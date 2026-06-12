@@ -1,20 +1,20 @@
 # pipesix — IPv6 over UDP Tunnel
 
-Connect your machine to a Route64 IPv6 subnet through a VPS relay.
+Connect your machine to the IPv6 internet through a VPS relay. Supports **Route64** (WireGuard) and **NetAssist** (SIT tunnel) as upstream providers.
 
 ## Architecture
 
 ```
-Client (::3) → pipesix → UDP → VPS pipesix → tun0 → wg0 (WireGuard) → Route64 → Internet
+Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] → IPv6 internet
 ```
 
 ## Prerequisites
 
-- A VPS with a public IP
-- A [Route64](https://route64.org) tunnel
-- `make`, `gcc`, `pthreads` on both machines
+- VPS with a public IPv4
+- Route64 or NetAssist tunnel account
+- `make`, `gcc`, `libpthread`
 
-## 1. Build
+## 1. Build & Install
 
 ```bash
 git clone <your-repo> && cd pipesix
@@ -22,82 +22,76 @@ make
 sudo make install
 ```
 
-Installs to `/usr/local/sbin/pipesix`.
+## 2. Upstream Setup (on VPS)
 
-## 2. VPS Setup (Server)
+Choose one:
 
-### WireGuard → Route64
+### Option A — Route64 (WireGuard)
 
-Edit and run:
+Edit `wg-route64.sh` with your Route64 keys, then:
 
 ```bash
 sudo ./wg-route64.sh
 ```
 
-Before running, replace placeholders in the script with your Route64 keys:
-
-| Field | Your Value |
-|---|---|
-| `Address` | `2a11:6c7:f27:86::2/64` |
-| `Endpoint` | `45.154.96.16:443` |
-| `PrivateKey` | *(from Route64 portal)* |
-| `PublicKey` | *(from Route64 portal)* |
-
-### Configure & Run pipesix (Server)
+### Option B — NetAssist (SIT tunnel)
 
 ```bash
-sudo ./setup.sh server
+sudo ./netassist-up.sh <your_vps_public_ipv4>
+```
+
+Example:
+
+```bash
+sudo ./netassist-up.sh 82.39.86.20
+```
+
+Verification (either option):
+
+```bash
+ping6 2a01:d0:ffff:233f::1   # NetAssist gateway
+ping6 2a11:6c7:f27:86::1     # Route64 gateway
+```
+
+## 3. Setup pipesix
+
+### VPS (Server)
+
+```bash
+sudo ./setup.sh server --backend route64   # if using Route64
+sudo ./setup.sh server --backend netassist # if using NetAssist
 sudo pipesix -c /etc/pipesix/pipesix.conf
 ```
 
-This enables IPv6 forwarding, adds routes, sets up NAT66, and creates the config.
-
-### Enable on Boot (Server)
-
-```bash
-sudo cp pipesix.service /etc/systemd/system/
-sudo systemctl enable --now pipesix
-```
-
-## 3. Client Setup
-
-### Configure & Run
+### Client Machine
 
 ```bash
 sudo ./setup.sh client
 sudo pipesix -c /etc/pipesix/pipesix.conf
 ```
 
-### Add Default Route
-
-The setup script adds it, but if you need to reapply:
-
-```bash
-sudo ip -6 route add default via 2a11:6c7:f27:86::2 dev tun0
-```
-
-### Enable on Boot (Client)
+## 4. Auto-Start on Boot
 
 ```bash
 sudo cp pipesix.service /etc/systemd/system/
 sudo systemctl enable --now pipesix
 ```
 
-## 4. Verify
+## 5. Verify
 
 | Test | Command | Expected |
 |---|---|---|
-| Tunnel to VPS | `ping6 2a11:6c7:f27:86::2` | Replies from VPS |
-| Route64 gateway | `ping6 2a11:6c7:f27:86::1` | Replies from gateway |
+| Tunnel to VPS | `ping6 2a01:d0:a33f::1` | Replies from VPS |
+| Upstream gateway | `ping6 2a01:d0:ffff:233f::1` | Replies from NetAssist |
 | Internet IPv6 | `ping6 2001:4860:4860::8888` | Replies from Google |
-| Public IPv6 | `curl -6 https://ifconfig.co` | Shows `2a11:6c7:f27:86::2` |
-| Browser | Open `https://test-ipv6.com` | 10/10 IPv6 ready |
+| Public IPv6 | `curl -6 https://ifconfig.co` | Shows your /48 address |
+| Browser | Open `https://test-ipv6.com` | 10/10 |
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `setup.sh` | One-command server/client setup (config + routes + NAT + sysctl) |
-| `pipesix.service` | systemd unit for auto-start on boot |
-| `wg-route64.sh` | WireGuard config template for Route64 |
-| `pipesix.conf.example` | Example pipesix config |
+| `setup.sh` | Server/client setup (config + routes + NAT) |
+| `pipesix.service` | systemd unit for auto-start |
+| `wg-route64.sh` | Route64 WireGuard setup |
+| `netassist-up.sh` | NetAssist SIT tunnel setup |
