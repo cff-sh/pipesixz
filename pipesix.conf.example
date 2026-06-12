@@ -1,0 +1,61 @@
+#
+# pipesix.conf.example - Example Configuration for pipesix IPv6 Tunnel
+#
+# This configuration file uses a simple key = value format.
+# Lines starting with '#' are comments and are ignored.
+# All paths are relative to the working directory unless absolute.
+#
+# Copy this file to /etc/pipesix/pipesix.conf and modify as needed.
+#
+# For a detailed explanation of all options, see the pipesix(8) man page
+# or run: pipesix -h
+#
+
+# ---------------------------------------------------------------------------
+# Operating Mode
+# ---------------------------------------------------------------------------
+# Set to "client" for the local machine or "server" for the VPS relay.
+#
+mode = client
+
+# ---------------------------------------------------------------------------
+# TUN Device Configuration
+# ---------------------------------------------------------------------------
+# tun_name:        Name of the TUN interface (default: tun0)
+# tun_address:     IPv6 address assigned to the TUN device
+# tun_prefixlen:   Prefix length for the address (default: 64)
+# tun_mtu:         MTU of the TUN device (default: 1500)
+#
+tun_name      = tun0
+tun_address   = fd00:dead:beef::2
+tun_prefixlen = 64
+tun_mtu       = 1500
+
+# ---------------------------------------------------------------------------
+# Remote Endpoint (Client Mode)
+# ---------------------------------------------------------------------------
+# These settings are used when mode = client.
+#
+# remote_address:  IP address or hostname of the VPS server
+# remote_port:     UDP port of the VPS server (default: 8899)
+#
+remote_address = 203.0.113.1
+remote_port    = 8899
+
+# ---------------------------------------------------------------------------
+# Local Bind (Server Mode)
+# ---------------------------------------------------------------------------
+# These settings are used when mode = server.
+#
+# bind_address:  IP address to bind the UDP listener (default: 0.0.0.0)
+# bind_port:     UDP port to listen on (default: 8899)
+#
+#bind_address = 0.0.0.0
+#bind_port    = 8899
+
+# ---------------------------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------------------------
+# log_level: Controls verbosity. Options: debug, info, warn, error, fatal
+#
+log_level = info
