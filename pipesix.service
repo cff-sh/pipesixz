@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 ExecStartPre=/sbin/modprobe tun
 ExecStart=/usr/local/sbin/pipesix -c /etc/pipesix/pipesix.conf
-ExecStartPost=/etc/pipesix/route-up.sh
+ExecStartPost=/bin/sh -c 'sleep 1 && /etc/pipesix/route-up.sh'
 Restart=on-failure
 RestartSec=5
 
