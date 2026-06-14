@@ -66,8 +66,14 @@ sudo pipesix -c /etc/pipesix/pipesix.conf
 ### Client Machine
 
 ```bash
-sudo ./setup.sh client
+sudo ./setup.sh client <vps_public_ipv4>
 sudo pipesix -c /etc/pipesix/pipesix.conf
+```
+
+In another terminal, add the default route once the tunnel is up:
+
+```bash
+sudo /etc/pipesix/route-up.sh
 ```
 
 ## 4. Auto-Start on Boot
