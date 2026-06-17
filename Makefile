@@ -21,8 +21,15 @@
 #   make clean        # Clean build artifacts
 #
 
+# Platform detection
+UNAME_S  := $(shell uname -s)
+
 # Compiler and linker configuration
+ifeq ($(UNAME_S),Darwin)
+CC       ?= clang
+else
 CC       ?= gcc
+endif
 CFLAGS   ?= -O2 -g
 LDFLAGS  ?=
 
@@ -61,9 +68,15 @@ TARGET       = pipesix
                     -Wcast-align \
                     -Wformat=2 \
                     -Wno-unused-parameter \
-                    -D_POSIX_C_SOURCE=200809L \
-                    -D_DEFAULT_SOURCE \
                     -I$(SRCDIR)
+
+# Platform-specific feature macros
+ifeq ($(UNAME_S),Darwin)
+ override CFLAGS += -D_DARWIN_C_SOURCE
+else
+ override CFLAGS += -D_POSIX_C_SOURCE=200809L \
+                    -D_DEFAULT_SOURCE
+endif
 
 # Linker flags
  override LDFLAGS += -pthread

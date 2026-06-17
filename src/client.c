@@ -72,6 +72,29 @@ static void *tun_to_network_thread(void *arg)
 
         memcpy(&server_addr, res->ai_addr, res->ai_addrlen);
         server_addr_len = res->ai_addrlen;
+
+        /*
+         * Ensure the resolved address family matches the socket family.
+         * On macOS, sendmsg() with a mismatched family fails (EINVAL).
+         * If we have an AF_INET6 socket but the server resolved to IPv4,
+         * convert to an IPv4-mapped IPv6 address (::ffff:a.b.c.d).
+         */
+        if (ctx->sock_family == AF_INET6 &&
+            server_addr.ss_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&server_addr;
+            struct sockaddr_in6 sin6;
+
+            memset(&sin6, 0, sizeof(sin6));
+            sin6.sin6_family = AF_INET6;
+            sin6.sin6_port   = sin->sin_port;
+            sin6.sin6_addr.s6_addr[10] = 0xff;
+            sin6.sin6_addr.s6_addr[11] = 0xff;
+            memcpy(&sin6.sin6_addr.s6_addr[12], &sin->sin_addr, 4);
+
+            memcpy(&server_addr, &sin6, sizeof(sin6));
+            server_addr_len = sizeof(sin6);
+        }
+
         freeaddrinfo(res);
     }
 
