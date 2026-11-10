@@ -132,7 +132,7 @@ sudo systemctl enable --now pipesix
 ```bash
 sudo systemctl reload pipesix     # apply log_level/keepalive/peer_timeout/...
 sudo kill -USR1 $(pidof pipesix)  # dump statistics now
-sudo pipesix --rotate-all         # new key for every client, printed
+sudo pipesix --rotate-all         # new client keys, printed and reloaded
 ```
 
 `systemctl reload` sends SIGHUP. It applies `log_level`, `keepalive`,
@@ -173,13 +173,17 @@ original — then prints them:
 
 ```bash
 sudo pipesix --rotate-all -c /etc/pipesix/pipesix.conf
-sudo systemctl reload pipesix   # then update each client's secret
 ```
 
-The keys still have to reach the clients; nothing pushes them there. Live
-sessions keep running until the server reloads, and a client whose key was
-not updated cannot handshake again — which is the point when you rotate
-because a key leaked.
+On Linux the command then sends SIGHUP to every running pipesix whose command
+line names that configuration file, so the server adopts the keys immediately;
+an instance started without `-c` counts when the default path is the one being
+rotated, and a client or a second server on another file is left alone. Where
+`/proc` is not available it prints a reminder to reload by hand instead.
+
+The keys still have to reach the clients; nothing pushes them there. A client
+whose key was not updated cannot handshake again — which is the point when you
+rotate because a key leaked.
 
 On a server, `SIGUSR1` also lists every connected client with its id, peer
 address, frame count and idle time, so you can see who is actually online

@@ -10,7 +10,7 @@
  *   pipesix [-c <config>]         Start with the given (or default) config
  *   pipesix -t [-c <config>]      Validate the configuration and exit
  *   pipesix --genkey              Print a random 256-bit per-client key
- *   pipesix --rotate-all          Replace every client key in a server config
+ *   pipesix --rotate-all          Replace every client key and reload the server
  *   pipesix -V                    Show version information
  *
  * Command-Line Options:
@@ -18,7 +18,8 @@
  *   -t, --check             Validate configuration without touching the network
  *   -l, --log-level <name>  Override the configured log level
  *   -g, --genkey            Generate a per-client pre-shared key
- *   -R, --rotate-all        Generate and apply a new key for every client
+ *   -R, --rotate-all        Generate and apply a new key for every client,
+ *                           then make the running server adopt it
  *   -V, --version           Show version information
  *   -h, --help              Show help
  *
@@ -36,13 +37,17 @@
 #include "runtime.h"
 #include "server.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define PIPESIX_APP_VERSION "2.1.0"
 #define DEFAULT_CONFIG_PATH "/etc/pipesix/pipesix.conf"
@@ -125,7 +130,8 @@ static void print_usage(const char *progname)
             "  -l, --log-level <name>  Override log level\n"
             "  -g, --genkey            Generate a per-client key and exit\n"
             "  -R, --rotate-all        Generate and apply a new key for every\n"
-            "                          'client' entry, then print them (server)\n"
+            "                          'client' entry, print them and reload\n"
+            "                          the running server (server only)\n"
             "  -V, --version           Show version information\n"
             "  -h, --help              Show this help message\n"
             "\n"
@@ -179,6 +185,180 @@ static int generate_key(void)
 }
 
 /*
+ * Read a small file into buf, NUL-terminating it.
+ *
+ * Returns the number of bytes read, or -1 when the file cannot be read.
+ */
+static ssize_t read_small_file(const char *path, char *buf, size_t size)
+{
+    size_t total = 0;
+    int fd;
+
+    if (size == 0) {
+        return -1;
+    }
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+
+    while (total + 1 < size) {
+        ssize_t n = read(fd, buf + total, size - 1 - total);
+
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            close(fd);
+            return -1;
+        }
+        if (n == 0) {
+            break;
+        }
+        total += (size_t)n;
+    }
+
+    close(fd);
+    buf[total] = '\0';
+    return (ssize_t)total;
+}
+
+/*
+ * Does this NUL-separated command line use config_path?
+ *
+ * A process that was started without -c/--config uses the default path,
+ * which only matches when that is the file being rotated. A relative path
+ * is resolved on both sides before giving up, since the two processes need
+ * not share a working directory.
+ */
+static int cmdline_uses_config(const char *cmdline, size_t len,
+                               const char *config_path)
+{
+    const char *arg = cmdline;
+    const char *end = cmdline + len;
+    const char *found = NULL;
+
+    while (arg < end) {
+        size_t arg_len = strnlen(arg, (size_t)(end - arg));
+
+        if (strcmp(arg, "-c") == 0 || strcmp(arg, "--config") == 0) {
+            const char *next = arg + arg_len + 1;
+
+            if (next < end) {
+                found = next;
+            }
+            break;
+        }
+
+        if (strncmp(arg, "--config=", 9) == 0) {
+            found = arg + 9;
+            break;
+        }
+
+        arg += arg_len + 1;
+    }
+
+    if (found == NULL) {
+        return strcmp(config_path, DEFAULT_CONFIG_PATH) == 0;
+    }
+
+    if (strcmp(found, config_path) == 0) {
+        return 1;
+    }
+
+    {
+        char theirs[PATH_MAX];
+        char ours[PATH_MAX];
+
+        if (realpath(found, theirs) != NULL &&
+            realpath(config_path, ours) != NULL) {
+            return strcmp(theirs, ours) == 0;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Ask running pipesix instances to reload the configuration we just wrote.
+ *
+ * A rotation that stopped at the file would look successful while the
+ * relay kept using the old keys, so --rotate-all finishes the job by
+ * sending SIGHUP. There is no pid file to consult, so the instance is
+ * found by walking /proc: a process counts when its program is named
+ * 'pipesix' (never ourselves) and its command line names this very
+ * configuration file. Restricting the match that way keeps a client or a
+ * second server on another configuration untouched.
+ *
+ * Returns:
+ *   the number of processes signalled, or -1 where /proc is unavailable
+ *   (no /proc on this platform, so the reload has to be done by hand)
+ */
+static int reload_running_instances(const char *config_path)
+{
+    DIR *dir;
+    struct dirent *entry;
+    pid_t self = getpid();
+    int signalled = 0;
+
+    dir = opendir("/proc");
+    if (dir == NULL) {
+        return -1;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        char path[64];
+        char comm[32];
+        char cmdline[4096];
+        char *endptr = NULL;
+        long parsed;
+        ssize_t len;
+        pid_t pid;
+
+        /* Only the numeric entries are processes. */
+        errno = 0;
+        parsed = strtol(entry->d_name, &endptr, 10);
+        if (errno != 0 || endptr == entry->d_name || *endptr != '\0' ||
+            parsed <= 0) {
+            continue;
+        }
+
+        pid = (pid_t)parsed;
+        if (pid == self) {
+            continue;
+        }
+
+        snprintf(path, sizeof(path), "/proc/%ld/comm", parsed);
+        if (read_small_file(path, comm, sizeof(comm)) < 0) {
+            continue;
+        }
+        comm[strcspn(comm, "\n")] = '\0';
+        if (strcmp(comm, "pipesix") != 0) {
+            continue;
+        }
+
+        snprintf(path, sizeof(path), "/proc/%ld/cmdline", parsed);
+        len = read_small_file(path, cmdline, sizeof(cmdline));
+        if (len < 0) {
+            continue;
+        }
+        if (!cmdline_uses_config(cmdline, (size_t)len, config_path)) {
+            continue;
+        }
+
+        if (kill(pid, SIGHUP) == 0) {
+            signalled++;
+        } else if (errno != ESRCH) {
+            log_warn("Cannot signal pid %ld: %s", parsed, strerror(errno));
+        }
+    }
+
+    closedir(dir);
+    return signalled;
+}
+
+/*
  * Report the keys generated by --rotate-all.
  *
  * The keys are printed because they still have to reach each client's
@@ -197,10 +377,8 @@ static void report_rotated_keys(const pipesix_config_t *config)
     }
 
     printf("\n"
-           "Put each key in the matching client's 'secret' line. Live\n"
-           "sessions keep running until the server reloads, and a client\n"
-           "whose key is not updated cannot handshake again, so reload the\n"
-           "server first and then each client:\n"
+           "Put each key in the matching client's 'secret' line and reload\n"
+           "each client:\n"
            "  sudo systemctl reload pipesix\n");
 }
 
@@ -289,10 +467,27 @@ int main(int argc, char *argv[])
     config_dump(&config);
 
     if (rotate_all) {
+        int signalled;
+
         if (config_rotate_all_keys(&config) != 0) {
             return EXIT_FAILURE;
         }
         report_rotated_keys(&config);
+
+        signalled = reload_running_instances(config.config_path);
+        if (signalled > 0) {
+            printf("Signalled %d running pipesix process(es) with SIGHUP; "
+                   "the server\nhas adopted the new keys.\n", signalled);
+        } else if (signalled == 0) {
+            printf("No running pipesix uses this configuration. Live "
+                   "sessions keep\ntheir current keys until it is reloaded:\n"
+                   "  sudo systemctl reload pipesix\n");
+        } else {
+            printf("Cannot look for a running pipesix here; reload the "
+                   "server to\nadopt the new keys:\n"
+                   "  sudo systemctl reload pipesix\n");
+        }
+
         return EXIT_SUCCESS;
     }
 
