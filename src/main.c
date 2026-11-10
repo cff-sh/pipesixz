@@ -31,18 +31,26 @@
 
 #include "client.h"
 #include "config.h"
+#include "control.h"
 #include "crypto.h"
 #include "logger.h"
+#include "platform.h"
 #include "proto.h"
 #include "runtime.h"
 #include "server.h"
 
+#if !defined(_WIN32)
 #include <dirent.h>
+#endif
 #include <errno.h>
+#if !defined(_WIN32)
 #include <fcntl.h>
+#endif
 #include <getopt.h>
 #include <limits.h>
+#if !defined(_WIN32)
 #include <signal.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,7 +58,50 @@
 #include <unistd.h>
 
 #define PIPESIX_APP_VERSION "2.1.0"
+
+/*
+ * Windows has no /etc, so the default is the current directory: a Windows
+ * user runs pipesix.exe where the configuration lives, or passes -c.
+ */
+#if defined(_WIN32)
+#define DEFAULT_CONFIG_PATH "pipesix.conf"
+#else
 #define DEFAULT_CONFIG_PATH "/etc/pipesix/pipesix.conf"
+#endif
+
+#if defined(_WIN32)
+
+/*
+ * Windows has no signals. A console handler covers Ctrl+C, Ctrl+Break and
+ * the stop/shutdown notifications a service wrapper sends; reload and
+ * statistics requests arrive through the named events in control.c, which
+ * is why --reload and --stats exist.
+ */
+static BOOL WINAPI console_handler(DWORD event)
+{
+    switch (event) {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+            runtime_request_stop();
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
+static int setup_signal_handlers(void)
+{
+    if (!SetConsoleCtrlHandler(console_handler, TRUE)) {
+        errno = EIO;
+        return -1;
+    }
+
+    return 0;
+}
+
+#else
 
 static void handle_shutdown(int sig)
 {
@@ -113,6 +164,23 @@ static int setup_signal_handlers(void)
     return 0;
 }
 
+#endif /* _WIN32 */
+
+#if defined(_WIN32)
+/*
+ * Server mode is not built for Windows: the relay needs a TUN device
+ * routed to an IPv6 uplink, which belongs on the VPS. This stub keeps the
+ * client binary self-contained and says so instead of failing to link.
+ */
+int server_start(pipesix_config_t *config)
+{
+    (void)config;
+    log_error("Server mode is not supported on Windows; run the server on "
+              "the VPS and use this binary as a client");
+    return -1;
+}
+#endif
+
 static void print_usage(const char *progname)
 {
     fprintf(stderr,
@@ -132,6 +200,9 @@ static void print_usage(const char *progname)
             "  -R, --rotate-all        Generate and apply a new key for every\n"
             "                          'client' entry, print them and reload\n"
             "                          the running server (server only)\n"
+            "      --reload            Ask the running instance for this\n"
+            "                          configuration to reload it\n"
+            "      --stats             Ask it to dump statistics now\n"
             "  -V, --version           Show version information\n"
             "  -h, --help              Show this help message\n"
             "\n"
@@ -163,7 +234,8 @@ static void print_usage(const char *progname)
             "Signal SIGUSR1 dumps traffic statistics immediately.\n"
             "Signal SIGHUP reloads log_level, keepalive, peer_timeout,\n"
             "session_timeout, stats_interval and keys (server: client\n"
-            "table, client: own secret) for live key rotation.\n",
+            "table, client: own secret) for live key rotation.\n"
+            "On Windows there are no signals: use --reload and --stats.\n",
             progname, progname, progname, progname, PIPESIX_APP_VERSION,
             DEFAULT_CONFIG_PATH);
 }
@@ -183,6 +255,8 @@ static int generate_key(void)
     printf("%s\n", hex);
     return EXIT_SUCCESS;
 }
+
+#if !defined(_WIN32)
 
 /*
  * Read a small file into buf, NUL-terminating it.
@@ -281,21 +355,26 @@ static int cmdline_uses_config(const char *cmdline, size_t len,
 }
 
 /*
- * Ask running pipesix instances to reload the configuration we just wrote.
+ * Ask running pipesix instances to act on a configuration.
  *
  * A rotation that stopped at the file would look successful while the
  * relay kept using the old keys, so --rotate-all finishes the job by
- * sending SIGHUP. There is no pid file to consult, so the instance is
+ * signalling the instance. --reload and --stats reach the same code with a
+ * different signal. There is no pid file to consult, so the instance is
  * found by walking /proc: a process counts when its program is named
  * 'pipesix' (never ourselves) and its command line names this very
  * configuration file. Restricting the match that way keeps a client or a
  * second server on another configuration untouched.
  *
+ * Parameters:
+ *   config_path - configuration the instance was started with
+ *   sig         - SIGHUP to reload it, SIGUSR1 to dump its statistics
+ *
  * Returns:
  *   the number of processes signalled, or -1 where /proc is unavailable
- *   (no /proc on this platform, so the reload has to be done by hand)
+ *   (no /proc on this platform, so the signal has to be sent by hand)
  */
-static int reload_running_instances(const char *config_path)
+static int signal_running_instances(const char *config_path, int sig)
 {
     DIR *dir;
     struct dirent *entry;
@@ -347,7 +426,7 @@ static int reload_running_instances(const char *config_path)
             continue;
         }
 
-        if (kill(pid, SIGHUP) == 0) {
+        if (kill(pid, sig) == 0) {
             signalled++;
         } else if (errno != ESRCH) {
             log_warn("Cannot signal pid %ld: %s", parsed, strerror(errno));
@@ -357,6 +436,8 @@ static int reload_running_instances(const char *config_path)
     closedir(dir);
     return signalled;
 }
+
+#endif /* !_WIN32 */
 
 /*
  * Report the keys generated by --rotate-all.
@@ -390,6 +471,8 @@ int main(int argc, char *argv[])
         { "log-level", required_argument, NULL, 'l' },
         { "genkey",    no_argument,       NULL, 'g' },
         { "rotate-all", no_argument,      NULL, 'R' },
+        { "reload",    no_argument,       NULL, 1000 },
+        { "stats",     no_argument,       NULL, 1001 },
         { "version",   no_argument,       NULL, 'V' },
         { "help",      no_argument,       NULL, 'h' },
         { NULL,        0,                 NULL, 0   }
@@ -401,6 +484,8 @@ int main(int argc, char *argv[])
     int have_cli_level = 0;
     int check_only = 0;
     int rotate_all = 0;
+    int reload_only = 0;
+    int stats_only = 0;
     int opt;
 
     while ((opt = getopt_long(argc, argv, "c:tl:gRVh", long_options, NULL)) != -1) {
@@ -422,6 +507,12 @@ int main(int argc, char *argv[])
                 return generate_key();
             case 'R':
                 rotate_all = 1;
+                break;
+            case 1000:
+                reload_only = 1;
+                break;
+            case 1001:
+                stats_only = 1;
                 break;
             case 'V':
                 printf("pipesix %s (protocol %d)\n",
@@ -474,7 +565,7 @@ int main(int argc, char *argv[])
         }
         report_rotated_keys(&config);
 
-        signalled = reload_running_instances(config.config_path);
+        signalled = signal_running_instances(config.config_path, SIGHUP);
         if (signalled > 0) {
             printf("Signalled %d running pipesix process(es) with SIGHUP; "
                    "the server\nhas adopted the new keys.\n", signalled);
@@ -496,13 +587,52 @@ int main(int argc, char *argv[])
         return EXIT_SUCCESS;
     }
 
+    /*
+     * --reload and --stats are the Windows equivalents of SIGHUP and
+     * SIGUSR1; on POSIX they signal the instance through /proc, so the
+     * behaviour is the same everywhere.
+     */
+    if (reload_only || stats_only) {
+        int signalled;
+
+#if defined(_WIN32)
+        signalled = reload_only ? control_request_reload(config.config_path)
+                                : control_request_stats(config.config_path);
+#else
+        signalled = signal_running_instances(config.config_path,
+                                             reload_only ? SIGHUP : SIGUSR1);
+#endif
+
+        if (signalled > 0) {
+            printf("Signalled %d running pipesix process(es): %s\n",
+                   signalled, reload_only ? "reload the configuration"
+                                          : "dump statistics");
+            return EXIT_SUCCESS;
+        }
+        if (signalled == 0) {
+            printf("No running pipesix uses this configuration; nothing to "
+                   "signal.\n");
+            return EXIT_FAILURE;
+        }
+
+        printf("Cannot find a running pipesix on this platform; reload it "
+               "with 'systemctl reload pipesix'.\n");
+        return EXIT_FAILURE;
+    }
+
     log_info("Frame protection: %s",
              "ChaCha20-Poly1305 with per-client session keys");
 
     runtime_init();
+    control_start(config.config_path);
 
     if (setup_signal_handlers() != 0) {
         log_error("Failed to setup signal handlers: %s", strerror(errno));
+        return EXIT_FAILURE;
+    }
+
+    if (psix_net_init() != 0) {
+        log_error("Failed to initialise the network stack");
         return EXIT_FAILURE;
     }
 
@@ -515,6 +645,9 @@ int main(int argc, char *argv[])
         log_info("Starting pipesix in SERVER mode");
         ret = server_start(&config);
     }
+
+    psix_net_shutdown();
+    control_stop();
 
     if (ret != 0) {
         log_error("pipesix terminated with error");

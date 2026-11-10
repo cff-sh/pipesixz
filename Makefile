@@ -49,6 +49,7 @@ SOURCES      = $(SRCDIR)/main.c \
                $(SRCDIR)/stats.c \
                $(SRCDIR)/tun.c \
                $(SRCDIR)/ipv6.c \
+               $(SRCDIR)/control.c \
                $(SRCDIR)/client.c \
                $(SRCDIR)/server.c
 
@@ -149,11 +150,45 @@ uninstall:
 	@echo "Uninstall complete"
 
 #
+# Windows client build.
+#
+# Only the TUN backend and the portability layer are platform specific,
+# so tun.c and server.c are replaced (server mode stays on the VPS) and
+# platform_win.c joins the build. Cross-compile from Linux with mingw-w64,
+# or run 'make windows' inside MSYS2:
+#
+#   make windows
+#
+# wintun.dll is loaded at run time and never linked, so nothing beyond the
+# compiler is needed to build a self-contained pipesix.exe.
+#
+WINDOWS_CC      ?= x86_64-w64-mingw32-gcc
+WINDOWS_TARGET   = pipesix.exe
+# -Wconversion and -Wsign-conversion are deliberately absent: the Win32 API
+# mixes int, DWORD, SIZE_T and pointer-sized SOCKET values by design, so the
+# POSIX warning set would fire on every call rather than on every bug.
+WINDOWS_CFLAGS  ?= -O2 -g -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 \
+                   -Werror -D_WIN32_WINNT=0x0601
+WINDOWS_LDLIBS   = -lws2_32 -lbcrypt -lwinpthread
+WINDOWS_SOURCES  = $(filter-out $(SRCDIR)/tun.c $(SRCDIR)/server.c,$(SOURCES)) \
+                   $(SRCDIR)/tun_windows.c $(SRCDIR)/platform_win.c
+
+.PHONY: windows clean-windows
+windows: $(WINDOWS_TARGET)
+
+$(WINDOWS_TARGET): $(WINDOWS_SOURCES) $(SRCDIR)/platform.h $(SRCDIR)/control.h
+	$(WINDOWS_CC) $(WINDOWS_CFLAGS) -o $@ $(WINDOWS_SOURCES) $(WINDOWS_LDLIBS)
+	@echo "Build complete: $(WINDOWS_TARGET)"
+
+clean-windows:
+	rm -f $(WINDOWS_TARGET)
+
+#
 # Clean build artifacts without removing dependency files.
 #
 .PHONY: clean
 clean:
-	rm -f $(OBJECTS) $(TARGET) $(TEST_BIN)
+	rm -f $(OBJECTS) $(TARGET) $(TEST_BIN) $(WINDOWS_TARGET)
 
 #
 # Clean build artifacts and dependency files.

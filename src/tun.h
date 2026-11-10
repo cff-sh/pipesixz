@@ -37,6 +37,18 @@ typedef struct {
     int   fd;                  /* TUN device file descriptor (-1 if closed) */
     char  name[64];            /* Interface name (e.g., "tun0") */
     int   mtu;                 /* Configured MTU */
+
+#if defined(_WIN32)
+    /*
+     * Wintun handles, used by tun_windows.c only. A Wintun adapter has no
+     * file descriptor: a packet arrives through a session and its
+     * arrival is announced by a waitable event, which tun_wait() waits
+     * on in place of poll().
+     */
+    void *adapter;             /* WINTUN_ADAPTER_HANDLE */
+    void *session;             /* WINTUN_SESSION_HANDLE */
+    void *read_event;          /* signalled when a packet is available */
+#endif
 } tun_device_t;
 
 /*
@@ -106,6 +118,22 @@ ssize_t tun_read(tun_device_t *tun, void *buf, size_t size);
  *   Number of bytes written on success, -1 on error
  */
 ssize_t tun_write(tun_device_t *tun, const void *buf, size_t length);
+
+/*
+ * Wait until the TUN device has a packet ready to read.
+ *
+ * The equivalent of poll() on the device: Linux and macOS wait on the
+ * file descriptor, Windows on Wintun's read event. Lets the worker loops
+ * stay identical on every platform.
+ *
+ * Parameters:
+ *   tun        - TUN device structure
+ *   timeout_ms - Milliseconds to wait, or -1 to wait forever
+ *
+ * Returns:
+ *   1 when readable, 0 on timeout, -1 on error with errno set
+ */
+int tun_wait(tun_device_t *tun, int timeout_ms);
 
 /*
  * Close the TUN device.

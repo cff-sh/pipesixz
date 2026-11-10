@@ -2,6 +2,8 @@
 *.o
 *.d
 pipesix
+pipesix.exe
+*.exe
 tests/test_core
 
 # Local secrets and generated configuration

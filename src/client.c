@@ -36,12 +36,12 @@
 #include "proto.h"
 #include "runtime.h"
 #include "stats.h"
+#include "platform.h"
 #include "tun.h"
 
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -58,7 +58,7 @@
 typedef struct {
     pipesix_config_t  *config;
     tun_device_t      *tun;
-    int                udp_fd;
+    psix_socket_t      udp_fd;
     uint8_t            psk[PIPESIX_KEY_LEN];
     uint8_t            tx_key[PIPESIX_KEY_LEN];
     uint8_t            rx_key[PIPESIX_KEY_LEN];
@@ -86,11 +86,7 @@ static void sleep_seconds(unsigned int seconds)
     unsigned int i;
 
     for (i = 0; i < seconds && !runtime_should_stop(); i++) {
-        struct timespec delay;
-
-        delay.tv_sec = 1;
-        delay.tv_nsec = 0;
-        nanosleep(&delay, NULL);
+        psix_sleep(1);
     }
 }
 
@@ -115,7 +111,7 @@ static int send_frame(client_context_t *ctx, uint16_t flags,
         return -1;
     }
 
-    if (send(ctx->udp_fd, frame, frame_len, 0) != (ssize_t)frame_len) {
+    if (psix_send(ctx->udp_fd, frame, frame_len, 0) != (ssize_t)frame_len) {
         return -1;
     }
 
@@ -161,7 +157,6 @@ static int handshake_once(client_context_t *ctx, int timeout_ms)
     size_t body_len;
     size_t frame_len;
     time_t deadline;
-    struct pollfd pfd;
 
     if (pipesix_random_bytes(cnonce, sizeof(cnonce)) != 0) {
         log_error("Cannot generate a handshake nonce: %s", strerror(errno));
@@ -184,14 +179,10 @@ static int handshake_once(client_context_t *ctx, int timeout_ms)
         return -1;
     }
 
-    if (send(ctx->udp_fd, frame, frame_len, 0) != (ssize_t)frame_len) {
+    if (psix_send(ctx->udp_fd, frame, frame_len, 0) != (ssize_t)frame_len) {
         log_warn("Failed to send the handshake request: %s", strerror(errno));
         return -1;
     }
-
-    pfd.fd = ctx->udp_fd;
-    pfd.events = POLLIN;
-    pfd.revents = 0;
 
     deadline = time(NULL) + (time_t)((timeout_ms + 999) / 1000);
 
@@ -201,7 +192,7 @@ static int handshake_once(client_context_t *ctx, int timeout_ms)
         ssize_t nread;
         int ready;
 
-        ready = poll(&pfd, 1, POLL_INTERVAL_MS);
+        ready = psix_socket_wait(ctx->udp_fd, POLL_INTERVAL_MS);
         if (ready < 0) {
             if (errno == EINTR) continue;
             log_warn("poll() during handshake failed: %s", strerror(errno));
@@ -211,7 +202,7 @@ static int handshake_once(client_context_t *ctx, int timeout_ms)
             continue;
         }
 
-        nread = recv(ctx->udp_fd, buf, sizeof(buf), 0);
+        nread = psix_recv(ctx->udp_fd, buf, sizeof(buf), 0);
         if (nread < 0) {
             if (errno == EINTR) continue;
             log_warn("Handshake receive failed: %s", strerror(errno));
@@ -295,17 +286,12 @@ static void *forward_loop(void *arg)
 {
     client_context_t *ctx = (client_context_t *)arg;
     uint8_t packet[PIPESIX_MAX_PACKET];
-    struct pollfd pfd;
     time_t last_send = time(NULL);
-
-    pfd.fd = ctx->tun->fd;
-    pfd.events = POLLIN;
-    pfd.revents = 0;
 
     log_info("Forward thread started (TUN -> UDP)");
 
     while (!runtime_should_stop() && !atomic_load(&ctx->stop_workers)) {
-        int ready = poll(&pfd, 1, POLL_INTERVAL_MS);
+        int ready = tun_wait(ctx->tun, POLL_INTERVAL_MS);
         time_t now;
         int keepalive;
 
@@ -320,7 +306,7 @@ static void *forward_loop(void *arg)
         now = time(NULL);
         keepalive = atomic_load(&ctx->keepalive);
 
-        if (ready > 0 && (pfd.revents & POLLIN) != 0) {
+        if (ready > 0) {
             ssize_t nread = tun_read(ctx->tun, packet, sizeof(packet));
 
             if (nread < 0) {
@@ -368,16 +354,11 @@ static void *reverse_loop(void *arg)
 {
     client_context_t *ctx = (client_context_t *)arg;
     uint8_t frame_buf[PIPESIX_RECV_BUF_SIZE];
-    struct pollfd pfd;
-
-    pfd.fd = ctx->udp_fd;
-    pfd.events = POLLIN;
-    pfd.revents = 0;
 
     log_info("Reverse thread started (UDP -> TUN)");
 
     while (!runtime_should_stop() && !atomic_load(&ctx->stop_workers)) {
-        int ready = poll(&pfd, 1, POLL_INTERVAL_MS);
+        int ready = psix_socket_wait(ctx->udp_fd, POLL_INTERVAL_MS);
         pipesix_frame_t frame;
         uint16_t flags;
         int rc;
@@ -394,7 +375,7 @@ static void *reverse_loop(void *arg)
             continue;
         }
 
-        nread = recv(ctx->udp_fd, frame_buf, sizeof(frame_buf), 0);
+        nread = psix_recv(ctx->udp_fd, frame_buf, sizeof(frame_buf), 0);
         if (nread < 0) {
             if (errno == EINTR) continue;
             log_error("UDP receive failed: %s", strerror(errno));
@@ -473,16 +454,18 @@ static void *reverse_loop(void *arg)
 /*
  * Resolve the server and connect the UDP socket.
  *
- * Returns the socket descriptor, or -1 on failure.
+ * Returns the connected socket, or PSIX_INVALID_SOCKET on failure.
+ * The socket is a SOCKET on Windows, which is pointer sized, so it must
+ * not travel through an int.
  */
-static int connect_server(const pipesix_config_t *config)
+static psix_socket_t connect_server(const pipesix_config_t *config)
 {
     struct addrinfo hints;
     struct addrinfo *result = NULL;
     struct addrinfo *rp;
     char port_str[16];
     int gai;
-    int fd = -1;
+    psix_socket_t fd = PSIX_INVALID_SOCKET;
 
     snprintf(port_str, sizeof(port_str), "%d", config->remote_port);
 
@@ -502,11 +485,11 @@ static int connect_server(const pipesix_config_t *config)
         char serv[NI_MAXSERV];
 
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd < 0) {
+        if (fd == PSIX_INVALID_SOCKET) {
             continue;
         }
 
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+        if (psix_connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
             if (getnameinfo(rp->ai_addr, rp->ai_addrlen,
                             host, sizeof(host), serv, sizeof(serv),
                             NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
@@ -516,13 +499,13 @@ static int connect_server(const pipesix_config_t *config)
             break;
         }
 
-        close(fd);
-        fd = -1;
+        psix_close(fd);
+        fd = PSIX_INVALID_SOCKET;
     }
 
     freeaddrinfo(result);
 
-    if (fd < 0) {
+    if (fd == PSIX_INVALID_SOCKET) {
         log_error("Failed to connect UDP socket to %s:%d: %s",
                   config->remote_address, config->remote_port,
                   strerror(errno));
@@ -634,7 +617,7 @@ int client_start(pipesix_config_t *config)
     memset(&ctx, 0, sizeof(ctx));
     ctx.config = config;
     ctx.tun = &tun;
-    ctx.udp_fd = -1;
+    ctx.udp_fd = PSIX_INVALID_SOCKET;
 
     if (pipesix_key_from_string(config->secret, ctx.psk) != 0) {
         log_error("Failed to derive the pre-shared key from 'secret'");
@@ -652,7 +635,7 @@ int client_start(pipesix_config_t *config)
     stats_init(&ctx.stats);
 
     ctx.udp_fd = connect_server(config);
-    if (ctx.udp_fd < 0) {
+    if (ctx.udp_fd == PSIX_INVALID_SOCKET) {
         tun_close(&tun);
         return -1;
     }
@@ -661,13 +644,13 @@ int client_start(pipesix_config_t *config)
 
     if (handshake(&ctx) != 0) {
         log_info("Shutdown requested before the handshake completed");
-        close(ctx.udp_fd);
+        psix_close(ctx.udp_fd);
         tun_close(&tun);
         return 0;
     }
 
     if (start_workers(&ctx, &forward_thread, &reverse_thread) != 0) {
-        close(ctx.udp_fd);
+        psix_close(ctx.udp_fd);
         tun_close(&tun);
         return -1;
     }
@@ -684,15 +667,12 @@ int client_start(pipesix_config_t *config)
         time_t last_report = time(NULL);
 
         while (!runtime_should_stop()) {
-            struct timespec delay;
             uint8_t new_psk[PIPESIX_KEY_LEN] = {0};
             time_t now;
             int keepalive;
             int rotate = 0;
 
-            delay.tv_sec = 1;
-            delay.tv_nsec = 0;
-            nanosleep(&delay, NULL);
+            psix_sleep(1);
             now = time(NULL);
 
             if (runtime_take_reload_request()) {
@@ -756,7 +736,7 @@ int client_start(pipesix_config_t *config)
 
                 if (start_workers(&ctx, &forward_thread, &reverse_thread)
                     != 0) {
-                    close(ctx.udp_fd);
+                    psix_close(ctx.udp_fd);
                     tun_close(&tun);
                     return -1;
                 }
@@ -789,7 +769,7 @@ int client_start(pipesix_config_t *config)
 
                 if (start_workers(&ctx, &forward_thread,
                                   &reverse_thread) != 0) {
-                    close(ctx.udp_fd);
+                    psix_close(ctx.udp_fd);
                     tun_close(&tun);
                     return -1;
                 }
@@ -808,8 +788,8 @@ int client_start(pipesix_config_t *config)
                 stop_workers(&ctx, &forward_thread, &reverse_thread);
                 workers_running = 0;
 
-                close(ctx.udp_fd);
-                ctx.udp_fd = -1;
+                psix_close(ctx.udp_fd);
+                ctx.udp_fd = PSIX_INVALID_SOCKET;
 
                 if (reconnect_peer(&ctx) != 0) {
                     break;
@@ -821,7 +801,7 @@ int client_start(pipesix_config_t *config)
 
                 if (start_workers(&ctx, &forward_thread,
                                   &reverse_thread) != 0) {
-                    close(ctx.udp_fd);
+                    psix_close(ctx.udp_fd);
                     tun_close(&tun);
                     return -1;
                 }
@@ -848,8 +828,8 @@ int client_start(pipesix_config_t *config)
     memset(ctx.tx_key, 0, sizeof(ctx.tx_key));
     memset(ctx.rx_key, 0, sizeof(ctx.rx_key));
 
-    if (ctx.udp_fd >= 0) {
-        close(ctx.udp_fd);
+    if (ctx.udp_fd != PSIX_INVALID_SOCKET) {
+        psix_close(ctx.udp_fd);
         log_info("UDP socket closed");
     }
 

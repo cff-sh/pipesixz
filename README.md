@@ -38,6 +38,7 @@ credential.
 - VPS with a public IPv4
 - Route64 or NetAssist tunnel account
 - `make`, `gcc`, `libpthread`
+- Windows client: MinGW-w64 and `wintun.dll` (see [Windows client](#windows-client))
 
 ## 1. Build & Install
 
@@ -256,6 +257,62 @@ Server side notes:
   authentication failures.
 - Handshake-required hints are rate limited, so the server cannot be used as
   a UDP amplifier.
+
+## Windows client
+
+The client also runs on Windows, through Wintun — the Layer 3 driver the
+WireGuard project publishes. Server mode stays on the VPS.
+
+Build with MinGW-w64, either cross-compiling from Linux or inside MSYS2:
+
+```bash
+make windows          # produces pipesix.exe
+```
+
+Install `wintun.dll` from <https://www.wintun.net/> next to `pipesix.exe`. The
+DLL is loaded at run time and never linked, so building needs no extra SDK and
+the binary still starts (and says what is missing) when it is absent.
+
+A Windows client uses the same configuration file as everywhere else; only the
+device name differs, because it names the Wintun adapter rather than a `tunX`:
+
+```ini
+mode = client
+client_id = client1
+remote_address = 184.107.84.10
+remote_port = 8899
+tun_name = pipesix
+tun_address = 2a01:d0:a33f::2
+tun_prefixlen = 64
+tun_mtu = 1400
+secret = <the key setup.sh printed>
+log_level = info
+```
+
+Run it from a console started as Administrator: pipesix creates (or reuses) the
+`pipesix` adapter and configures its IPv6 address and MTU. The default
+configuration path on Windows is `pipesix.conf` in the current directory, or
+pass `-c`.
+
+Add the default route yourself once the tunnel is up. Windows otherwise keeps
+using its own router-advertised IPv6 default, so traffic would leave through
+the local ISP instead of the tunnel:
+
+```powershell
+netsh interface ipv6 add route ::/0 "pipesix" 2a01:d0:a33f::1
+```
+
+Windows has no signals, so the two runtime controls are command line options
+that reach the running instance through a per-configuration named event:
+
+```powershell
+pipesix.exe --reload -c pipesix.conf    # instead of SIGHUP
+pipesix.exe --stats  -c pipesix.conf    # instead of SIGUSR1
+```
+
+Stop the tunnel with Ctrl+C. `setup.sh`, `pipesix.service` and the `ip`/`route`
+scripts are POSIX-only, but the configuration format and the wire protocol are
+shared, so a Windows client talks to an unchanged Linux server.
 
 ## Testing
 

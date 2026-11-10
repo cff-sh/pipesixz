@@ -7,10 +7,19 @@
 
 #include "crypto.h"
 
+#include <string.h>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <bcrypt.h>
+#else
 #include <errno.h>
 #include <fcntl.h>
-#include <string.h>
 #include <unistd.h>
+#endif
 
 /* SHA-256 round constants (FIPS 180-4, section 4.2.2) */
 static const uint32_t s_sha256_k[64] = {
@@ -823,6 +832,28 @@ int pipesix_key_from_string(const char *secret, uint8_t out[PIPESIX_KEY_LEN])
     return 0;
 }
 
+#if defined(_WIN32)
+
+/*
+ * Windows has no /dev/urandom. BCryptGenRandom with the system-preferred
+ * RNG is the documented equivalent and needs no seeding by us.
+ */
+int pipesix_random_bytes(void *buf, size_t len)
+{
+    if (buf == NULL || len > 0xFFFFFFFFu) {
+        return -1;
+    }
+
+    if (BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)len,
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+#else
+
 int pipesix_random_bytes(void *buf, size_t len)
 {
     uint8_t *out = (uint8_t *)buf;
@@ -852,6 +883,8 @@ int pipesix_random_bytes(void *buf, size_t len)
     close(fd);
     return 0;
 }
+
+#endif /* _WIN32 */
 
 void pipesix_hex_encode(const uint8_t *in, size_t len, char *out)
 {

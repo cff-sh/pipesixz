@@ -23,6 +23,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -381,6 +382,22 @@ ssize_t tun_write(tun_device_t *tun, const void *buf, size_t length)
     }
 
     return n;
+}
+
+int tun_wait(tun_device_t *tun, int timeout_ms)
+{
+    struct pollfd pfd;
+
+    if (tun == NULL || tun->fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+
+    pfd.fd = tun->fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    return poll(&pfd, 1, timeout_ms);
 }
 
 void tun_close(tun_device_t *tun)
