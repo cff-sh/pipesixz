@@ -21,7 +21,9 @@ Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] �
 - Client keepalives, echoed by the server for liveness
 - Automatic client reconnect with DNS re-resolution and backoff when the
   peer goes silent (`peer_timeout`)
-- Session reset frames so restarts on either side do not stall the tunnel
+- Automatic session renegotiation: a client re-handshakes when the server asks
+  it to or after reconnecting, so a restart on either side never leaves a
+  stale session blocking the tunnel
 - Server client allow-list (`allow_client`, up to 64 entries)
 - SIGHUP reload of log level and timing settings without dropping the tunnel
 - Periodic statistics and on-demand dumps via SIGUSR1
@@ -131,8 +133,18 @@ sudo systemctl reload pipesix     # apply log_level/keepalive/peer_timeout/...
 sudo kill -USR1 $(pidof pipesix)  # dump statistics now
 ```
 
-`systemctl reload` sends SIGHUP. Interface, endpoint, secret, mode and
+`systemctl reload` sends SIGHUP. Interface, endpoint, credentials, mode and
 allow-list changes require a restart.
+
+On a server, `SIGUSR1` also lists every connected client with its id, peer
+address, frame count and idle time, so you can see who is actually online
+without restarting the relay:
+
+```text
+[INFO] Sessions: 2 connected (of 64 slots)
+[INFO]   client 'alice' from 203.0.113.5:41622: 1841 frame(s), idle 2s
+[INFO]   client 'bob' from [2001:db8::7]:51820: 97 frame(s), idle 41s
+```
 
 ## Security
 

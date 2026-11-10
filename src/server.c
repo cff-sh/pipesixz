@@ -672,6 +672,60 @@ static void sessions_expire(server_context_t *ctx, time_t now)
 }
 
 /*
+ * Log one line per active client session.
+ *
+ * Triggered by SIGUSR1 so an operator can see who is connected, from
+ * where, and how recently they were heard from, without restarting the
+ * relay. The snapshot is taken under the session lock and logged after
+ * the lock is released, so reporting never blocks the data path.
+ */
+static void sessions_dump(server_context_t *ctx)
+{
+    char ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
+    char peers[SERVER_MAX_CLIENTS][96];
+    uint64_t frames[SERVER_MAX_CLIENTS];
+    time_t last_seen[SERVER_MAX_CLIENTS];
+    time_t now = time(NULL);
+    int count = 0;
+    int i;
+
+    pthread_mutex_lock(&ctx->lock);
+
+    for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+        if (!ctx->sessions[i].active) {
+            continue;
+        }
+
+        snprintf(ids[count], sizeof(ids[count]), "%s",
+                 ctx->sessions[i].client_id[0] != '\0'
+                     ? ctx->sessions[i].client_id
+                     : "?");
+        format_peer((const struct sockaddr *)&ctx->sessions[i].addr,
+                    ctx->sessions[i].addr_len, peers[count],
+                    sizeof(peers[count]));
+        frames[count] = ctx->sessions[i].frames;
+        last_seen[count] = ctx->sessions[i].last_seen;
+        count++;
+    }
+
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (count == 0) {
+        log_info("Sessions: none connected");
+        return;
+    }
+
+    log_info("Sessions: %d connected (of %d slots)", count,
+             SERVER_MAX_CLIENTS);
+
+    for (i = 0; i < count; i++) {
+        log_info("  client '%s' from %s: %llu frame(s), idle %lds",
+                 ids[i], peers[i], (unsigned long long)frames[i],
+                 (long)(now - last_seen[i]));
+    }
+}
+
+/*
  * Receiver loop (UDP -> TUN)
  */
 static void *receiver_loop(void *arg)
@@ -1112,6 +1166,7 @@ int server_start(pipesix_config_t *config)
 
             if (runtime_take_stats_request()) {
                 stats_dump(&ctx.stats, "server");
+                sessions_dump(&ctx);
                 last_report = now;
             } else if (config->stats_interval > 0 &&
                        (now - last_report) >=
