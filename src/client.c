@@ -23,8 +23,9 @@
  * the server address, reconnects, re-handshakes with exponential
  * backoff and restarts the workers. A handshake request from the
  * server triggers the same renegotiation without reconnecting. SIGHUP
- * reloads the runtime-tunable configuration without dropping the
- * tunnel.
+ * reloads the runtime-tunable configuration; when this client's own id
+ * or key changed it re-handshakes on the existing socket, so a key can
+ * be rotated without restarting the tunnel.
  */
 
 #include "client.h"
@@ -684,8 +685,10 @@ int client_start(pipesix_config_t *config)
 
         while (!runtime_should_stop()) {
             struct timespec delay;
+            uint8_t new_psk[PIPESIX_KEY_LEN] = {0};
             time_t now;
             int keepalive;
+            int rotate = 0;
 
             delay.tv_sec = 1;
             delay.tv_nsec = 0;
@@ -693,16 +696,74 @@ int client_start(pipesix_config_t *config)
             now = time(NULL);
 
             if (runtime_take_reload_request()) {
+                char old_id[CONFIG_MAX_CLIENT_ID];
+                char old_secret[CONFIG_MAX_SECRET];
+
+                memcpy(old_id, config->client_id, sizeof(old_id));
+                memcpy(old_secret, config->secret, sizeof(old_secret));
+
                 if (config_reload_runtime(config) == 0) {
                     logger_set_level(config->log_level);
                     atomic_store(&ctx.keepalive, config->keepalive);
                     log_info("Configuration reloaded (log_level, keepalive, "
                              "peer_timeout, stats_interval)");
+
+                    /*
+                     * Our own key or identity changed, so the server will
+                     * not accept the current session keys any more. Derive
+                     * the new key before touching the session: if the key
+                     * is unusable the live tunnel keeps working.
+                     */
+                    if (strcmp(old_id, config->client_id) != 0 ||
+                        strcmp(old_secret, config->secret) != 0) {
+                        if (pipesix_key_from_string(config->secret,
+                                                    new_psk) == 0) {
+                            rotate = 1;
+                            log_info("Client credentials changed; "
+                                     "re-handshaking with the server");
+                        } else {
+                            memset(new_psk, 0, sizeof(new_psk));
+                            log_error("Cannot derive a key from the new "
+                                      "'secret'; keeping the current "
+                                      "session");
+                        }
+                    }
                 } else {
                     log_error("Configuration reload failed; keeping the "
                               "previous settings");
                 }
+
+                memset(old_secret, 0, sizeof(old_secret));
                 last_report = now;
+            }
+
+            if (rotate) {
+                /* The workers encrypt with tx_key/rx_key: stop them first. */
+                if (workers_running) {
+                    stop_workers(&ctx, &forward_thread, &reverse_thread);
+                    workers_running = 0;
+                }
+
+                memset(ctx.psk, 0, sizeof(ctx.psk));
+                memset(ctx.tx_key, 0, sizeof(ctx.tx_key));
+                memset(ctx.rx_key, 0, sizeof(ctx.rx_key));
+                memcpy(ctx.psk, new_psk, sizeof(ctx.psk));
+                memset(new_psk, 0, sizeof(new_psk));
+
+                if (renegotiate(&ctx) != 0) {
+                    break;
+                }
+
+                if (start_workers(&ctx, &forward_thread, &reverse_thread)
+                    != 0) {
+                    close(ctx.udp_fd);
+                    tun_close(&tun);
+                    return -1;
+                }
+
+                workers_running = 1;
+                last_report = now;
+                continue;
             }
 
             if (runtime_take_stats_request()) {

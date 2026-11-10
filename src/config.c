@@ -803,6 +803,14 @@ int config_reload_runtime(pipesix_config_t *config)
     if (strcmp(config->mode, "server") == 0) {
         config->client_count = fresh.client_count;
         memcpy(config->clients, fresh.clients, sizeof(config->clients));
+    } else {
+        /*
+         * A client's own identity and key are reloadable as well; the
+         * caller compares them and re-handshakes when they changed, which
+         * is how a client rotates its key without a restart.
+         */
+        memcpy(config->client_id, fresh.client_id, sizeof(config->client_id));
+        memcpy(config->secret, fresh.secret, sizeof(config->secret));
     }
 
     return 0;

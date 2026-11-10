@@ -1174,7 +1174,7 @@ static void test_credential_rotation(void)
     check(config.client_count == 1, "reload adopted the smaller client count");
 }
 
-static void test_client_secret_needs_restart(void)
+static void test_client_secret_rotation(void)
 {
     static const char initial[] =
         "mode = client\n"
@@ -1188,6 +1188,18 @@ static void test_client_secret_needs_restart(void)
         "remote_address = 203.0.113.1\n"
         "client_id = alice\n"
         "secret = cccccccccccccccccccccccccccccccc\n";
+    static const char renamed[] =
+        "mode = client\n"
+        "tun_address = fd00::2/64\n"
+        "remote_address = 203.0.113.1\n"
+        "client_id = alice2\n"
+        "secret = cccccccccccccccccccccccccccccccc\n";
+    static const char broken[] =
+        "mode = client\n"
+        "tun_address = fd00::2/64\n"
+        "remote_address = 203.0.113.1\n"
+        "client_id = alice\n"
+        "secret = \n";
     pipesix_config_t config;
     char path[64];
 
@@ -1197,10 +1209,24 @@ static void test_client_secret_needs_restart(void)
     check(overwrite_file(config.config_path, changed) == 0,
           "rewrite the client key");
     check(config_reload_runtime(&config) == 0, "reload a client with a new key");
-    unlink(path);
+    check(strcmp(config.secret, "cccccccccccccccccccccccccccccccc") == 0,
+          "a client adopts a rotated key on reload");
 
-    check(strcmp(config.secret, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == 0,
-          "a client's own key still requires a restart");
+    check(overwrite_file(config.config_path, renamed) == 0,
+          "rewrite the client id");
+    check(config_reload_runtime(&config) == 0,
+          "reload a client with a new id");
+    check(strcmp(config.client_id, "alice2") == 0,
+          "a client adopts a new id on reload");
+
+    /* An unusable key must be rejected, leaving the current one in place. */
+    check(overwrite_file(config.config_path, broken) == 0,
+          "empty the client key");
+    check(config_reload_runtime(&config) != 0,
+          "a missing client key is rejected");
+    check(strcmp(config.secret, "cccccccccccccccccccccccccccccccc") == 0,
+          "a rejected reload keeps the working key");
+    unlink(path);
 }
 
 static void test_allow_client(void)
@@ -1275,7 +1301,7 @@ int main(void)
     test_client_routes();
     test_config_reload();
     test_credential_rotation();
-    test_client_secret_needs_restart();
+    test_client_secret_rotation();
     test_allow_client();
 
     printf("%d checks, %d failure(s)\n", g_checks, g_failures);
