@@ -96,10 +96,20 @@ int ipv6_parse_header(const uint8_t *data, size_t length,
                       const pipesix_ipv6_header_t **header);
 
 /*
+ * Validate a complete IPv6 packet before injecting it into a TUN
+ * device: version must be 6 and the payload length field must match
+ * the actual datagram length.
+ *
+ * Returns:
+ *   0 if the packet is well formed, -1 otherwise
+ */
+int ipv6_validate_packet(const uint8_t *data, size_t length);
+
+/*
  * Log a summary of the IPv6 packet.
  *
  * Extracts and logs source/destination addresses, payload length,
- * next header protocol, and hop limit at INFO level.
+ * next header protocol, and hop limit at DEBUG level.
  *
  * Parameters:
  *   data   - Pointer to the raw IPv6 packet

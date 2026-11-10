@@ -9,6 +9,10 @@
  *   macOS: Uses the utun (user tunnel) kernel control interface.
  *          Address configuration via the ifconfig command.
  *
+ * External commands are executed with fork/execvp() and argument
+ * arrays, so interface names and addresses cannot be interpreted by a
+ * shell.
+ *
  * The TUN device operates in Layer 3 (IFF_TUN) mode without packet
  * information headers (IFF_NO_PI on Linux, equivalent on macOS),
  * meaning each read/write delivers or expects a raw IP packet.
@@ -17,14 +21,15 @@
 #include "tun.h"
 #include "logger.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 
 #ifdef __linux__
@@ -46,14 +51,87 @@
 #endif
 #endif
 
-#define CMD_BUF_SIZE       512
+/*
+ * Copy an interface name, always NUL-terminating and never writing more
+ * than size - 1 bytes.
+ */
+static void copy_name(char *dst, size_t size, const char *src)
+{
+    size_t len;
+
+    if (dst == NULL || size == 0) {
+        return;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+
+    len = strlen(src);
+    if (len >= size) {
+        len = size - 1;
+    }
+
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
+/*
+ * Run an external command without a shell.
+ *
+ * Parameters:
+ *   argv  - NULL-terminated argument vector
+ *   quiet - Non-zero to discard the child's stdout/stderr
+ *
+ * Returns:
+ *   The command's exit status, or -1 if it could not be run.
+ */
+static int run_command(char *const argv[], int quiet)
+{
+    pid_t pid;
+    int status;
+
+    pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+
+    if (pid == 0) {
+        if (quiet) {
+            int null_fd = open("/dev/null", O_WRONLY);
+
+            if (null_fd >= 0) {
+                (void)dup2(null_fd, STDOUT_FILENO);
+                (void)dup2(null_fd, STDERR_FILENO);
+                if (null_fd > STDERR_FILENO) {
+                    close(null_fd);
+                }
+            }
+        }
+
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            return -1;
+        }
+    }
+
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+
+    return -1;
+}
 
 void tun_init(tun_device_t *tun)
 {
     if (tun == NULL) return;
-    tun->fd   = -1;
+    tun->fd = -1;
     tun->name[0] = '\0';
-    tun->mtu  = 0;
+    tun->mtu = 0;
 }
 
 int tun_open(tun_device_t *tun, const char *name,
@@ -78,7 +156,7 @@ int tun_open(tun_device_t *tun, const char *name,
     ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
 
     if (name != NULL && strlen(name) > 0) {
-        strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+        copy_name(ifr.ifr_name, sizeof(ifr.ifr_name), name);
     }
 
     rc = ioctl(fd, TUNSETIFF, &ifr);
@@ -88,15 +166,14 @@ int tun_open(tun_device_t *tun, const char *name,
         return -1;
     }
 
-    strncpy(tun->name, ifr.ifr_name, sizeof(tun->name) - 1);
+    copy_name(tun->name, sizeof(tun->name), ifr.ifr_name);
     tun->fd = fd;
 
     log_info("TUN device '%s' created (fd=%d)", tun->name, tun->fd);
 
     if (mtu > 0) {
         memset(&ifr, 0, sizeof(ifr));
-        memcpy(ifr.ifr_name, tun->name, IFNAMSIZ - 1);
-        ifr.ifr_name[IFNAMSIZ - 1] = '\0';
+        copy_name(ifr.ifr_name, sizeof(ifr.ifr_name), tun->name);
         ifr.ifr_mtu = mtu;
 
         rc = ioctl(fd, SIOCSIFMTU, &ifr);
@@ -109,34 +186,49 @@ int tun_open(tun_device_t *tun, const char *name,
     }
 
     if (address != NULL && strlen(address) > 0) {
-        char cmd[CMD_BUF_SIZE];
-        int cmd_rc;
+        char addr_opt[INET6_ADDRSTRLEN + 8];
+        char *addr_argv[8];
+        char *up_argv[8];
+        int n;
 
-        rc = snprintf(cmd, sizeof(cmd),
-                      "ip -6 addr add %s/%d dev %s 2>/dev/null",
-                      address, prefixlen, tun->name);
-        if (rc < 0 || (size_t)rc >= sizeof(cmd)) {
-            log_error("Address configuration command too long");
+        n = snprintf(addr_opt, sizeof(addr_opt), "%s/%d", address, prefixlen);
+        if (n < 0 || (size_t)n >= sizeof(addr_opt)) {
+            log_error("IPv6 address option too long");
             tun_close(tun);
             return -1;
         }
 
-        cmd_rc = system(cmd);
-        if (cmd_rc != 0) {
-            log_warn("'ip -6 addr add' returned %d (address may already exist)", cmd_rc);
+        /*
+         * "replace" is idempotent: restarting pipesix does not fail
+         * because the address already exists.
+         */
+        addr_argv[0] = "ip";
+        addr_argv[1] = "-6";
+        addr_argv[2] = "addr";
+        addr_argv[3] = "replace";
+        addr_argv[4] = addr_opt;
+        addr_argv[5] = "dev";
+        addr_argv[6] = tun->name;
+        addr_argv[7] = NULL;
+
+        rc = run_command(addr_argv, 1);
+        if (rc != 0) {
+            log_warn("'ip -6 addr replace' returned %d (address may already exist)",
+                     rc);
         }
 
-        rc = snprintf(cmd, sizeof(cmd),
-                      "ip link set %s up 2>/dev/null", tun->name);
-        if (rc < 0 || (size_t)rc >= sizeof(cmd)) {
-            log_error("Link up command too long");
-            tun_close(tun);
-            return -1;
-        }
+        up_argv[0] = "ip";
+        up_argv[1] = "link";
+        up_argv[2] = "set";
+        up_argv[3] = "dev";
+        up_argv[4] = tun->name;
+        up_argv[5] = "up";
+        up_argv[6] = NULL;
 
-        cmd_rc = system(cmd);
-        if (cmd_rc != 0) {
-            log_error("Failed to bring TUN interface up (ip link returned %d)", cmd_rc);
+        rc = run_command(up_argv, 1);
+        if (rc != 0) {
+            log_error("Failed to bring TUN interface up (ip link returned %d)",
+                      rc);
             tun_close(tun);
             return -1;
         }
@@ -158,7 +250,7 @@ int tun_open(tun_device_t *tun, const char *name,
     }
 
     memset(&ci, 0, sizeof(ci));
-    strncpy(ci.ctl_name, UTUN_CONTROL_NAME, sizeof(ci.ctl_name) - 1);
+    copy_name(ci.ctl_name, sizeof(ci.ctl_name), UTUN_CONTROL_NAME);
 
     rc = ioctl(fd, CTLIOCGINFO, &ci);
     if (rc < 0) {
@@ -184,27 +276,35 @@ int tun_open(tun_device_t *tun, const char *name,
     memset(ifname, 0, sizeof(ifname));
     {
         socklen_t ifnamelen = sizeof(ifname);
+
         if (getsockopt(fd, SYSPROTO_CONTROL, UTUN_OPT_IFNAME,
                        ifname, &ifnamelen) < 0) {
-            log_error("getsockopt(UTUN_OPT_IFNAME) failed: %s", strerror(errno));
+            log_error("getsockopt(UTUN_OPT_IFNAME) failed: %s",
+                      strerror(errno));
             close(fd);
             return -1;
         }
     }
 
-    strncpy(tun->name, ifname, sizeof(tun->name) - 1);
+    copy_name(tun->name, sizeof(tun->name), ifname);
     tun->fd = fd;
 
     log_info("TUN device '%s' created (fd=%d)", tun->name, tun->fd);
 
     if (mtu > 0) {
-        char cmd[CMD_BUF_SIZE];
+        char mtu_opt[16];
+        char *mtu_argv[5];
+        int n = snprintf(mtu_opt, sizeof(mtu_opt), "%d", mtu);
 
-        rc = snprintf(cmd, sizeof(cmd),
-                      "ifconfig %s mtu %d 2>/dev/null", tun->name, mtu);
-        if (rc < 0 || (size_t)rc >= sizeof(cmd)) {
-            log_error("MTU command too long");
-        } else if (system(cmd) != 0) {
+        mtu_argv[0] = "ifconfig";
+        mtu_argv[1] = tun->name;
+        mtu_argv[2] = "mtu";
+        mtu_argv[3] = mtu_opt;
+        mtu_argv[4] = NULL;
+
+        if (n < 0 || (size_t)n >= sizeof(mtu_opt)) {
+            log_error("MTU option too long");
+        } else if (run_command(mtu_argv, 1) != 0) {
             log_warn("Failed to set MTU to %d on %s", mtu, tun->name);
         } else {
             tun->mtu = mtu;
@@ -213,22 +313,27 @@ int tun_open(tun_device_t *tun, const char *name,
     }
 
     if (address != NULL && strlen(address) > 0) {
-        char cmd[CMD_BUF_SIZE];
-        int cmd_rc;
+        char addr_opt[INET6_ADDRSTRLEN + 8];
+        char *addr_argv[6];
+        int n;
 
-        rc = snprintf(cmd, sizeof(cmd),
-                      "ifconfig %s inet6 %s/%d up 2>/dev/null",
-                      tun->name, address, prefixlen);
-        if (rc < 0 || (size_t)rc >= sizeof(cmd)) {
-            log_error("Address configuration command too long");
+        n = snprintf(addr_opt, sizeof(addr_opt), "%s/%d", address, prefixlen);
+        if (n < 0 || (size_t)n >= sizeof(addr_opt)) {
+            log_error("IPv6 address option too long");
             tun_close(tun);
             return -1;
         }
 
-        cmd_rc = system(cmd);
-        if (cmd_rc != 0) {
-            log_error("Failed to configure address on %s "
-                      "(ifconfig returned %d)", tun->name, cmd_rc);
+        addr_argv[0] = "ifconfig";
+        addr_argv[1] = tun->name;
+        addr_argv[2] = "inet6";
+        addr_argv[3] = addr_opt;
+        addr_argv[4] = "up";
+        addr_argv[5] = NULL;
+
+        if (run_command(addr_argv, 1) != 0) {
+            log_error("Failed to configure address %s on %s",
+                      addr_opt, tun->name);
             tun_close(tun);
             return -1;
         }

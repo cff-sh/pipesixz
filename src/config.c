@@ -8,123 +8,261 @@
  *   key = value
  *
  * Leading and trailing whitespace is stripped from keys and values.
- * Unknown keys are silently ignored to allow forward compatibility.
- * Required fields are validated after loading.
+ * Values are length-checked so typos fail early instead of being
+ * silently truncated. Required fields are validated after loading.
  */
 
 #include "config.h"
 
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <ctype.h>
-#include <errno.h>
 
 /*
  * Trim leading and trailing whitespace from a string in place.
- *
- * Parameters:
- *   str - NUL-terminated string to trim
- *
- * Returns:
- *   Pointer to the trimmed string (same buffer)
  */
 static char *str_trim(char *str)
 {
     char *end;
 
-    /* Trim leading space */
     while (isspace((unsigned char)*str)) {
         str++;
     }
 
-    /* Trim trailing space */
-    end = str + strlen(str) - 1;
-    while (end > str && isspace((unsigned char)*end)) {
+    end = str + strlen(str);
+    while (end > str && isspace((unsigned char)*(end - 1))) {
         end--;
     }
 
-    /* Write new null terminator */
-    *(end + 1) = '\0';
-
+    *end = '\0';
     return str;
+}
+
+static int copy_string(char *dst, size_t size, const char *value)
+{
+    size_t len = strlen(value);
+
+    if (len >= size) {
+        return -1;
+    }
+
+    memcpy(dst, value, len + 1);
+    return 0;
+}
+
+static int parse_int(const char *value, int *out)
+{
+    char *end = NULL;
+    long parsed;
+
+    if (value == NULL || out == NULL) {
+        return -1;
+    }
+
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+
+    if (errno != 0 || end == value || *end != '\0') {
+        return -1;
+    }
+    if (parsed < INT_MIN || parsed > INT_MAX) {
+        return -1;
+    }
+
+    *out = (int)parsed;
+    return 0;
+}
+
+static int set_int_range(int *dst, const char *value, int min, int max)
+{
+    int parsed;
+
+    if (parse_int(value, &parsed) != 0 || parsed < min || parsed > max) {
+        return -1;
+    }
+
+    *dst = parsed;
+    return 0;
 }
 
 /*
  * Set default values for all configuration fields.
- *
- * Parameters:
- *   config - Configuration structure to initialize
  */
 static void config_set_defaults(pipesix_config_t *config)
 {
     memset(config, 0, sizeof(*config));
 
-    strncpy(config->tun_name, CONFIG_DEFAULT_TUN_NAME, CONFIG_MAX_TUN_NAME - 1);
-    config->tun_prefixlen = CONFIG_DEFAULT_TUN_PREFIX;
-    config->tun_mtu       = CONFIG_DEFAULT_TUN_MTU;
-    config->remote_port   = CONFIG_DEFAULT_PORT;
-    strncpy(config->bind_address, CONFIG_DEFAULT_BIND_ADDRESS, CONFIG_MAX_ADDRESS - 1);
-    config->bind_port     = CONFIG_DEFAULT_PORT;
-    config->log_level     = CONFIG_DEFAULT_LOG_LEVEL;
+    memcpy(config->tun_name, CONFIG_DEFAULT_TUN_NAME,
+           sizeof(CONFIG_DEFAULT_TUN_NAME));
+    config->tun_prefixlen  = CONFIG_DEFAULT_TUN_PREFIX;
+    config->tun_mtu        = CONFIG_DEFAULT_TUN_MTU;
+    config->remote_port    = CONFIG_DEFAULT_PORT;
+    memcpy(config->bind_address, CONFIG_DEFAULT_BIND_ADDRESS,
+           sizeof(CONFIG_DEFAULT_BIND_ADDRESS));
+    config->bind_port      = CONFIG_DEFAULT_PORT;
+    config->keepalive      = CONFIG_DEFAULT_KEEPALIVE;
+    config->session_timeout = CONFIG_DEFAULT_SESSION_TIMEOUT;
+    config->peer_timeout   = CONFIG_DEFAULT_PEER_TIMEOUT;
+    config->stats_interval = CONFIG_DEFAULT_STATS_INTERVAL;
+    config->log_level      = CONFIG_DEFAULT_LOG_LEVEL;
+}
+
+int config_parse_log_level(const char *str, log_level_t *level)
+{
+    if (str == NULL || level == NULL) {
+        return -1;
+    }
+
+    if (strcasecmp(str, "debug") == 0) { *level = LOG_DEBUG; return 0; }
+    if (strcasecmp(str, "info") == 0)  { *level = LOG_INFO;  return 0; }
+    if (strcasecmp(str, "warn") == 0)  { *level = LOG_WARN;  return 0; }
+    if (strcasecmp(str, "error") == 0) { *level = LOG_ERROR; return 0; }
+    if (strcasecmp(str, "fatal") == 0) { *level = LOG_FATAL; return 0; }
+    return -1;
 }
 
 /*
- * Parse a log level string into the corresponding enum value.
- *
- * Parameters:
- *   str   - Log level string (case-insensitive)
- *   level - Output parameter for parsed level
- *
- * Returns:
- *   0 on success, -1 if the string is not a valid log level
+ * Accept tun_address with or without an explicit /prefix.
  */
-static int parse_log_level(const char *str, log_level_t *level)
+static int set_tun_address(pipesix_config_t *config, const char *value)
 {
-    if (strcasecmp(str, "debug") == 0)  { *level = LOG_DEBUG; return 0; }
-    if (strcasecmp(str, "info") == 0)   { *level = LOG_INFO;  return 0; }
-    if (strcasecmp(str, "warn") == 0)   { *level = LOG_WARN;  return 0; }
-    if (strcasecmp(str, "error") == 0)  { *level = LOG_ERROR; return 0; }
-    if (strcasecmp(str, "fatal") == 0)  { *level = LOG_FATAL; return 0; }
-    return -1;
+    const char *slash = strchr(value, '/');
+
+    if (slash != NULL) {
+        size_t addr_len = (size_t)(slash - value);
+        int prefix;
+
+        if (addr_len == 0 || addr_len >= CONFIG_MAX_ADDRESS) {
+            return -1;
+        }
+        if (parse_int(slash + 1, &prefix) != 0 || prefix < 0 || prefix > 128) {
+            return -1;
+        }
+
+        memcpy(config->tun_address, value, addr_len);
+        config->tun_address[addr_len] = '\0';
+        config->tun_prefixlen = prefix;
+        return 0;
+    }
+
+    return copy_string(config->tun_address, CONFIG_MAX_ADDRESS, value);
+}
+
+/*
+ * Parse a comma/space separated allow-list of numeric client IPs.
+ */
+static int set_allow_client(pipesix_config_t *config, const char *value)
+{
+    char work[CONFIG_MAX_ALLOWED * CONFIG_MAX_ADDRESS];
+    struct in_addr v4;
+    struct in6_addr v6;
+    char *saveptr = NULL;
+    char *token;
+    int count = 0;
+
+    if (strlen(value) >= sizeof(work)) {
+        return -1;
+    }
+    memcpy(work, value, strlen(value) + 1);
+
+    for (token = strtok_r(work, ", \t", &saveptr);
+         token != NULL;
+         token = strtok_r(NULL, ", \t", &saveptr)) {
+        size_t len = strlen(token);
+
+        if (count >= CONFIG_MAX_ALLOWED) {
+            return -1;
+        }
+        if (len == 0 || len >= CONFIG_MAX_ADDRESS) {
+            return -1;
+        }
+        if (inet_pton(AF_INET, token, &v4) != 1 &&
+            inet_pton(AF_INET6, token, &v6) != 1) {
+            return -1;
+        }
+
+        memcpy(config->allow_client[count], token, len + 1);
+        count++;
+    }
+
+    if (count == 0) {
+        return -1;
+    }
+
+    config->allow_client_count = count;
+    return 0;
 }
 
 /*
  * Process a single key=value line and update the configuration.
  *
- * Parameters:
- *   config - Configuration structure to update
- *   key    - Trimmed key string
- *   value  - Trimmed value string
+ * Returns 0 on success, -1 if the value is invalid or too long.
  */
-static void config_set_value(pipesix_config_t *config, const char *key, const char *value)
+static int config_set_value(pipesix_config_t *config, const char *key,
+                            const char *value)
 {
     if (strcmp(key, "mode") == 0) {
-        strncpy(config->mode, value, CONFIG_MAX_MODE - 1);
-    } else if (strcmp(key, "tun_name") == 0) {
-        strncpy(config->tun_name, value, CONFIG_MAX_TUN_NAME - 1);
-    } else if (strcmp(key, "tun_address") == 0) {
-        strncpy(config->tun_address, value, CONFIG_MAX_ADDRESS - 1);
-    } else if (strcmp(key, "tun_prefixlen") == 0) {
-        config->tun_prefixlen = atoi(value);
-    } else if (strcmp(key, "tun_mtu") == 0) {
-        config->tun_mtu = atoi(value);
-    } else if (strcmp(key, "remote_address") == 0) {
-        strncpy(config->remote_address, value, CONFIG_MAX_ADDRESS - 1);
-    } else if (strcmp(key, "remote_port") == 0) {
-        config->remote_port = atoi(value);
-    } else if (strcmp(key, "bind_address") == 0) {
-        strncpy(config->bind_address, value, CONFIG_MAX_ADDRESS - 1);
-    } else if (strcmp(key, "bind_port") == 0) {
-        config->bind_port = atoi(value);
-    } else if (strcmp(key, "log_level") == 0) {
-        log_level_t level;
-        if (parse_log_level(value, &level) == 0) {
-            config->log_level = level;
-        }
+        return copy_string(config->mode, CONFIG_MAX_MODE, value);
     }
-    /* Unknown keys are silently ignored */
+    if (strcmp(key, "tun_name") == 0) {
+        return copy_string(config->tun_name, CONFIG_MAX_TUN_NAME, value);
+    }
+    if (strcmp(key, "tun_address") == 0) {
+        return set_tun_address(config, value);
+    }
+    if (strcmp(key, "tun_prefixlen") == 0) {
+        return set_int_range(&config->tun_prefixlen, value, 0, 128);
+    }
+    if (strcmp(key, "tun_mtu") == 0) {
+        return set_int_range(&config->tun_mtu, value, 0, 65535);
+    }
+    if (strcmp(key, "remote_address") == 0) {
+        return copy_string(config->remote_address, CONFIG_MAX_ADDRESS, value);
+    }
+    if (strcmp(key, "remote_port") == 0) {
+        return set_int_range(&config->remote_port, value, 1, 65535);
+    }
+    if (strcmp(key, "bind_address") == 0) {
+        return copy_string(config->bind_address, CONFIG_MAX_ADDRESS, value);
+    }
+    if (strcmp(key, "bind_port") == 0) {
+        return set_int_range(&config->bind_port, value, 1, 65535);
+    }
+    if (strcmp(key, "secret") == 0) {
+        return copy_string(config->secret, CONFIG_MAX_SECRET, value);
+    }
+    if (strcmp(key, "keepalive") == 0) {
+        return set_int_range(&config->keepalive, value, 0, 3600);
+    }
+    if (strcmp(key, "session_timeout") == 0) {
+        return set_int_range(&config->session_timeout, value, 0, 86400);
+    }
+    if (strcmp(key, "peer_timeout") == 0) {
+        return set_int_range(&config->peer_timeout, value, 0, 86400);
+    }
+    if (strcmp(key, "allow_client") == 0) {
+        return set_allow_client(config, value);
+    }
+    if (strcmp(key, "stats_interval") == 0) {
+        return set_int_range(&config->stats_interval, value, 0, 86400);
+    }
+    if (strcmp(key, "log_level") == 0) {
+        log_level_t level;
+
+        if (config_parse_log_level(value, &level) != 0) {
+            return -1;
+        }
+        config->log_level = level;
+        return 0;
+    }
+
+    log_warn("Configuration: ignoring unknown key '%s'", key);
+    return 0;
 }
 
 int config_load(const char *path, pipesix_config_t *config)
@@ -138,10 +276,13 @@ int config_load(const char *path, pipesix_config_t *config)
         return -1;
     }
 
-    /* Initialize with defaults */
     config_set_defaults(config);
 
-    /* Open configuration file */
+    if (copy_string(config->config_path, sizeof(config->config_path),
+                    path) != 0) {
+        config->config_path[0] = '\0';
+    }
+
     fp = fopen(path, "r");
     if (fp == NULL) {
         fprintf(stderr, "config_load: cannot open '%s': %s\n",
@@ -149,11 +290,18 @@ int config_load(const char *path, pipesix_config_t *config)
         return -1;
     }
 
-    /* Parse each line */
     while (fgets(line, sizeof(line), fp) != NULL) {
         char *ptr, *key, *value;
 
         line_num++;
+
+        /* Detect lines too long for the buffer before trimming. */
+        if (strchr(line, '\n') == NULL && !feof(fp)) {
+            fprintf(stderr, "config_load: %s:%u: line too long\n",
+                    path, line_num);
+            fclose(fp);
+            return -1;
+        }
 
         /* Remove trailing newline/carriage return */
         ptr = line + strlen(line);
@@ -177,7 +325,6 @@ int config_load(const char *path, pipesix_config_t *config)
             return -1;
         }
 
-        /* Split into key and value */
         *value = '\0';
         key = str_trim(line);
         value = str_trim(value + 1);
@@ -189,7 +336,13 @@ int config_load(const char *path, pipesix_config_t *config)
             return -1;
         }
 
-        config_set_value(config, key, value);
+        if (config_set_value(config, key, value) != 0) {
+            fprintf(stderr,
+                    "config_load: %s:%u: invalid value for '%s'\n",
+                    path, line_num, key);
+            fclose(fp);
+            return -1;
+        }
     }
 
     fclose(fp);
@@ -198,11 +351,12 @@ int config_load(const char *path, pipesix_config_t *config)
 
 int config_validate(const pipesix_config_t *config)
 {
+    struct in6_addr parsed_addr;
+
     if (config == NULL) {
         return -1;
     }
 
-    /* Validate mode */
     if (strlen(config->mode) == 0) {
         log_error("Configuration validation failed: 'mode' is required (client or server)");
         return -1;
@@ -215,9 +369,14 @@ int config_validate(const pipesix_config_t *config)
         return -1;
     }
 
-    /* Validate TUN configuration */
     if (strlen(config->tun_address) == 0) {
         log_error("Configuration validation failed: 'tun_address' is required");
+        return -1;
+    }
+
+    if (inet_pton(AF_INET6, config->tun_address, &parsed_addr) != 1) {
+        log_error("Configuration validation failed: 'tun_address' is not a valid IPv6 address (got '%s')",
+                  config->tun_address);
         return -1;
     }
 
@@ -227,17 +386,25 @@ int config_validate(const pipesix_config_t *config)
         return -1;
     }
 
-    if (config->tun_mtu < 576 || config->tun_mtu > 65535) {
-        log_warn("TUN MTU %d is unusual (expected 576-65535)", config->tun_mtu);
+    if (config->tun_mtu != 0 &&
+        (config->tun_mtu < 576 || config->tun_mtu > 65535)) {
+        log_error("Configuration validation failed: 'tun_mtu' must be 576-65535 or 0 to leave it unchanged (got %d)",
+                  config->tun_mtu);
+        return -1;
     }
 
-    /* Validate mode-specific fields */
+    if (config->peer_timeout < 0 || config->peer_timeout > 86400) {
+        log_error("Configuration validation failed: 'peer_timeout' must be 0-86400 (got %d)",
+                  config->peer_timeout);
+        return -1;
+    }
+
     if (strcmp(config->mode, "client") == 0) {
         if (strlen(config->remote_address) == 0) {
             log_error("Configuration validation failed: 'remote_address' is required in client mode");
             return -1;
         }
-        if (config->remote_port <= 0 || config->remote_port > 65535) {
+        if (config->remote_port < 1 || config->remote_port > 65535) {
             log_error("Configuration validation failed: 'remote_port' must be 1-65535 (got %d)",
                       config->remote_port);
             return -1;
@@ -249,11 +416,20 @@ int config_validate(const pipesix_config_t *config)
             log_error("Configuration validation failed: 'bind_address' is required in server mode");
             return -1;
         }
-        if (config->bind_port <= 0 || config->bind_port > 65535) {
+        if (config->bind_port < 1 || config->bind_port > 65535) {
             log_error("Configuration validation failed: 'bind_port' must be 1-65535 (got %d)",
                       config->bind_port);
             return -1;
         }
+        if (config->secret[0] == '\0') {
+            log_warn("Server is running without a 'secret': frames are sent in "
+                     "plaintext and any host that can reach the UDP port can "
+                     "inject traffic");
+        }
+    }
+
+    if (config->secret[0] != '\0' && strlen(config->secret) < 16) {
+        log_warn("Configured 'secret' is short; generate one with 'pipesix --genkey'");
     }
 
     return 0;
@@ -261,12 +437,23 @@ int config_validate(const pipesix_config_t *config)
 
 void config_dump(const pipesix_config_t *config)
 {
+    const char *level_str = "UNKNOWN";
+
     if (config == NULL) return;
+
+    switch (config->log_level) {
+        case LOG_DEBUG: level_str = "debug"; break;
+        case LOG_INFO:  level_str = "info";  break;
+        case LOG_WARN:  level_str = "warn";  break;
+        case LOG_ERROR: level_str = "error"; break;
+        case LOG_FATAL: level_str = "fatal"; break;
+    }
 
     log_info("Configuration:");
     log_info("  mode            = %s", config->mode);
     log_info("  tun_name        = %s", config->tun_name);
-    log_info("  tun_address     = %s/%d", config->tun_address, config->tun_prefixlen);
+    log_info("  tun_address     = %s/%d", config->tun_address,
+             config->tun_prefixlen);
     log_info("  tun_mtu         = %d", config->tun_mtu);
 
     if (strcmp(config->mode, "client") == 0) {
@@ -277,16 +464,45 @@ void config_dump(const pipesix_config_t *config)
     if (strcmp(config->mode, "server") == 0) {
         log_info("  bind_address    = %s", config->bind_address);
         log_info("  bind_port       = %d", config->bind_port);
+        log_info("  allow_client    = %d configured",
+                 config->allow_client_count);
     }
 
-    /* Convert log level back to string for display */
-    const char *level_str = "UNKNOWN";
-    switch (config->log_level) {
-        case LOG_DEBUG: level_str = "debug"; break;
-        case LOG_INFO:  level_str = "info";  break;
-        case LOG_WARN:  level_str = "warn";  break;
-        case LOG_ERROR: level_str = "error"; break;
-        case LOG_FATAL: level_str = "fatal"; break;
-    }
+    log_info("  secret          = %s",
+             (config->secret[0] != '\0') ? "(set)" : "(not set)");
+    log_info("  keepalive       = %d s", config->keepalive);
+    log_info("  peer_timeout    = %d s", config->peer_timeout);
+    log_info("  session_timeout = %d s", config->session_timeout);
+    log_info("  stats_interval  = %d s", config->stats_interval);
     log_info("  log_level       = %s", level_str);
+}
+
+int config_reload_runtime(pipesix_config_t *config)
+{
+    pipesix_config_t fresh;
+
+    if (config == NULL || config->config_path[0] == '\0') {
+        return -1;
+    }
+
+    if (config_load(config->config_path, &fresh) != 0) {
+        return -1;
+    }
+
+    if (config_validate(&fresh) != 0) {
+        return -1;
+    }
+
+    if (strcmp(fresh.mode, config->mode) != 0) {
+        log_error("Configuration reload rejected: 'mode' cannot change at runtime");
+        return -1;
+    }
+
+    config->log_level       = fresh.log_level;
+    config->keepalive       = fresh.keepalive;
+    config->peer_timeout    = fresh.peer_timeout;
+    config->session_timeout = fresh.session_timeout;
+    config->stats_interval  = fresh.stats_interval;
+
+    return 0;
 }

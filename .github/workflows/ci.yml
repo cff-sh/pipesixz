@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and test (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [ gcc, clang ]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with warnings treated as errors
+        run: make CC=${{ matrix.cc }} CFLAGS="-O2 -g -Werror"
+
+      - name: Run unit tests
+        run: make CC=${{ matrix.cc }} CFLAGS="-O2 -g -Werror" check
+
+      - name: Validate the example configuration
+        run: ./pipesix -t -c pipesix.conf.example
+
+  sanitizers:
+    name: address and UB sanitizers
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test under ASan and UBSan
+        run: |
+          make distclean
+          make CFLAGS="-O1 -g -Werror -fsanitize=address,undefined -fno-omit-frame-pointer" check

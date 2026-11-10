@@ -1,152 +1,606 @@
 /*
  * server.c - pipesix Server Mode Implementation
  *
- * Implements the server-side tunnel operation. The server:
+ * The server relays between clients and the upstream TUN route:
  *
- *   1. Creates a TUN device (tun0) with a configured IPv6 address
- *   2. Binds a UDP socket to listen for client connections
- *   3. Spawns two worker threads:
- *        - network_to_tun: Receives frames from the client via UDP,
- *          decapsulates IPv6 packets, and writes them to the TUN
- *          device for forwarding to the Route64 gateway
- *        - tun_to_network: Reads IPv6 packets from the TUN device
- *          (return traffic from the gateway), encapsulates them
- *          in frames, and sends them back to the client
- *   4. Waits for a shutdown signal, then gracefully terminates
+ *   Client -> UDP -> receiver loop -> TUN -> upstream gateway
+ *   Client <- UDP <- sender loop   <- TUN <- upstream gateway
  *
- * The server dynamically learns the client's address from the first
- * received packet and uses that address for all return traffic.
- * In the current implementation, the server serves a single client.
- * If a new client connects, the previous client is replaced.
+ * Multiple clients are supported concurrently. Each session is keyed
+ * by its UDP endpoint and owns its own replay window, so one client's
+ * restarts and NAT rebinds never disturb another's. Sessions are
+ * created on the first valid frame and expire after 'session_timeout'
+ * seconds without traffic; when the table is full the least recently
+ * used session is evicted.
+ *
+ * Return traffic is routed by learning which session a client's inner
+ * IPv6 source addresses arrive from. The sender looks the packet's
+ * destination address up in that table, which lets several clients
+ * share one tunnel without any per-client configuration. When exactly
+ * one client is connected the lookup falls back to that session, so
+ * traffic to an address that has not been learned yet still flows.
+ *
+ * With a 'secret' configured, every frame is encrypted and
+ * authenticated with ChaCha20-Poly1305; a session is only ever
+ * established from a frame whose tag verified. Keepalives are echoed
+ * so clients get a liveness signal for dead-peer detection.
+ *
+ * An optional allow-list ('allow_client') restricts which source
+ * addresses may reach the tunnel at all.
  */
 
 #include "server.h"
-#include "tun.h"
 #include "config.h"
-#include "proto.h"
+#include "crypto.h"
 #include "ipv6.h"
 #include "logger.h"
+#include "proto.h"
+#include "runtime.h"
+#include "stats.h"
+#include "tun.h"
 
+#include <errno.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <errno.h>
-#include <pthread.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
+#include <time.h>
+#include <unistd.h>
+
+#define POLL_INTERVAL_MS   500
+#define SERVER_MAX_CLIENTS 64
+#define SERVER_MAX_ROUTES  512
+
+typedef struct {
+    int                     active;
+    struct sockaddr_storage addr;
+    socklen_t               addr_len;
+    pipesix_replay_t        replay;
+    time_t                  last_seen;
+    uint64_t                frames;
+} server_session_t;
 
 /*
- * Receiver Thread (Network -> TUN)
- *
- * Continuously receives frames from the client via UDP recvfrom(),
- * validates the frame header, decapsulates the IPv6 packet, and
- * writes it to the TUN device. The TUN device kernel-side routing
- * then forwards the packet to the Route64 gateway.
- *
- * This thread also learns and updates the client's address so that
- * the sender thread knows where to send return traffic.
- *
- * Parameters:
- *   arg - Pointer to server_context_t
- *
- * Returns:
- *   NULL always
+ * Learned mapping from an inner IPv6 address to the session it was
+ * last seen on.
  */
-static void *network_to_tun_thread(void *arg)
+typedef struct {
+    int     active;
+    uint8_t addr[16];
+    int     session;
+    time_t  last_seen;
+} server_route_t;
+
+typedef struct {
+    pipesix_config_t  *config;
+    tun_device_t      *tun;
+    int                udp_fd;
+    int                sock_family;
+    uint8_t            key[PIPESIX_KEY_LEN];
+    int                auth_enabled;
+    _Atomic uint64_t   seq;
+    uint32_t           salt;
+    _Atomic int        session_timeout;
+    server_session_t   sessions[SERVER_MAX_CLIENTS];
+    server_route_t     routes[SERVER_MAX_ROUTES];
+    pthread_mutex_t    lock;
+    pipesix_stats_t    stats;
+} server_context_t;
+
+static uint64_t next_seq(server_context_t *ctx)
+{
+    return atomic_fetch_add_explicit(&ctx->seq, 1, memory_order_relaxed);
+}
+
+static int sockaddr_equal(const struct sockaddr_storage *a,
+                          const struct sockaddr_storage *b)
+{
+    if (a->ss_family != b->ss_family) {
+        return 0;
+    }
+
+    if (a->ss_family == AF_INET) {
+        const struct sockaddr_in *x = (const struct sockaddr_in *)(const void *)a;
+        const struct sockaddr_in *y = (const struct sockaddr_in *)(const void *)b;
+
+        return x->sin_port == y->sin_port &&
+               x->sin_addr.s_addr == y->sin_addr.s_addr;
+    }
+
+    if (a->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *x = (const struct sockaddr_in6 *)(const void *)a;
+        const struct sockaddr_in6 *y = (const struct sockaddr_in6 *)(const void *)b;
+
+        return x->sin6_port == y->sin6_port &&
+               x->sin6_scope_id == y->sin6_scope_id &&
+               memcmp(&x->sin6_addr, &y->sin6_addr,
+                      sizeof(x->sin6_addr)) == 0;
+    }
+
+    return 0;
+}
+
+static void format_peer(const struct sockaddr *addr, socklen_t addr_len,
+                        char *out, size_t out_size)
+{
+    char host[NI_MAXHOST];
+    char serv[NI_MAXSERV];
+
+    if (getnameinfo(addr, addr_len, host, sizeof(host),
+                    serv, sizeof(serv),
+                    NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+        snprintf(out, out_size, "unknown");
+        return;
+    }
+
+    if (addr->sa_family == AF_INET6) {
+        snprintf(out, out_size, "[%s]:%s", host, serv);
+    } else {
+        snprintf(out, out_size, "%s:%s", host, serv);
+    }
+}
+
+/*
+ * Return non-zero when the peer is permitted by 'allow_client'.
+ * An empty allow-list permits any sender.
+ */
+static int peer_allowed(const server_context_t *ctx,
+                        const struct sockaddr *addr, socklen_t addr_len)
+{
+    char host[NI_MAXHOST];
+    int i;
+
+    if (ctx->config->allow_client_count == 0) {
+        return 1;
+    }
+
+    if (getnameinfo(addr, addr_len, host, sizeof(host), NULL, 0,
+                    NI_NUMERICHOST) != 0) {
+        return 0;
+    }
+
+    for (i = 0; i < ctx->config->allow_client_count; i++) {
+        if (strcmp(host, ctx->config->allow_client[i]) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Send a control frame (RESET or KEEPALIVE) to a peer.
+ */
+static void send_control(server_context_t *ctx,
+                         const struct sockaddr_storage *peer,
+                         socklen_t peer_len, uint16_t flags)
+{
+    uint8_t frame[PIPESIX_MAX_FRAME];
+    size_t frame_len;
+
+    frame_len = pipesix_frame_build(frame, sizeof(frame), flags, ctx->salt,
+                                    next_seq(ctx), NULL, 0,
+                                    ctx->auth_enabled ? ctx->key : NULL);
+    if (frame_len == 0) {
+        log_debug("Failed to build control frame");
+        return;
+    }
+
+    if (sendto(ctx->udp_fd, frame, frame_len, 0,
+               (const struct sockaddr *)peer, peer_len) !=
+        (ssize_t)frame_len) {
+        log_debug("Failed to send control frame: %s", strerror(errno));
+    }
+}
+
+/*
+ * ---------------------------------------------------------------------
+ * Session and route tables (all helpers require ctx->lock)
+ * ---------------------------------------------------------------------
+ */
+
+static void routes_clear_slot(server_context_t *ctx, int slot)
+{
+    int i;
+
+    for (i = 0; i < SERVER_MAX_ROUTES; i++) {
+        if (ctx->routes[i].active && ctx->routes[i].session == slot) {
+            ctx->routes[i].active = 0;
+        }
+    }
+}
+
+static int session_find(const server_context_t *ctx,
+                        const struct sockaddr_storage *peer)
+{
+    int i;
+
+    for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+        if (ctx->sessions[i].active &&
+            sockaddr_equal(&ctx->sessions[i].addr, peer)) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+/*
+ * Allocate a session slot for a new peer, evicting the least recently
+ * used session when the table is full. Stale routes pointing at the
+ * reused slot are cleared so another client's addresses can never be
+ * sent to the new one.
+ */
+static int session_alloc(server_context_t *ctx,
+                         const struct sockaddr_storage *peer,
+                         socklen_t peer_len, int *evicted)
+{
+    int slot = -1;
+    int i;
+
+    *evicted = 0;
+
+    for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+        if (!ctx->sessions[i].active) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot < 0) {
+        time_t oldest = 0;
+
+        slot = 0;
+        oldest = ctx->sessions[0].last_seen;
+        for (i = 1; i < SERVER_MAX_CLIENTS; i++) {
+            if (ctx->sessions[i].last_seen < oldest) {
+                oldest = ctx->sessions[i].last_seen;
+                slot = i;
+            }
+        }
+        *evicted = 1;
+    }
+
+    routes_clear_slot(ctx, slot);
+
+    memset(&ctx->sessions[slot], 0, sizeof(ctx->sessions[slot]));
+    ctx->sessions[slot].active = 1;
+    ctx->sessions[slot].addr = *peer;
+    ctx->sessions[slot].addr_len = peer_len;
+    ctx->sessions[slot].last_seen = time(NULL);
+    pipesix_replay_reset(&ctx->sessions[slot].replay);
+
+    return slot;
+}
+
+static int count_active(const server_context_t *ctx)
+{
+    int i;
+    int active = 0;
+
+    for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+        if (ctx->sessions[i].active) {
+            active++;
+        }
+    }
+
+    return active;
+}
+
+/*
+ * Return the index of the only active session, or -1 when there is no
+ * session or more than one.
+ */
+static int sole_session(const server_context_t *ctx)
+{
+    int i;
+    int found = -1;
+
+    for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+        if (ctx->sessions[i].active) {
+            if (found >= 0) {
+                return -1;
+            }
+            found = i;
+        }
+    }
+
+    return found;
+}
+
+/*
+ * Remember that an inner address lives behind a session.
+ */
+static void route_learn(server_context_t *ctx, int slot,
+                        const uint8_t addr[16], time_t now)
+{
+    int i;
+    int free_slot = -1;
+
+    for (i = 0; i < SERVER_MAX_ROUTES; i++) {
+        if (!ctx->routes[i].active) {
+            if (free_slot < 0) {
+                free_slot = i;
+            }
+            continue;
+        }
+
+        if (memcmp(ctx->routes[i].addr, addr, sizeof(ctx->routes[i].addr)) == 0) {
+            ctx->routes[i].session = slot;
+            ctx->routes[i].last_seen = now;
+            return;
+        }
+    }
+
+    if (free_slot < 0) {
+        time_t oldest = ctx->routes[0].last_seen;
+
+        free_slot = 0;
+        for (i = 1; i < SERVER_MAX_ROUTES; i++) {
+            if (ctx->routes[i].last_seen < oldest) {
+                oldest = ctx->routes[i].last_seen;
+                free_slot = i;
+            }
+        }
+    }
+
+    ctx->routes[free_slot].active = 1;
+    ctx->routes[free_slot].session = slot;
+    ctx->routes[free_slot].last_seen = now;
+    memcpy(ctx->routes[free_slot].addr, addr, sizeof(ctx->routes[free_slot].addr));
+}
+
+/*
+ * Resolve an inner destination address to a session index, or -1.
+ */
+static int route_lookup(server_context_t *ctx, const uint8_t addr[16])
+{
+    int i;
+
+    for (i = 0; i < SERVER_MAX_ROUTES; i++) {
+        if (!ctx->routes[i].active) {
+            continue;
+        }
+        if (memcmp(ctx->routes[i].addr, addr, sizeof(ctx->routes[i].addr)) != 0) {
+            continue;
+        }
+
+        if (ctx->routes[i].session >= 0 &&
+            ctx->routes[i].session < SERVER_MAX_CLIENTS &&
+            ctx->sessions[ctx->routes[i].session].active) {
+            return ctx->routes[i].session;
+        }
+
+        /* The session went away: forget the route. */
+        ctx->routes[i].active = 0;
+        return -1;
+    }
+
+    return -1;
+}
+
+/*
+ * Drop sessions that have been idle for longer than session_timeout.
+ */
+static void sessions_expire(server_context_t *ctx, time_t now)
+{
+    int expired[SERVER_MAX_CLIENTS];
+    int timeout = atomic_load(&ctx->session_timeout);
+    int count = 0;
+    int i;
+
+    if (timeout <= 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&ctx->lock);
+
+    for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+        server_session_t *session = &ctx->sessions[i];
+
+        if (!session->active) {
+            continue;
+        }
+        if ((now - session->last_seen) <= (time_t)timeout) {
+            continue;
+        }
+
+        session->active = 0;
+        routes_clear_slot(ctx, i);
+        expired[count++] = i;
+    }
+
+    pthread_mutex_unlock(&ctx->lock);
+
+    for (i = 0; i < count; i++) {
+        server_session_t *session = &ctx->sessions[expired[i]];
+        char peer_str[NI_MAXHOST + NI_MAXSERV + 8];
+
+        format_peer((const struct sockaddr *)&session->addr, session->addr_len,
+                    peer_str, sizeof(peer_str));
+        log_info("Client session %s expired after %d seconds of inactivity "
+                 "(%llu frames)", peer_str, timeout,
+                 (unsigned long long)session->frames);
+    }
+}
+
+/*
+ * Receiver loop (UDP -> TUN)
+ */
+static void *receiver_loop(void *arg)
 {
     server_context_t *ctx = (server_context_t *)arg;
-    uint8_t recv_buf[PIPESIX_RECV_BUF_SIZE];
+    uint8_t frame_buf[PIPESIX_RECV_BUF_SIZE];
+    struct pollfd pfd;
+
+    pfd.fd = ctx->udp_fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
 
     log_info("Receiver thread started (UDP -> TUN)");
 
-    while (*ctx->running) {
-        struct sockaddr_storage peer_addr;
-        socklen_t peer_addr_len = sizeof(peer_addr);
-        ssize_t nrecv;
+    while (!runtime_should_stop()) {
+        struct sockaddr_storage peer;
+        socklen_t peer_len = sizeof(peer);
+        pipesix_frame_t frame;
+        ssize_t nread;
+        int ready;
+        int rc;
+        int slot;
+        int new_session = 0;
+        int evicted = 0;
+        int reset_requested;
+        int session_count;
+        time_t now;
+        char peer_str[NI_MAXHOST + NI_MAXSERV + 8];
 
-        /* Receive frame from any client */
-        nrecv = recvfrom(ctx->udp_fd, recv_buf, sizeof(recv_buf), 0,
-                         (struct sockaddr *)&peer_addr, &peer_addr_len);
-        if (nrecv < 0) {
+        ready = poll(&pfd, 1, POLL_INTERVAL_MS);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            log_error("poll() on UDP socket failed: %s", strerror(errno));
+            stats_add_error(&ctx->stats);
+            runtime_request_stop();
+            break;
+        }
+        if (ready == 0) {
+            continue;
+        }
+
+        memset(&peer, 0, sizeof(peer));
+        nread = recvfrom(ctx->udp_fd, frame_buf, sizeof(frame_buf), 0,
+                         (struct sockaddr *)&peer, &peer_len);
+        if (nread < 0) {
             if (errno == EINTR) continue;
             log_error("UDP recvfrom failed: %s", strerror(errno));
+            stats_add_error(&ctx->stats);
+            runtime_request_stop();
             break;
         }
 
-        /* Validate minimum frame size */
-        if (nrecv < (ssize_t)PIPESIX_HEADER_SIZE) {
-            log_warn("Received short frame: %zd bytes (minimum %zu)",
-                     nrecv, PIPESIX_HEADER_SIZE);
+        if (!peer_allowed(ctx, (struct sockaddr *)&peer, peer_len)) {
+            format_peer((struct sockaddr *)&peer, peer_len,
+                        peer_str, sizeof(peer_str));
+            log_debug("Dropping datagram from non-allowed peer %s", peer_str);
+            stats_add_dropped(&ctx->stats);
             continue;
         }
 
-        /* Parse and validate frame header */
-        pipesix_frame_header_t *hdr = (pipesix_frame_header_t *)recv_buf;
-
-        if (ntohl(hdr->magic) != PIPESIX_MAGIC) {
-            log_warn("Invalid frame magic: 0x%08x (expected 0x%08lx) from client",
-                     ntohl(hdr->magic), (unsigned long)PIPESIX_MAGIC);
+        rc = pipesix_frame_parse(frame_buf, (size_t)nread, &frame,
+                                 ctx->auth_enabled ? ctx->key : NULL);
+        if (rc != PIPESIX_OK) {
+            format_peer((struct sockaddr *)&peer, peer_len,
+                        peer_str, sizeof(peer_str));
+            log_warn("Dropping invalid datagram (%zd bytes) from %s: %s",
+                     nread, peer_str, pipesix_strerror(rc));
+            stats_add_invalid(&ctx->stats);
+            if (rc == PIPESIX_ERR_AUTH) {
+                stats_add_auth_failure(&ctx->stats);
+            }
             continue;
         }
 
-        if (ntohs(hdr->version) != PIPESIX_VERSION) {
-            log_warn("Unsupported protocol version from client: %u (expected %u)",
-                     ntohs(hdr->version), PIPESIX_VERSION);
+        reset_requested = (frame.flags & PIPESIX_FLAG_RESET) != 0;
+        now = time(NULL);
+
+        pthread_mutex_lock(&ctx->lock);
+
+        slot = session_find(ctx, &peer);
+        if (slot < 0) {
+            slot = session_alloc(ctx, &peer, peer_len, &evicted);
+            new_session = 1;
+        } else if (reset_requested) {
+            /*
+             * Start the client's replay window from scratch so a
+             * restarted client's fresh sequence numbers are accepted.
+             */
+            pipesix_replay_reset(&ctx->sessions[slot].replay);
+        }
+
+        if (!pipesix_replay_accept(&ctx->sessions[slot].replay, frame.seq)) {
+            pthread_mutex_unlock(&ctx->lock);
+            format_peer((struct sockaddr *)&peer, peer_len,
+                        peer_str, sizeof(peer_str));
+            log_warn("Rejected replayed/out-of-window frame (seq=%llu) from %s",
+                     (unsigned long long)frame.seq, peer_str);
+            stats_add_replayed(&ctx->stats);
             continue;
         }
 
-        /* Extract encapsulated packet length */
-        uint32_t pkt_length = ntohl(hdr->length);
+        ctx->sessions[slot].last_seen = now;
+        ctx->sessions[slot].frames++;
 
-        if (pkt_length > (uint32_t)(nrecv - (ssize_t)PIPESIX_HEADER_SIZE)) {
-            log_warn("Frame length mismatch: header claims %u bytes, "
-                     "but only %zd available", pkt_length,
-                     nrecv - (ssize_t)PIPESIX_HEADER_SIZE);
-            return NULL;
-        }
+        if (frame.payload_len > 0) {
+            const pipesix_ipv6_header_t *header;
 
-        if (pkt_length == 0) {
-            continue;
-        }
-
-        /*
-         * Update the client address for return traffic.
-         * Protected by a mutex to ensure thread-safe access between
-         * the receiver and sender threads.
-         */
-        pthread_mutex_lock(&ctx->client_lock);
-        memcpy(&ctx->client_addr, &peer_addr, peer_addr_len);
-        ctx->client_addr_len = peer_addr_len;
-        ctx->client_initialized = 1;
-
-        /* Log the client address on first connection */
-        if (!ctx->client_initialized) {
-            char addr_str[INET6_ADDRSTRLEN];
-            if (peer_addr.ss_family == AF_INET) {
-                struct sockaddr_in *sin = (struct sockaddr_in *)&peer_addr;
-                inet_ntop(AF_INET, &sin->sin_addr, addr_str, sizeof(addr_str));
-                log_info("Client connected from %s:%d", addr_str, ntohs(sin->sin_port));
-            } else {
-                struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&peer_addr;
-                inet_ntop(AF_INET6, &sin6->sin6_addr, addr_str, sizeof(addr_str));
-                log_info("Client connected from [%s]:%d", addr_str, ntohs(sin6->sin6_port));
+            if (ipv6_parse_header(frame.payload, frame.payload_len,
+                                  &header) == 0) {
+                route_learn(ctx, slot, header->source_addr, now);
             }
         }
-        pthread_mutex_unlock(&ctx->client_lock);
 
-        /* Write the IPv6 packet to the TUN device */
-        uint8_t *packet = recv_buf + PIPESIX_HEADER_SIZE;
-        ssize_t nwritten = tun_write(ctx->tun, packet, pkt_length);
-        if (nwritten < 0) {
-            log_error("TUN write failed: %s", strerror(errno));
+        session_count = count_active(ctx);
+
+        pthread_mutex_unlock(&ctx->lock);
+
+        if (new_session) {
+            format_peer((struct sockaddr *)&peer, peer_len,
+                        peer_str, sizeof(peer_str));
+
+            if (evicted) {
+                log_warn("Session table full; evicted the least recently "
+                         "used client to admit %s", peer_str);
+            }
+
+            if (reset_requested) {
+                log_info("Client session reset from %s", peer_str);
+            } else {
+                log_info("Client connected from %s (crypto=%s, %d active)",
+                         peer_str,
+                         ctx->auth_enabled ? "chacha20-poly1305" : "plaintext",
+                         session_count);
+            }
+
+            send_control(ctx, &peer, peer_len, PIPESIX_FLAG_RESET);
+        }
+
+        if (reset_requested) {
             continue;
         }
 
-        /* Log packet for diagnostics */
-        ipv6_log_packet(packet, pkt_length, "RX");
+        if ((frame.flags & PIPESIX_FLAG_KEEPALIVE) != 0) {
+            log_debug("Keepalive received from client");
+            send_control(ctx, &peer, peer_len, PIPESIX_FLAG_KEEPALIVE);
+            continue;
+        }
+
+        if (frame.payload_len == 0) {
+            continue;
+        }
+
+        if (ipv6_validate_packet(frame.payload, frame.payload_len) != 0) {
+            log_debug("Dropping frame with invalid IPv6 payload");
+            stats_add_invalid(&ctx->stats);
+            continue;
+        }
+
+        {
+            ssize_t nwritten = tun_write(ctx->tun, frame.payload,
+                                         frame.payload_len);
+
+            if (nwritten < 0) {
+                log_error("TUN write failed: %s", strerror(errno));
+                stats_add_error(&ctx->stats);
+                continue;
+            }
+        }
+
+        stats_add_rx(&ctx->stats, frame.payload_len);
+        ipv6_log_packet(frame.payload, frame.payload_len, "RX");
     }
 
     log_info("Receiver thread exiting");
@@ -154,120 +608,183 @@ static void *network_to_tun_thread(void *arg)
 }
 
 /*
- * Sender Thread (TUN -> Network)
- *
- * Continuously reads IPv6 packets from the TUN device (return traffic
- * from the Route64 gateway), encapsulates them in pipesix frames, and
- * sends them back to the connected client.
- *
- * Parameters:
- *   arg - Pointer to server_context_t
- *
- * Returns:
- *   NULL always
+ * Sender loop (TUN -> UDP)
  */
-static void *tun_to_network_thread(void *arg)
+static void *sender_loop(void *arg)
 {
     server_context_t *ctx = (server_context_t *)arg;
-    uint8_t packet_buf[PIPESIX_MAX_PACKET];
+    uint8_t packet[PIPESIX_MAX_PACKET];
+    uint8_t frame[PIPESIX_MAX_FRAME];
+    struct pollfd pfd;
+
+    pfd.fd = ctx->tun->fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
 
     log_info("Sender thread started (TUN -> UDP)");
 
-    while (*ctx->running) {
+    while (!runtime_should_stop()) {
+        struct sockaddr_storage dest;
+        socklen_t dest_len = 0;
+        const pipesix_ipv6_header_t *header;
         ssize_t nread;
+        int ready;
+        int slot;
+        uint64_t seq;
+        size_t frame_len;
 
-        /* Read IPv6 packet from TUN device (return traffic) */
-        nread = tun_read(ctx->tun, packet_buf, sizeof(packet_buf));
-        if (nread < 0) {
+        ready = poll(&pfd, 1, POLL_INTERVAL_MS);
+        if (ready < 0) {
             if (errno == EINTR) continue;
-            log_error("TUN read failed in sender thread: %s", strerror(errno));
+            log_error("poll() on TUN failed: %s", strerror(errno));
+            stats_add_error(&ctx->stats);
+            runtime_request_stop();
             break;
         }
-
-        if (nread == 0) continue;
-
-        /*
-         * Check if we have a client to send to.
-         * If no client has connected yet, drop the packet silently.
-         */
-        pthread_mutex_lock(&ctx->client_lock);
-        int has_client = ctx->client_initialized;
-        pthread_mutex_unlock(&ctx->client_lock);
-
-        if (!has_client) {
-            /* No client connected; drop the packet */
+        if (ready == 0) {
             continue;
         }
 
-        /*
-         * Build the pipesix frame header for the return packet.
-         */
-        pipesix_frame_header_t hdr;
-        struct iovec iov[2];
-        struct msghdr msg;
-
-        hdr.magic   = htonl(PIPESIX_MAGIC);
-        hdr.version = htons(PIPESIX_VERSION);
-        hdr.flags   = htons(PIPESIX_FLAG_NONE);
-        hdr.length  = htonl((uint32_t)nread);
-
-        /* Use gather I/O for zero-copy transmission */
-        memset(iov, 0, sizeof(iov));
-        iov[0].iov_base = &hdr;
-        iov[0].iov_len  = PIPESIX_HEADER_SIZE;
-        iov[1].iov_base = packet_buf;
-        iov[1].iov_len  = (size_t)nread;
-
-        memset(&msg, 0, sizeof(msg));
-        msg.msg_iov    = iov;
-        msg.msg_iovlen = 2;
-
-        /*
-         * Send to the client.
-         * We copy the client address under the lock to avoid holding
-         * it during the sendmsg call (which might block).
-         */
-        pthread_mutex_lock(&ctx->client_lock);
-        struct sockaddr_storage send_addr;
-        socklen_t send_addr_len;
-        memcpy(&send_addr, &ctx->client_addr, ctx->client_addr_len);
-        send_addr_len = ctx->client_addr_len;
-        pthread_mutex_unlock(&ctx->client_lock);
-
-        msg.msg_name    = &send_addr;
-        msg.msg_namelen = send_addr_len;
-
-        if (sendmsg(ctx->udp_fd, &msg, 0) < 0) {
-            log_error("UDP sendmsg failed for client: %s", strerror(errno));
+        nread = tun_read(ctx->tun, packet, sizeof(packet));
+        if (nread < 0) {
+            if (errno != EINTR) {
+                log_error("TUN read failed: %s", strerror(errno));
+                stats_add_error(&ctx->stats);
+            }
+            continue;
+        }
+        if (nread == 0) {
             continue;
         }
 
-        /* Log return packet for diagnostics */
-        ipv6_log_packet(packet_buf, (size_t)nread, "TX");
+        if (ipv6_parse_header(packet, (size_t)nread, &header) != 0) {
+            stats_add_invalid(&ctx->stats);
+            continue;
+        }
+
+        memset(&dest, 0, sizeof(dest));
+
+        pthread_mutex_lock(&ctx->lock);
+
+        slot = route_lookup(ctx, header->dest_addr);
+        if (slot < 0) {
+            /* No learned route: a single client gets everything. */
+            slot = sole_session(ctx);
+        }
+
+        if (slot >= 0) {
+            dest = ctx->sessions[slot].addr;
+            dest_len = ctx->sessions[slot].addr_len;
+        }
+
+        pthread_mutex_unlock(&ctx->lock);
+
+        if (slot < 0) {
+            stats_add_dropped(&ctx->stats);
+            continue;
+        }
+
+        seq = next_seq(ctx);
+        frame_len = pipesix_frame_build(frame, sizeof(frame), 0, ctx->salt,
+                                        seq, packet, (size_t)nread,
+                                        ctx->auth_enabled ? ctx->key : NULL);
+        if (frame_len == 0) {
+            log_warn("Failed to build frame for %zd-byte packet", nread);
+            stats_add_dropped(&ctx->stats);
+            continue;
+        }
+
+        if (sendto(ctx->udp_fd, frame, frame_len, 0,
+                   (struct sockaddr *)&dest, dest_len) !=
+            (ssize_t)frame_len) {
+            log_error("UDP send to client failed: %s", strerror(errno));
+            stats_add_error(&ctx->stats);
+            continue;
+        }
+
+        stats_add_tx(&ctx->stats, (size_t)nread);
+        ipv6_log_packet(packet, (size_t)nread, "TX");
     }
 
     log_info("Sender thread exiting");
     return NULL;
 }
 
+static int bind_socket(const pipesix_config_t *config)
+{
+    struct addrinfo hints;
+    struct addrinfo *result = NULL;
+    struct addrinfo *rp;
+    char port_str[16];
+    int gai;
+    int fd = -1;
+    int family = AF_UNSPEC;
+
+    snprintf(port_str, sizeof(port_str), "%d", config->bind_port);
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_flags = AI_PASSIVE;
+
+    gai = getaddrinfo(config->bind_address, port_str, &hints, &result);
+    if (gai != 0) {
+        log_error("Failed to resolve bind address '%s': %s",
+                  config->bind_address, gai_strerror(gai));
+        return -1;
+    }
+
+    for (rp = result; rp != NULL; rp = rp->ai_next) {
+        int optval = 1;
+
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+
+        if (rp->ai_family == AF_INET6) {
+            int off = 0;
+            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+        }
+
+        if (bind(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            family = rp->ai_family;
+            break;
+        }
+
+        close(fd);
+        fd = -1;
+    }
+
+    freeaddrinfo(result);
+
+    if (fd < 0) {
+        log_error("Failed to bind UDP socket to %s:%d: %s",
+                  config->bind_address, config->bind_port, strerror(errno));
+        return -1;
+    }
+
+    log_info("UDP server listening on %s:%d (%s, fd=%d)",
+             config->bind_address, config->bind_port,
+             family == AF_INET6 ? "AF_INET6" : "AF_INET", fd);
+
+    return fd;
+}
+
 int server_start(pipesix_config_t *config)
 {
     tun_device_t tun;
-    pthread_t recv_thread, send_thread;
     server_context_t ctx;
-    volatile int running = 1;
+    pthread_t receiver_thread;
+    pthread_t sender_thread;
+    uint64_t seed = 0;
+    uint32_t salt = 0;
     int rc;
 
-    /* Initialize TUN device structure */
     tun_init(&tun);
 
-    /*
-     * Open and configure the TUN device on the server.
-     * The TUN device on the server side is connected to the Route64
-     * gateway via the system's routing table. Packets written to this
-     * TUN device are routed to the gateway, and packets from the
-     * gateway appear as reads from this device.
-     */
     log_info("Opening TUN device '%s'", config->tun_name);
     if (tun_open(&tun, config->tun_name, config->tun_address,
                  config->tun_prefixlen, config->tun_mtu) != 0) {
@@ -275,115 +792,128 @@ int server_start(pipesix_config_t *config)
         return -1;
     }
 
-    /*
-     * Create a UDP socket and bind to the configured address and port.
-     * The server listens for incoming encapsulated packets from the
-     * client.
-     */
-    int udp_fd;
-    int sock_family;
-    struct addrinfo hints, *res;
-    char port_str[16];
-
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_socktype = SOCK_DGRAM;
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_flags    = AI_PASSIVE;
-
-    snprintf(port_str, sizeof(port_str), "%d", config->bind_port);
-
-    rc = getaddrinfo(config->bind_address, port_str, &hints, &res);
-    if (rc != 0) {
-        log_error("Failed to resolve bind address '%s': %s",
-                  config->bind_address, gai_strerror(rc));
-        tun_close(&tun);
-        return -1;
-    }
-
-    /* Try to create and bind the socket */
-    udp_fd = -1;
-    for (struct addrinfo *rp = res; rp != NULL; rp = rp->ai_next) {
-        udp_fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (udp_fd < 0) continue;
-
-        /* Allow address reuse for quick restarts */
-        int optval = 1;
-        setsockopt(udp_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-
-        if (bind(udp_fd, rp->ai_addr, rp->ai_addrlen) == 0) {
-            /* Bind succeeded */
-            sock_family = rp->ai_family;
-            break;
-        }
-
-        close(udp_fd);
-        udp_fd = -1;
-    }
-
-    freeaddrinfo(res);
-
-    if (udp_fd < 0) {
-        log_error("Failed to bind UDP socket to %s:%d: %s",
-                  config->bind_address, config->bind_port, strerror(errno));
-        tun_close(&tun);
-        return -1;
-    }
-
-    log_info("UDP server listening on %s:%d (family=%s, fd=%d)",
-             config->bind_address, config->bind_port,
-             sock_family == AF_INET6 ? "AF_INET6" : "AF_INET", udp_fd);
-
-    /* Initialize server context */
     memset(&ctx, 0, sizeof(ctx));
-    ctx.config             = config;
-    ctx.tun                = &tun;
-    ctx.udp_fd             = udp_fd;
-    ctx.sock_family        = sock_family;
-    ctx.client_initialized = 0;
-    ctx.running            = &running;
-    pthread_mutex_init(&ctx.client_lock, NULL);
-
-    /*
-     * Launch worker threads.
-     * recv_thread: Receives from client, writes to TUN (-> Route64 gateway)
-     * send_thread: Reads from TUN (return from gateway), sends to client
-     */
-    pthread_create(&recv_thread, NULL, network_to_tun_thread, &ctx);
-    pthread_create(&send_thread, NULL, tun_to_network_thread, &ctx);
-
-    log_info("Server is running. Waiting for client connection on %s:%d ...",
-             config->bind_address, config->bind_port);
-
-    /*
-     * Main thread waits for shutdown signal.
-     * The running flag is set to 0 by the signal handler in main.c.
-     */
-    while (running) {
-        sleep(1);
+    ctx.config = config;
+    ctx.tun = &tun;
+    ctx.udp_fd = bind_socket(config);
+    if (ctx.udp_fd < 0) {
+        tun_close(&tun);
+        return -1;
     }
 
-    /*
-     * Graceful shutdown sequence.
-     */
+    if (config->secret[0] != '\0') {
+        if (pipesix_key_from_string(config->secret, ctx.key) != 0) {
+            log_error("Failed to derive encryption key from 'secret'");
+            close(ctx.udp_fd);
+            tun_close(&tun);
+            return -1;
+        }
+        ctx.auth_enabled = 1;
+    }
+
+    if (pipesix_random_bytes(&seed, sizeof(seed)) != 0) {
+        seed = ((uint64_t)time(NULL) << 32) | (uint64_t)(uint32_t)getpid();
+    }
+    if (pipesix_random_bytes(&salt, sizeof(salt)) != 0) {
+        salt = (uint32_t)time(NULL) ^ (uint32_t)getpid();
+    }
+
+    atomic_init(&ctx.seq, seed);
+    atomic_init(&ctx.session_timeout, config->session_timeout);
+    ctx.salt = salt;
+    stats_init(&ctx.stats);
+
+    rc = pthread_mutex_init(&ctx.lock, NULL);
+    if (rc != 0) {
+        log_error("Failed to initialize session mutex: %s", strerror(rc));
+        close(ctx.udp_fd);
+        tun_close(&tun);
+        return -1;
+    }
+
+    rc = pthread_create(&receiver_thread, NULL, receiver_loop, &ctx);
+    if (rc != 0) {
+        log_error("Failed to create receiver thread: %s", strerror(rc));
+        pthread_mutex_destroy(&ctx.lock);
+        close(ctx.udp_fd);
+        tun_close(&tun);
+        return -1;
+    }
+
+    rc = pthread_create(&sender_thread, NULL, sender_loop, &ctx);
+    if (rc != 0) {
+        log_error("Failed to create sender thread: %s", strerror(rc));
+        runtime_request_stop();
+        pthread_join(receiver_thread, NULL);
+        pthread_mutex_destroy(&ctx.lock);
+        close(ctx.udp_fd);
+        tun_close(&tun);
+        return -1;
+    }
+
+    log_info("Server tunnel ready (crypto=%s, max_clients=%d, "
+             "session_timeout=%ds, allow_client=%d)",
+             ctx.auth_enabled ? "chacha20-poly1305" : "plaintext",
+             SERVER_MAX_CLIENTS, config->session_timeout,
+             config->allow_client_count);
+    log_info("Server is running. Send SIGINT/SIGTERM to stop, "
+             "SIGUSR1 for stats, SIGHUP to reload.");
+
+    {
+        time_t last_report = time(NULL);
+
+        while (!runtime_should_stop()) {
+            struct timespec delay;
+            time_t now;
+
+            delay.tv_sec = 1;
+            delay.tv_nsec = 0;
+            nanosleep(&delay, NULL);
+            now = time(NULL);
+
+            if (runtime_take_reload_request()) {
+                if (config_reload_runtime(config) == 0) {
+                    logger_set_level(config->log_level);
+                    atomic_store(&ctx.session_timeout,
+                                 config->session_timeout);
+                    log_info("Configuration reloaded (log_level, "
+                             "session_timeout, stats_interval); other "
+                             "changes need a restart");
+                } else {
+                    log_error("Configuration reload failed; keeping the "
+                              "previous settings");
+                }
+                last_report = now;
+            }
+
+            if (runtime_take_stats_request()) {
+                stats_dump(&ctx.stats, "server");
+                last_report = now;
+            } else if (config->stats_interval > 0 &&
+                       (now - last_report) >=
+                           (time_t)config->stats_interval) {
+                stats_dump(&ctx.stats, "server");
+                last_report = now;
+            }
+
+            sessions_expire(&ctx, now);
+        }
+    }
+
     log_info("Initiating graceful shutdown...");
 
-    pthread_join(recv_thread, NULL);
+    pthread_join(receiver_thread, NULL);
     log_info("Receiver thread joined");
 
-    pthread_join(send_thread, NULL);
+    pthread_join(sender_thread, NULL);
     log_info("Sender thread joined");
 
-    /* Clean up synchronization primitives */
-    pthread_mutex_destroy(&ctx.client_lock);
+    pthread_mutex_destroy(&ctx.lock);
+    close(ctx.udp_fd);
+    log_info("UDP socket closed");
 
-    /* Close UDP socket */
-    if (udp_fd >= 0) {
-        close(udp_fd);
-        log_info("UDP socket closed");
-    }
-
-    /* Close TUN device */
     tun_close(&tun);
+    stats_dump(&ctx.stats, "server");
 
     log_info("Server shutdown complete");
     return 0;

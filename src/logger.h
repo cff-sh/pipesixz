@@ -108,29 +108,29 @@ void logger_log(log_level_t level, const char *file, int line,
  *   log_error("sendto() failed: %s", strerror(errno));
  *   log_fatal("Out of memory");
  */
-#define log_debug(fmt, ...) \
+#define log_debug(...) \
     do { \
-        logger_log(LOG_DEBUG, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__); \
+        logger_log(LOG_DEBUG, __FILE__, __LINE__, __func__, __VA_ARGS__); \
     } while (0)
 
-#define log_info(fmt, ...) \
+#define log_info(...) \
     do { \
-        logger_log(LOG_INFO,  __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__); \
+        logger_log(LOG_INFO,  __FILE__, __LINE__, __func__, __VA_ARGS__); \
     } while (0)
 
-#define log_warn(fmt, ...) \
+#define log_warn(...) \
     do { \
-        logger_log(LOG_WARN,  __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__); \
+        logger_log(LOG_WARN,  __FILE__, __LINE__, __func__, __VA_ARGS__); \
     } while (0)
 
-#define log_error(fmt, ...) \
+#define log_error(...) \
     do { \
-        logger_log(LOG_ERROR, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__); \
+        logger_log(LOG_ERROR, __FILE__, __LINE__, __func__, __VA_ARGS__); \
     } while (0)
 
-#define log_fatal(fmt, ...) \
+#define log_fatal(...) \
     do { \
-        logger_log(LOG_FATAL, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__); \
+        logger_log(LOG_FATAL, __FILE__, __LINE__, __func__, __VA_ARGS__); \
     } while (0)
 
 #endif /* PIPESIX_LOGGER_H */

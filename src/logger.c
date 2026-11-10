@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
+#include <stdatomic.h>
 
 /*
  * Default logger configuration used when NULL is passed to
@@ -31,6 +32,9 @@ static logger_config_t s_config = {
     .use_color     = 1,
     .use_timestamp = 1
 };
+
+/* Threshold is atomic so SIGHUP can change it while workers log. */
+static _Atomic int s_min_level = LOG_INFO;
 
 /*
  * Human-readable labels for each log level.
@@ -77,6 +81,7 @@ int logger_init(const logger_config_t *config)
         s_config.use_color = 0;
     }
 
+    atomic_store(&s_min_level, (int)s_config.min_level);
     return 0;
 }
 
@@ -84,6 +89,7 @@ void logger_set_level(log_level_t level)
 {
     if (level >= LOG_DEBUG && level <= LOG_FATAL) {
         s_config.min_level = level;
+        atomic_store(&s_min_level, (int)level);
     }
 }
 
@@ -93,7 +99,7 @@ void logger_log(log_level_t level, const char *file, int line,
     va_list args;
 
     /* Filter by level threshold */
-    if (level < s_config.min_level) {
+    if ((int)level < atomic_load(&s_min_level)) {
         return;
     }
 

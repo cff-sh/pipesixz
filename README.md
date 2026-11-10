@@ -8,6 +8,26 @@ Connect your machine to the IPv6 internet through a VPS relay. Supports **Route6
 Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] → IPv6 internet
 ```
 
+## Features
+
+- ChaCha20-Poly1305 authenticated encryption of every frame (RFC 8439), with
+  an anti-replay window
+- Multiple concurrent clients per server, each with its own session and
+  replay window; return traffic is routed by learning each client's inner
+  IPv6 addresses
+- Client keepalives, echoed by the server for liveness
+- Automatic client reconnect with DNS re-resolution and backoff when the
+  peer goes silent (`peer_timeout`)
+- Session reset frames so restarts on either side do not stall the tunnel
+- Server client allow-list (`allow_client`, up to 64 entries)
+- SIGHUP reload of log level and timing settings without dropping the tunnel
+- Periodic statistics and on-demand dumps via SIGUSR1
+
+Frames are encrypted and authenticated when `secret` is set on both sides.
+Without a secret the tunnel carries plaintext and should only be used on a
+network you already trust. The wire protocol is version 4, which is not
+compatible with 1.x peers.
+
 ## Prerequisites
 
 - VPS with a public IPv4
@@ -101,3 +121,34 @@ sudo systemctl enable --now pipesix
 | `pipesix.service` | systemd unit for auto-start |
 | `wg-route64.sh` | Route64 WireGuard setup |
 | `netassist-up.sh` | NetAssist SIT tunnel setup |
+
+## Operations
+
+```bash
+sudo systemctl reload pipesix     # apply log_level/keepalive/peer_timeout/...
+sudo kill -USR1 $(pidof pipesix)  # dump statistics now
+```
+
+`systemctl reload` sends SIGHUP. Interface, endpoint, secret, mode and
+allow-list changes require a restart.
+
+## Security
+
+- Generate a shared secret with `pipesix --genkey` and put the same value in
+  the `secret` key on both the server and every client.
+- A server without a `secret` logs a warning: frames are plaintext and any
+  host that can reach the UDP port can inject traffic.
+- The server accepts up to 64 concurrent clients, each tracked by endpoint
+  and protected by its own replay window. Sessions idle for longer than
+  `session_timeout` are dropped, and the least recently used session is
+  evicted when the table is full.
+
+## Testing
+
+```bash
+make check
+```
+
+Runs the unit tests for cryptography (against RFC known-answer vectors),
+the frame codec, the replay window and the configuration parser. No root
+privileges are required.

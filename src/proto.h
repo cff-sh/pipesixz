@@ -1,106 +1,182 @@
 /*
- * proto.h - pipesix Protocol Definition
+ * proto.h - pipesix Wire Protocol (version 4)
  *
- * This file defines the wire protocol used to encapsulate IPv6 packets
- * inside UDP datagrams for transmission between the pipesix client and
- * server. Each UDP payload consists of a fixed-size frame header
- * followed by a raw IPv6 packet.
+ * Each UDP datagram carries a fixed 24-byte header. When a shared
+ * secret is configured the header is authenticated as additional data
+ * and the payload is encrypted with ChaCha20-Poly1305, followed by a
+ * 16-byte tag.
  *
- * Frame Format (on the wire, all multi-byte fields are big-endian):
+ * Frame Format (all multi-byte fields are big-endian):
  *
  *   +-------+-------+-------+-------+
  *   |          magic (4)             | 0x50495849 = "PIXI"
  *   +-------+-------+-------+-------+
- *   |  version (2)   |   flags (2)   |
+ *   |  version (4)   |   flags (2)   | version = 4
  *   +-------+-------+-------+-------+
- *   |         length (4)             | payload length in bytes
+ *   |  length (2)    |  reserved (2) | payload length in bytes
+ *   +-------+-------+-------+-------+
+ *   |           salt (4)             | random per-session nonce salt
  *   +-------+-------+-------+-------+
  *   |                               |
- *   |     IPv6 Packet (variable)    |
+ *   +        sequence (8)           | per-session anti-replay counter
  *   |                               |
+ *   +-------+-------+-------+-------+
+ *   |     IPv6 Packet (variable)     | encrypted when FLAG_AUTH is set
+ *   +-------------------------------+
+ *   |  ChaCha20-Poly1305 tag (16)    | present when FLAG_AUTH is set
  *   +-------------------------------+
  *
- * Architecture:
+ * Flags:
+ *   PIPESIX_FLAG_AUTH       - payload is encrypted and the tag verifies
+ *   PIPESIX_FLAG_KEEPALIVE  - keepalive, payload length must be 0
+ *   PIPESIX_FLAG_RESET      - resets the peer's replay window, payload
+ *                             length must be 0 (sent on session start)
  *
- *   [Client Side]
- *   Applications -> TUN (tun0) -> pipesix client -> UDP -> Internet
+ * A RESET frame tells the receiver to start a new session: the replay
+ * window is cleared, so sequence numbers from a restarted peer are
+ * accepted again. Keepalive and reset are mutually exclusive.
  *
- *   [Server Side]
- *   Internet -> UDP -> pipesix server -> TUN (tun0) -> Route64 Gateway
+ * The nonce is the 4-byte salt followed by the 8-byte sequence number.
+ * The salt is freshly randomised whenever a session starts, so a key
+ * never sees a repeated nonce even across restarts. The 64-bit
+ * sequence number doubles as the anti-replay counter, which means it
+ * cannot wrap in any realistic deployment; the window arithmetic is
+ * nevertheless wrap-safe.
  *
- * The frame header allows the receiver to validate incoming datagrams
- * and extract the encapsulated IPv6 packet for injection into the
- * local TUN device.
+ * Replay protection uses a 64-packet sliding window keyed on the
+ * sequence number. Sequence numbers start at a random value.
  */
 
 #ifndef PIPESIX_PROTO_H
 #define PIPESIX_PROTO_H
 
+#include <stddef.h>
 #include <stdint.h>
 
-/*
- * Magic Number: "PIXI" in ASCII
- * Used to validate that a received UDP datagram is a valid pipesix frame.
- * Stored in network byte order in the header.
- */
+#include "crypto.h"
+
+/* Magic number: "PIXI" in ASCII */
 #define PIPESIX_MAGIC               0x50495849UL
 
-/*
- * Protocol Version
- * Currently version 1. Incremented when incompatible protocol changes
- * are made to the frame format.
- */
-#define PIPESIX_VERSION             1
+/* Protocol version. Version 4 adds AEAD encryption and 64-bit sequence. */
+#define PIPESIX_VERSION             4
 
-/*
- * Frame Flags
- * Reserved for future use (e.g., fragmentation, encryption, compression).
- * Currently unused and should be set to PIPESIX_FLAG_NONE.
- */
-#define PIPESIX_FLAG_NONE           0x0000
+/* Frame flags */
+#define PIPESIX_FLAG_AUTH           0x0001u
+#define PIPESIX_FLAG_KEEPALIVE      0x0002u
+#define PIPESIX_FLAG_RESET          0x0004u
+#define PIPESIX_FLAG_KNOWN          (PIPESIX_FLAG_AUTH | PIPESIX_FLAG_KEEPALIVE | \
+                                     PIPESIX_FLAG_RESET)
 
-/*
- * MTU and Packet Size Limits
- *
- * PIPESIX_MAX_MTU:     Maximum MTU of the TUN device (standard IPv6 min MTU)
- * PIPESIX_MAX_PACKET:  Maximum IPv6 packet we can handle (MTU + IPv6 header overhead)
- * PIPESIX_MAX_FRAME:   Maximum total frame size (header + payload)
- */
+/* Fixed header size on the wire */
+#define PIPESIX_HEADER_SIZE         24
+
+/* Size of the optional ChaCha20-Poly1305 authentication tag */
+#define PIPESIX_AUTH_TAG_SIZE       PIPESIX_AEAD_TAG_LEN
+
+/* Packet size limits */
 #define PIPESIX_MAX_MTU             1500
 #define PIPESIX_MAX_PACKET          (PIPESIX_MAX_MTU + 40)
-#define PIPESIX_MAX_FRAME           (PIPESIX_HEADER_SIZE + PIPESIX_MAX_PACKET)
-
-/*
- * pipesix_frame_header_t
- *
- * Fixed-size header prepended to every IPv6 packet before transmission
- * over UDP. All fields except flags are mandatory; flags is reserved.
- *
- * Fields:
- *   magic    - Frame magic number (PIPESIX_MAGIC) for validation
- *   version  - Protocol version (PIPESIX_VERSION)
- *   flags    - Reserved flags field (must be 0)
- *   length   - Length of the encapsulated IPv6 packet in bytes
- *
- * NOTE: This structure is packed to avoid padding, ensuring consistent
- * wire format across all architectures.
- */
-typedef struct __attribute__((packed)) {
-    uint32_t magic;              /* Frame magic number (network byte order) */
-    uint16_t version;            /* Protocol version (network byte order) */
-    uint16_t flags;              /* Reserved flags (network byte order) */
-    uint32_t length;             /* Payload length in bytes (network byte order) */
-} pipesix_frame_header_t;
-
-/* Size of the frame header on the wire */
-#define PIPESIX_HEADER_SIZE         ((size_t)sizeof(pipesix_frame_header_t))
-
-/*
- * Buffer Sizing Helper
- *
- * Maximum buffer size needed to hold a full received frame including
- * header and payload. Used for receive buffer allocation.
- */
+#define PIPESIX_MAX_FRAME           (PIPESIX_HEADER_SIZE + PIPESIX_MAX_PACKET + \
+                                     PIPESIX_AUTH_TAG_SIZE)
 #define PIPESIX_RECV_BUF_SIZE       (PIPESIX_MAX_FRAME + 64)
+
+/* Parse result codes */
+#define PIPESIX_OK                  0
+#define PIPESIX_ERR_SHORT          (-1)
+#define PIPESIX_ERR_MAGIC          (-2)
+#define PIPESIX_ERR_VERSION        (-3)
+#define PIPESIX_ERR_FLAGS          (-4)
+#define PIPESIX_ERR_LENGTH         (-5)
+#define PIPESIX_ERR_AUTH           (-6)
+#define PIPESIX_ERR_PARAM          (-7)
+
+/*
+ * Decoded frame view. Pointers reference the caller's receive buffer
+ * and remain valid until that buffer is reused.
+ */
+typedef struct {
+    uint16_t       flags;         /* Frame flags (host byte order) */
+    uint32_t       salt;          /* Nonce salt (host byte order) */
+    uint64_t       seq;           /* Sequence number (host byte order) */
+    const uint8_t *payload;       /* IPv6 packet (may be NULL for keepalive) */
+    size_t         payload_len;   /* Payload length in bytes */
+    int            authenticated; /* Non-zero if the AEAD tag verified */
+} pipesix_frame_t;
+
+/*
+ * Sliding-window replay tracker.
+ * One instance per direction of a session.
+ */
+typedef struct {
+    uint64_t last;
+    uint64_t bitmap;
+    int      initialized;
+} pipesix_replay_t;
+
+/*
+ * Build a frame in the caller's buffer.
+ *
+ * Parameters:
+ *   buf         - Output buffer
+ *   bufsize     - Size of the output buffer
+ *   flags       - PIPESIX_FLAG_KEEPALIVE, PIPESIX_FLAG_RESET, or 0
+ *                 (AUTH is added automatically when key is not NULL)
+ *   salt        - Nonce salt for this session
+ *   seq         - Sequence number for this frame
+ *   payload     - IPv6 packet, or NULL for a keepalive
+ *   payload_len - Payload length (must be 0 for keepalive)
+ *   key         - 32-byte encryption key, or NULL to disable encryption
+ *
+ * Returns:
+ *   Total frame length on success, 0 on invalid parameters or a
+ *   buffer that is too small.
+ */
+size_t pipesix_frame_build(uint8_t *buf, size_t bufsize, uint16_t flags,
+                           uint32_t salt, uint64_t seq,
+                           const uint8_t *payload, size_t payload_len,
+                           const uint8_t *key);
+
+/*
+ * Validate and decode a received datagram.
+ *
+ * When key is non-NULL the frame must carry a valid AEAD tag and the
+ * payload is decrypted in place inside buf; when key is NULL, frames
+ * carrying a tag are rejected because they cannot be verified.
+ * Trailing or missing bytes are treated as a length error.
+ *
+ * Parameters:
+ *   buf  - Received datagram (modified in place when decrypting)
+ *   len  - Datagram length
+ *   out  - Decoded frame (must not be NULL)
+ *   key  - 32-byte encryption key, or NULL for plaintext mode
+ *
+ * Returns:
+ *   PIPESIX_OK on success, or a negative PIPESIX_ERR_* code.
+ */
+int pipesix_frame_parse(uint8_t *buf, size_t len, pipesix_frame_t *out,
+                        const uint8_t *key);
+
+/*
+ * Reset a replay window (call when a new session starts).
+ */
+void pipesix_replay_reset(pipesix_replay_t *replay);
+
+/*
+ * Check and record a sequence number.
+ *
+ * Sequence comparisons use modular arithmetic (RFC 1982 style), so the
+ * window behaves correctly across a counter wrap instead of rejecting
+ * every subsequent frame.
+ *
+ * Returns 1 if the frame should be accepted, 0 if it is a duplicate,
+ * replayed, or outside the window.
+ */
+int pipesix_replay_accept(pipesix_replay_t *replay, uint64_t seq);
+
+/*
+ * Human-readable description of a PIPESIX_ERR_* code.
+ */
+const char *pipesix_strerror(int code);
 
 #endif /* PIPESIX_PROTO_H */

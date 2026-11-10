@@ -1,0 +1,10 @@
+# Build artifacts
+*.o
+*.d
+pipesix
+tests/test_core
+
+# Local secrets and generated configuration
+privatekey
+*.bak
+*.bak.*

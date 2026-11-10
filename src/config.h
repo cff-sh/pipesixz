@@ -12,16 +12,27 @@
  *   key = value
  *
  * Supported Keys:
- *   mode            - Operating mode: "client" or "server"
- *   tun_name        - TUN device name (e.g., "tun0")
- *   tun_address     - IPv6 address for the TUN device (e.g., "fd00::1")
- *   tun_prefixlen   - IPv6 prefix length (e.g., 64)
- *   tun_mtu         - TUN device MTU (e.g., 1500)
- *   remote_address  - Server address for client mode
- *   remote_port     - Server port for client mode
- *   bind_address    - Bind address for server mode
- *   bind_port       - Bind port for server mode
- *   log_level       - Logging level: debug, info, warn, error, fatal
+ *   mode             - Operating mode: "client" or "server"
+ *   tun_name         - TUN device name (e.g., "tun0")
+ *   tun_address      - IPv6 address, optionally with /prefix
+ *   tun_prefixlen    - IPv6 prefix length when no /prefix is given
+ *   tun_mtu          - TUN device MTU
+ *   remote_address   - Server address for client mode
+ *   remote_port      - Server port for client mode
+ *   bind_address     - Bind address for server mode
+ *   bind_port        - Bind port for server mode
+ *   secret           - Shared secret enabling HMAC-SHA256 authentication
+ *   keepalive        - Client keepalive interval in seconds (0 disables)
+ *   session_timeout  - Server session idle timeout in seconds (0 disables)
+ *   peer_timeout     - Client dead-peer timeout in seconds (0 disables)
+ *   allow_client     - Server allow-list of client IPs (comma separated)
+ *   stats_interval   - Periodic stats log interval in seconds (0 disables)
+ *   log_level        - debug, info, warn, error, fatal
+ *
+ * SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout
+ * and stats_interval from the original configuration file. Changes to
+ * the interface, endpoints, secret, mode or allow_client require a
+ * restart.
  */
 
 #ifndef PIPESIX_CONFIG_H
@@ -37,21 +48,23 @@
 #define CONFIG_MAX_MODE     16
 #define CONFIG_MAX_TUN_NAME 64
 #define CONFIG_MAX_ADDRESS  128
+#define CONFIG_MAX_SECRET   256
 #define CONFIG_PATH_MAX     4096
+#define CONFIG_MAX_ALLOWED  64
 
 /*
  * Default Configuration Values
- *
- * Sensible defaults for fields that have reasonable fallbacks.
- * The user is expected to override at least mode, tun_address,
- * and the remote/bind endpoint.
  */
-#define CONFIG_DEFAULT_TUN_NAME     "tun0"
-#define CONFIG_DEFAULT_TUN_PREFIX   64
-#define CONFIG_DEFAULT_TUN_MTU      1500
-#define CONFIG_DEFAULT_PORT         8899
-#define CONFIG_DEFAULT_BIND_ADDRESS "0.0.0.0"
-#define CONFIG_DEFAULT_LOG_LEVEL    LOG_INFO
+#define CONFIG_DEFAULT_TUN_NAME          "tun0"
+#define CONFIG_DEFAULT_TUN_PREFIX        64
+#define CONFIG_DEFAULT_TUN_MTU           1500
+#define CONFIG_DEFAULT_PORT              8899
+#define CONFIG_DEFAULT_BIND_ADDRESS      "0.0.0.0"
+#define CONFIG_DEFAULT_LOG_LEVEL         LOG_INFO
+#define CONFIG_DEFAULT_KEEPALIVE         20
+#define CONFIG_DEFAULT_SESSION_TIMEOUT   120
+#define CONFIG_DEFAULT_STATS_INTERVAL    60
+#define CONFIG_DEFAULT_PEER_TIMEOUT      120
 
 /*
  * pipesix_config_t
@@ -65,7 +78,7 @@ typedef struct {
 
     /* TUN device configuration */
     char tun_name[CONFIG_MAX_TUN_NAME];    /* TUN interface name */
-    char tun_address[CONFIG_MAX_ADDRESS];  /* IPv6 address with optional /prefix */
+    char tun_address[CONFIG_MAX_ADDRESS];  /* IPv6 address (prefix split out) */
     int  tun_prefixlen;                     /* IPv6 prefix length */
     int  tun_mtu;                           /* TUN device MTU */
 
@@ -77,8 +90,22 @@ typedef struct {
     char bind_address[CONFIG_MAX_ADDRESS];  /* Local bind address */
     int  bind_port;                          /* Local UDP port */
 
-    /* Logging configuration */
-    log_level_t log_level;  /* Minimum log level */
+    /* Security and session management */
+    char secret[CONFIG_MAX_SECRET];         /* Shared secret (empty = no auth) */
+    int  keepalive;                          /* Client keepalive interval */
+    int  session_timeout;                    /* Server idle session timeout */
+
+    /* Reliability and access control */
+    int  peer_timeout;                       /* Client dead-peer timeout */
+    char allow_client[CONFIG_MAX_ALLOWED][CONFIG_MAX_ADDRESS];
+    int  allow_client_count;                 /* Parsed allow-list entries */
+
+    /* Observability */
+    int  stats_interval;                     /* Periodic stats interval */
+    log_level_t log_level;                   /* Minimum log level */
+
+    /* Source path, used by the SIGHUP reload */
+    char config_path[CONFIG_PATH_MAX];
 } pipesix_config_t;
 
 /*
@@ -88,10 +115,6 @@ typedef struct {
  * and populates the provided config structure with defaults for
  * any missing fields.
  *
- * Parameters:
- *   path   - Path to the configuration file
- *   config - Pointer to config structure to populate (must not be NULL)
- *
  * Returns:
  *   0 on success, -1 on failure (with details logged)
  */
@@ -100,12 +123,6 @@ int config_load(const char *path, pipesix_config_t *config);
 /*
  * Validate the loaded configuration.
  *
- * Checks that all required fields are present and have acceptable
- * values. Logs specific error messages for each validation failure.
- *
- * Parameters:
- *   config - Pointer to config structure to validate (must not be NULL)
- *
  * Returns:
  *   0 if configuration is valid, -1 if validation fails
  */
@@ -113,13 +130,28 @@ int config_validate(const pipesix_config_t *config);
 
 /*
  * Print configuration summary to the log.
- *
- * Outputs all configuration values at INFO level for operational
- * visibility and troubleshooting.
- *
- * Parameters:
- *   config - Pointer to config structure to display
  */
 void config_dump(const pipesix_config_t *config);
+
+/*
+ * Re-read runtime-tunable settings from config->config_path.
+ *
+ * Applies log_level, keepalive, peer_timeout, session_timeout and
+ * stats_interval. Interface, endpoint, secret, mode and allow-list
+ * changes are ignored until the process restarts.
+ *
+ * Returns:
+ *   0 on success, -1 if the file cannot be loaded or validated (the
+ *   current configuration is left untouched)
+ */
+int config_reload_runtime(pipesix_config_t *config);
+
+/*
+ * Parse a log level name (case-insensitive).
+ *
+ * Returns:
+ *   0 on success, -1 if the name is not recognized
+ */
+int config_parse_log_level(const char *str, log_level_t *level);
 
 #endif /* PIPESIX_CONFIG_H */

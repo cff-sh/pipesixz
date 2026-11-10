@@ -43,6 +43,10 @@ SRCDIR       = src
 SOURCES      = $(SRCDIR)/main.c \
                $(SRCDIR)/logger.c \
                $(SRCDIR)/config.c \
+               $(SRCDIR)/crypto.c \
+               $(SRCDIR)/proto.c \
+               $(SRCDIR)/runtime.c \
+               $(SRCDIR)/stats.c \
                $(SRCDIR)/tun.c \
                $(SRCDIR)/ipv6.c \
                $(SRCDIR)/client.c \
@@ -50,6 +54,13 @@ SOURCES      = $(SRCDIR)/main.c \
 
 OBJECTS      = $(SOURCES:.c=.o)
 DEPENDS      = $(SOURCES:.c=.d)
+
+# Unit tests only need the platform-independent modules
+TEST_BIN     = tests/test_core
+TEST_SOURCES = tests/test_core.c
+TEST_OBJECTS = $(SRCDIR)/crypto.o $(SRCDIR)/proto.o \
+               $(SRCDIR)/config.o $(SRCDIR)/logger.o \
+               $(SRCDIR)/ipv6.o
 
 # Binary name
 TARGET       = pipesix
@@ -104,6 +115,16 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.c
 -include $(DEPENDS)
 
 #
+# Build and run the unit tests (no root privileges required).
+#
+$(TEST_BIN): $(TEST_SOURCES) $(TEST_OBJECTS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+.PHONY: check
+check: $(TEST_BIN)
+	@./$(TEST_BIN)
+
+#
 # Install the binary and example configuration.
 #
 .PHONY: install
@@ -132,7 +153,7 @@ uninstall:
 #
 .PHONY: clean
 clean:
-	rm -f $(OBJECTS) $(TARGET)
+	rm -f $(OBJECTS) $(TARGET) $(TEST_BIN)
 
 #
 # Clean build artifacts and dependency files.

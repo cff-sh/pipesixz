@@ -50,6 +50,22 @@ int ipv6_parse_header(const uint8_t *data, size_t length,
     return 0;
 }
 
+int ipv6_validate_packet(const uint8_t *data, size_t length)
+{
+    const pipesix_ipv6_header_t *header;
+
+    if (ipv6_parse_header(data, length, &header) != 0) {
+        return -1;
+    }
+
+    if ((size_t)ntohs(header->payload_length) + (size_t)IPV6_HEADER_LEN !=
+        length) {
+        return -1;
+    }
+
+    return 0;
+}
+
 void ipv6_log_packet(const uint8_t *data, size_t length, const char *prefix)
 {
     const pipesix_ipv6_header_t *hdr;
@@ -79,12 +95,11 @@ void ipv6_log_packet(const uint8_t *data, size_t length, const char *prefix)
         default:               proto_str = "UNKN";  break;
     }
 
-    log_info("[%s] %s %s -> %s (proto=%s, len=%u, hlim=%u)",
-             prefix,
-             proto_str,
-             src_str,
-             dst_str,
-             proto_str,
-             (unsigned)ntohs(hdr->payload_length),
-             (unsigned)hdr->hop_limit);
+    log_debug("[%s] %s %s -> %s (len=%u, hlim=%u)",
+              prefix,
+              proto_str,
+              src_str,
+              dst_str,
+              (unsigned)ntohs(hdr->payload_length),
+              (unsigned)hdr->hop_limit);
 }

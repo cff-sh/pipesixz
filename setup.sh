@@ -68,6 +68,10 @@ fi
 mkdir -p /etc/pipesix
 
 if [ "$MODE" = "server" ]; then
+    # 256-bit shared secret; identical on the server and every client.
+    SECRET="$(openssl rand -hex 32 2>/dev/null || \
+              head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+
     cat > /etc/pipesix/pipesix.conf <<EOF
 mode = server
 bind_address = 0.0.0.0
@@ -76,20 +80,31 @@ tun_name = tun0
 tun_address = ${TUN_ADDR}
 tun_prefixlen = 64
 tun_mtu = 1500
+secret = ${SECRET}
 log_level = info
 EOF
 
     ip -6 route del ${SUBNET} dev tun0 2>/dev/null || true
-    ip -6 route add ${CLIENT_ADDR}/128 dev tun0
+   # ip -6 route add ${CLIENT_ADDR}/128 dev tun0
 
     ip6tables -t nat -A POSTROUTING -s ${CLIENT_ADDR}/128 -o ${UPSTREAM_IFACE} -j MASQUERADE 2>/dev/null || true
     mkdir -p /etc/iptables
     ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
 
     echo "=== Server setup complete ==="
+    echo ""
+    echo "Shared secret (add the same line to every client config):"
+    echo "  secret = ${SECRET}"
+    echo ""
     echo "Run: sudo pipesix -c /etc/pipesix/pipesix.conf"
 
 else
+    if [ -n "${PIPESIX_SECRET:-}" ]; then
+        SECRET_LINE="secret = ${PIPESIX_SECRET}"
+    else
+        SECRET_LINE="# secret = <the value printed by setup.sh on the server>"
+    fi
+
     cat > /etc/pipesix/pipesix.conf <<EOF
 mode = client
 remote_address = ${VPS_PUBLIC_IP}
@@ -98,6 +113,7 @@ tun_name = tun0
 tun_address = ${TUN_ADDR}
 tun_prefixlen = 64
 tun_mtu = 1500
+${SECRET_LINE}
 log_level = info
 EOF
 
@@ -110,6 +126,12 @@ EOF
 
     echo "=== Client setup complete ==="
     echo ""
+    if [ -z "${PIPESIX_SECRET:-}" ]; then
+        echo "No secret configured: frames will be sent in plaintext."
+        echo "Re-run as 'PIPESIX_SECRET=<server secret> sudo -E ./setup.sh client ...'"
+        echo "or add the 'secret = ...' line to the config by hand."
+        echo ""
+    fi
     echo "1. Start pipesix:"
     echo "   sudo pipesix -c /etc/pipesix/pipesix.conf"
     echo ""

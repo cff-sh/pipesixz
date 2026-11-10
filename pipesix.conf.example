@@ -7,8 +7,7 @@
 #
 # Copy this file to /etc/pipesix/pipesix.conf and modify as needed.
 #
-# For a detailed explanation of all options, see the pipesix(8) man page
-# or run: pipesix -h
+# For a detailed explanation of all options, run: pipesix -h
 #
 
 # ---------------------------------------------------------------------------
@@ -52,10 +51,45 @@ remote_port    = 8899
 #
 #bind_address = 0.0.0.0
 #bind_port    = 8899
+#
+# allow_client:  Optional comma-separated allow-list of client IPs (up to
+#                64 entries). When empty, any sender may reach the tunnel.
+#
+#allow_client = 198.51.100.9, 2001:db8::3
+
+# ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+# secret:  Shared secret used to encrypt and authenticate every frame with
+#          ChaCha20-Poly1305. Both ends must use the same value.
+#          Generate one with: pipesix --genkey
+#          A 64-character hex string is used as a raw key; any other value
+#          is hashed with SHA-256. When unset, frames are sent in plaintext.
+#
+#secret = <output of "pipesix --genkey">
+
+# ---------------------------------------------------------------------------
+# Reliability
+# ---------------------------------------------------------------------------
+# keepalive:      Client keepalive interval in seconds (default: 20, 0 = off)
+# peer_timeout:   Client reconnects when no traffic arrives for this many
+#                 seconds (default: 120, 0 = off; requires keepalive > 0)
+# session_timeout: Server drops an idle session after this many seconds
+#                 (default: 120, 0 = off)
+# stats_interval: Periodic statistics interval (default: 60, 0 = off)
+#
+keepalive       = 20
+peer_timeout    = 120
+session_timeout = 120
+stats_interval  = 60
 
 # ---------------------------------------------------------------------------
 # Logging Configuration
 # ---------------------------------------------------------------------------
 # log_level: Controls verbosity. Options: debug, info, warn, error, fatal
+#
+# SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout and
+# stats_interval. Interface, endpoint, secret, mode and allow_client
+# changes take effect after a restart.
 #
 log_level = info
