@@ -1229,6 +1229,101 @@ static void test_client_secret_rotation(void)
     unlink(path);
 }
 
+/*
+ * --rotate-all: every configured client gets a fresh key, written into
+ * the file with comments and layout intact, and the result still loads.
+ */
+static void test_rotate_all_keys(void)
+{
+    static const char initial[] =
+        "# rotation fixture: comments and spacing must survive\n"
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "\n"
+        "client   = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_route = alice fd00:dead:beef::2/128\n"
+        "client = bob:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
+    static const char client_conf[] =
+        "mode = client\n"
+        "tun_address = fd00::2/64\n"
+        "remote_address = 203.0.113.1\n"
+        "client_id = alice\n"
+        "secret = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+    char path[512];
+    char client_path[512];
+    char text[4096];
+    char alice_key[CONFIG_MAX_SECRET];
+    pipesix_config_t config;
+    pipesix_config_t reloaded;
+    const pipesix_client_cred_t *cred;
+    FILE *fp;
+    size_t got;
+
+    check(write_temp_file(initial, path, sizeof(path)) == 0,
+          "write the rotate-all fixture");
+    check(config_load(path, &config) == 0, "load the rotate-all fixture");
+    check(config.client_count == 2, "the fixture has two clients");
+
+    check(config_rotate_all_keys(&config) == 0, "rotate every client key");
+    check(strcmp(config.clients[0].secret,
+                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") != 0,
+          "alice's key changed");
+    check(strcmp(config.clients[1].secret,
+                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") != 0,
+          "bob's key changed");
+    check(strlen(config.clients[0].secret) == 64,
+          "the rotated key is 64 characters");
+    check(strspn(config.clients[0].secret, "0123456789abcdef") == 64,
+          "the rotated key is hexadecimal");
+    check(strcmp(config.clients[0].secret, config.clients[1].secret) != 0,
+          "each client gets its own key");
+
+    memcpy(alice_key, config.clients[0].secret, sizeof(alice_key));
+
+    check(config_load(path, &reloaded) == 0, "the rewritten file still loads");
+    cred = config_find_client(&reloaded, "alice");
+    check(cred != NULL && strcmp(cred->secret, alice_key) == 0,
+          "the file holds alice's new key");
+    check(cred != NULL && cred->prefix_len == 128,
+          "the rewrite kept alice's route");
+    cred = config_find_client(&reloaded, "bob");
+    check(cred != NULL &&
+              strcmp(cred->secret, config.clients[1].secret) == 0,
+          "the file holds bob's new key");
+
+    fp = fopen(path, "r");
+    check(fp != NULL, "reopen the rewritten file");
+    if (fp != NULL) {
+        got = fread(text, 1, sizeof(text) - 1, fp);
+        fclose(fp);
+        text[got] = '\0';
+
+        check(strstr(text, "# rotation fixture") != NULL,
+              "the rewrite kept the comment");
+        check(strstr(text, "client   = alice: ") != NULL,
+              "the rewrite kept the spacing around '='");
+        check(strstr(text, "client = bob:") != NULL,
+              "the rewrite kept the spacing around ':'");
+        check(strstr(text, "client_route = alice fd00:dead:beef::2/128") != NULL,
+              "the rewrite kept the client_route line");
+    }
+
+    /* A second rotation must not hand out a key again. */
+    check(config_rotate_all_keys(&config) == 0, "rotate every key again");
+    check(strcmp(config.clients[0].secret, alice_key) != 0,
+          "the second rotation produced a different key");
+
+    /* Only a server has a client table to rotate. */
+    check(write_temp_file(client_conf, client_path, sizeof(client_path)) == 0,
+          "write a client-mode fixture");
+    check(config_load(client_path, &config) == 0, "load the client fixture");
+    check(config_rotate_all_keys(&config) != 0,
+          "rotate-all refuses a client configuration");
+
+    unlink(client_path);
+    unlink(path);
+}
+
 static void test_allow_client(void)
 {
     static const char allowed_config[] =
@@ -1302,6 +1397,7 @@ int main(void)
     test_config_reload();
     test_credential_rotation();
     test_client_secret_rotation();
+    test_rotate_all_keys();
     test_allow_client();
 
     printf("%d checks, %d failure(s)\n", g_checks, g_failures);

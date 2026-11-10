@@ -180,6 +180,21 @@ void config_dump(const pipesix_config_t *config);
 int config_reload_runtime(pipesix_config_t *config);
 
 /*
+ * Generate a fresh key for every configured client and write it into
+ * the configuration file.
+ *
+ * Server mode only: a client owns a single key, which 'pipesix --genkey'
+ * and a 'secret' edit already cover. Comments, ordering and spacing in
+ * the file are preserved, the new file is re-parsed and checked before it
+ * replaces the original, and on success config->clients[] holds the new
+ * secrets so the caller can print them for distribution.
+ *
+ * Returns:
+ *   0 on success, -1 on failure (no key and no file change)
+ */
+int config_rotate_all_keys(pipesix_config_t *config);
+
+/*
  * Find a client credential by id.
  *
  * Returns a pointer into config->clients, or NULL when the id is not

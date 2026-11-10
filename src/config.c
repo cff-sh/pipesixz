@@ -13,6 +13,7 @@
  */
 
 #include "config.h"
+#include "crypto.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -22,6 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /*
  * Trim leading and trailing whitespace from a string in place.
@@ -811,6 +814,287 @@ int config_reload_runtime(pipesix_config_t *config)
          */
         memcpy(config->client_id, fresh.client_id, sizeof(config->client_id));
         memcpy(config->secret, fresh.secret, sizeof(config->secret));
+    }
+
+    return 0;
+}
+
+/* One generated key as a NUL-terminated hex string. */
+#define ROTATE_KEY_STRIDE (PIPESIX_KEY_LEN * 2 + 1)
+
+/*
+ * Rewrite the 'client = <id>: <secret>' lines of path with new_keys.
+ *
+ * Every other byte of the file is copied through unchanged, so comments,
+ * blank lines, ordering and the spacing around '=' and ':' survive a
+ * rotation and the diff shows nothing but the secrets.
+ *
+ * The replacement is written to a temporary file in the same directory,
+ * parsed back and compared entry by entry, and only then renamed over the
+ * original: a bad rewrite can never replace a working configuration.
+ *
+ * Returns:
+ *   0 on success, -1 on failure (the original file is left alone)
+ */
+static int rewrite_client_keys(const char *path,
+                               const pipesix_config_t *config,
+                               const char *new_keys)
+{
+    char tmp_path[CONFIG_PATH_MAX + 32];
+    char buf[4096];
+    struct stat st;
+    FILE *in;
+    FILE *out = NULL;
+    int fd;
+    int rc = -1;
+    int i;
+
+    if (path == NULL || config == NULL) {
+        return -1;
+    }
+
+    if (strlen(path) + sizeof(".pipesix.XXXXXX") > sizeof(tmp_path)) {
+        return -1;
+    }
+
+    if (stat(path, &st) != 0) {
+        return -1;
+    }
+
+    snprintf(tmp_path, sizeof(tmp_path), "%s.pipesix.XXXXXX", path);
+
+    in = fopen(path, "r");
+    if (in == NULL) {
+        return -1;
+    }
+
+    fd = mkstemp(tmp_path);
+    if (fd < 0) {
+        fclose(in);
+        return -1;
+    }
+
+    /* Keep the permissions the operator set on the original file. */
+    if (fchmod(fd, st.st_mode & (mode_t)07777) != 0) {
+        close(fd);
+        unlink(tmp_path);
+        fclose(in);
+        return -1;
+    }
+
+    out = fdopen(fd, "w");
+    if (out == NULL) {
+        close(fd);
+        unlink(tmp_path);
+        fclose(in);
+        return -1;
+    }
+
+    while (fgets(buf, sizeof(buf), in) != NULL) {
+        const char *key = buf;
+        const char *eq;
+        const char *colon;
+        const char *secret;
+        const char *tail;
+        const char *id;
+        const char *id_end;
+        size_t key_len = 0;
+        size_t id_len;
+        size_t secret_len;
+        int idx = -1;
+
+        /* config_load() refused longer lines, so this is not a split. */
+        if (strchr(buf, '\n') == NULL && !feof(in)) {
+            goto cleanup;
+        }
+
+        while (isspace((unsigned char)*key)) {
+            key++;
+        }
+
+        /* Comments, blank lines and every other key are copied verbatim. */
+        if (*key == '\0' || *key == '#') {
+            fputs(buf, out);
+            continue;
+        }
+
+        while (key[key_len] != '\0' && key[key_len] != '=' &&
+               !isspace((unsigned char)key[key_len])) {
+            key_len++;
+        }
+
+        /* 'client_id' and 'client_route' must not be mistaken for 'client'. */
+        if (key_len != 6u || memcmp(key, "client", 6) != 0) {
+            fputs(buf, out);
+            continue;
+        }
+
+        eq = strchr(key, '=');
+        colon = (eq != NULL) ? strchr(eq + 1, ':') : NULL;
+        if (colon == NULL) {
+            goto cleanup;
+        }
+
+        /* Locate the id between '=' and ':', trimmed at both ends. */
+        id = eq + 1;
+        id_end = colon;
+        while (id < id_end && isspace((unsigned char)*id)) {
+            id++;
+        }
+        while (id_end > id && isspace((unsigned char)*(id_end - 1))) {
+            id_end--;
+        }
+        id_len = (size_t)(id_end - id);
+
+        for (i = 0; i < config->client_count; i++) {
+            if (strlen(config->clients[i].id) == id_len &&
+                memcmp(config->clients[i].id, id, id_len) == 0) {
+                idx = i;
+                break;
+            }
+        }
+
+        /* An id the loaded table does not know means the file changed. */
+        if (idx < 0) {
+            goto cleanup;
+        }
+
+        secret = colon + 1;
+        while (*secret != '\0' && isspace((unsigned char)*secret)) {
+            secret++;
+        }
+
+        tail = secret;
+        while (*tail != '\0' && !isspace((unsigned char)*tail)) {
+            tail++;
+        }
+        secret_len = (size_t)(secret - buf);
+
+        /* Prefix through the colon's whitespace, new key, then the rest. */
+        if (fwrite(buf, 1, secret_len, out) != secret_len) {
+            goto cleanup;
+        }
+        if (fputs(new_keys + ((size_t)idx * ROTATE_KEY_STRIDE), out) == EOF ||
+            fputs(tail, out) == EOF) {
+            goto cleanup;
+        }
+    }
+
+    if (ferror(in)) {
+        goto cleanup;
+    }
+
+    if (fflush(out) != 0 || fsync(fileno(out)) != 0) {
+        goto cleanup;
+    }
+
+    if (fclose(out) != 0) {
+        out = NULL;
+        goto cleanup;
+    }
+    out = NULL;
+
+    /* Re-parse the replacement before it is allowed to replace anything. */
+    {
+        pipesix_config_t check;
+
+        if (config_load(tmp_path, &check) != 0 ||
+            config_validate(&check) != 0) {
+            unlink(tmp_path);
+            fclose(in);
+            return -1;
+        }
+
+        for (i = 0; i < config->client_count; i++) {
+            const pipesix_client_cred_t *cred =
+                config_find_client(&check, config->clients[i].id);
+
+            if (cred == NULL ||
+                strcmp(cred->secret,
+                       new_keys + ((size_t)i * ROTATE_KEY_STRIDE)) != 0) {
+                unlink(tmp_path);
+                fclose(in);
+                return -1;
+            }
+        }
+    }
+
+    if (rename(tmp_path, path) != 0) {
+        unlink(tmp_path);
+        fclose(in);
+        return -1;
+    }
+
+    rc = 0;
+
+cleanup:
+    if (out != NULL) {
+        fclose(out);
+    }
+    fclose(in);
+
+    if (rc != 0) {
+        unlink(tmp_path);
+    }
+
+    return rc;
+}
+
+int config_rotate_all_keys(pipesix_config_t *config)
+{
+    char new_keys[(size_t)CONFIG_MAX_CLIENTS * ROTATE_KEY_STRIDE];
+    uint8_t key[PIPESIX_KEY_LEN];
+    int i;
+
+    if (config == NULL) {
+        return -1;
+    }
+
+    if (strcmp(config->mode, "server") != 0) {
+        log_error("--rotate-all rewrites a server's client table; on a "
+                  "client generate a key with 'pipesix --genkey' and set "
+                  "'secret' by hand");
+        return -1;
+    }
+
+    if (config->client_count <= 0) {
+        log_error("--rotate-all: no 'client' entries are configured");
+        return -1;
+    }
+
+    if (config->config_path[0] == '\0') {
+        log_error("--rotate-all: the configuration file path is unknown");
+        return -1;
+    }
+
+    /*
+     * Generate every key before touching the file, so a failure to read
+     * randomness leaves the configuration exactly as it was.
+     */
+    for (i = 0; i < config->client_count; i++) {
+        if (pipesix_random_bytes(key, sizeof(key)) != 0) {
+            log_error("--rotate-all: cannot read random bytes: %s",
+                      strerror(errno));
+            return -1;
+        }
+
+        pipesix_hex_encode(key, sizeof(key),
+                           new_keys + ((size_t)i * ROTATE_KEY_STRIDE));
+    }
+
+    memset(key, 0, sizeof(key));
+
+    if (rewrite_client_keys(config->config_path, config, new_keys) != 0) {
+        log_error("--rotate-all: cannot rewrite '%s'; the existing keys "
+                  "are unchanged", config->config_path);
+        return -1;
+    }
+
+    /* The caller prints these, so the new keys can be handed out. */
+    for (i = 0; i < config->client_count; i++) {
+        memcpy(config->clients[i].secret,
+               new_keys + ((size_t)i * ROTATE_KEY_STRIDE),
+               ROTATE_KEY_STRIDE);
     }
 
     return 0;
