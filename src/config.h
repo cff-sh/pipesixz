@@ -21,7 +21,9 @@
  *   remote_port      - Server port for client mode
  *   bind_address     - Bind address for server mode
  *   bind_port        - Bind port for server mode
- *   secret           - Shared secret enabling HMAC-SHA256 authentication
+ *   secret           - This client's pre-shared key (client mode)
+ *   client_id        - This client's identity (client mode)
+ *   client           - <id>: <secret> credential (server mode, repeatable)
  *   keepalive        - Client keepalive interval in seconds (0 disables)
  *   session_timeout  - Server session idle timeout in seconds (0 disables)
  *   peer_timeout     - Client dead-peer timeout in seconds (0 disables)
@@ -31,8 +33,8 @@
  *
  * SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout
  * and stats_interval from the original configuration file. Changes to
- * the interface, endpoints, secret, mode or allow_client require a
- * restart.
+ * the interface, endpoints, credentials, mode or allow_client require
+ * a restart.
  */
 
 #ifndef PIPESIX_CONFIG_H
@@ -51,6 +53,8 @@
 #define CONFIG_MAX_SECRET   256
 #define CONFIG_PATH_MAX     4096
 #define CONFIG_MAX_ALLOWED  64
+#define CONFIG_MAX_CLIENTS  64
+#define CONFIG_MAX_CLIENT_ID 32
 
 /*
  * Default Configuration Values
@@ -65,6 +69,14 @@
 #define CONFIG_DEFAULT_SESSION_TIMEOUT   120
 #define CONFIG_DEFAULT_STATS_INTERVAL    60
 #define CONFIG_DEFAULT_PEER_TIMEOUT      120
+
+/*
+ * Per-client credential: a stable identity plus its own pre-shared key.
+ */
+typedef struct {
+    char id[CONFIG_MAX_CLIENT_ID];
+    char secret[CONFIG_MAX_SECRET];
+} pipesix_client_cred_t;
 
 /*
  * pipesix_config_t
@@ -91,7 +103,7 @@ typedef struct {
     int  bind_port;                          /* Local UDP port */
 
     /* Security and session management */
-    char secret[CONFIG_MAX_SECRET];         /* Shared secret (empty = no auth) */
+    char secret[CONFIG_MAX_SECRET];         /* This client's pre-shared key */
     int  keepalive;                          /* Client keepalive interval */
     int  session_timeout;                    /* Server idle session timeout */
 
@@ -99,6 +111,15 @@ typedef struct {
     int  peer_timeout;                       /* Client dead-peer timeout */
     char allow_client[CONFIG_MAX_ALLOWED][CONFIG_MAX_ADDRESS];
     int  allow_client_count;                 /* Parsed allow-list entries */
+
+    /*
+     * Per-client identity and credentials. In client mode 'client_id'
+     * and 'secret' identify this host; in server mode 'clients' holds
+     * one entry per admitted client, each with its own PSK.
+     */
+    char client_id[CONFIG_MAX_CLIENT_ID];
+    pipesix_client_cred_t clients[CONFIG_MAX_CLIENTS];
+    int  client_count;
 
     /* Observability */
     int  stats_interval;                     /* Periodic stats interval */
@@ -145,6 +166,15 @@ void config_dump(const pipesix_config_t *config);
  *   current configuration is left untouched)
  */
 int config_reload_runtime(pipesix_config_t *config);
+
+/*
+ * Find a client credential by id.
+ *
+ * Returns a pointer into config->clients, or NULL when the id is not
+ * configured.
+ */
+const pipesix_client_cred_t *config_find_client(const pipesix_config_t *config,
+                                                const char *id);
 
 /*
  * Parse a log level name (case-insensitive).

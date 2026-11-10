@@ -199,6 +199,105 @@ static int set_allow_client(pipesix_config_t *config, const char *value)
 }
 
 /*
+ * Client ids appear in logs and are matched byte for byte, so keep them
+ * to a conservative character set.
+ */
+static int valid_client_id(const char *id)
+{
+    size_t i;
+    size_t len;
+
+    if (id == NULL) return 0;
+
+    len = strlen(id);
+    if (len == 0 || len >= CONFIG_MAX_CLIENT_ID) return 0;
+
+    for (i = 0; i < len; i++) {
+        char c = id[i];
+
+        if (!(isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.')) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+/*
+ * Parse "client = <id>: <secret>" and append it to the credential table.
+ */
+static int set_client_cred(pipesix_config_t *config, const char *value)
+{
+    const char *sep;
+    const char *start;
+    const char *end;
+    const char *secret;
+    char id[CONFIG_MAX_CLIENT_ID];
+    size_t id_len;
+    size_t secret_len;
+    size_t i;
+
+    if (value == NULL) return -1;
+
+    sep = strchr(value, ':');
+    if (sep == NULL) return -1;
+
+    start = value;
+    end = sep;
+    while (start < end && isspace((unsigned char)*start)) start++;
+    while (end > start && isspace((unsigned char)*(end - 1))) end--;
+
+    id_len = (size_t)(end - start);
+    if (id_len == 0 || id_len >= sizeof(id)) return -1;
+
+    memcpy(id, start, id_len);
+    id[id_len] = '\0';
+
+    if (!valid_client_id(id)) return -1;
+
+    secret = sep + 1;
+    while (*secret != '\0' && isspace((unsigned char)*secret)) secret++;
+
+    secret_len = strlen(secret);
+    while (secret_len > 0 &&
+           isspace((unsigned char)secret[secret_len - 1])) {
+        secret_len--;
+    }
+
+    if (secret_len == 0 || secret_len >= CONFIG_MAX_SECRET) return -1;
+    if (config->client_count >= CONFIG_MAX_CLIENTS) return -1;
+
+    for (i = 0; i < (size_t)config->client_count; i++) {
+        if (strcmp(config->clients[i].id, id) == 0) {
+            return -1; /* Duplicate ids would make identity ambiguous. */
+        }
+    }
+
+    memcpy(config->clients[config->client_count].id, id, id_len + 1);
+    memcpy(config->clients[config->client_count].secret, secret, secret_len);
+    config->clients[config->client_count].secret[secret_len] = '\0';
+    config->client_count++;
+
+    return 0;
+}
+
+const pipesix_client_cred_t *config_find_client(const pipesix_config_t *config,
+                                                const char *id)
+{
+    int i;
+
+    if (config == NULL || id == NULL) return NULL;
+
+    for (i = 0; i < config->client_count; i++) {
+        if (strcmp(config->clients[i].id, id) == 0) {
+            return &config->clients[i];
+        }
+    }
+
+    return NULL;
+}
+
+/*
  * Process a single key=value line and update the configuration.
  *
  * Returns 0 on success, -1 if the value is invalid or too long.
@@ -250,6 +349,16 @@ static int config_set_value(pipesix_config_t *config, const char *key,
     }
     if (strcmp(key, "stats_interval") == 0) {
         return set_int_range(&config->stats_interval, value, 0, 86400);
+    }
+    if (strcmp(key, "client_id") == 0) {
+        if (!valid_client_id(value)) {
+            return -1;
+        }
+        return copy_string(config->client_id, sizeof(config->client_id),
+                           value);
+    }
+    if (strcmp(key, "client") == 0) {
+        return set_client_cred(config, value);
     }
     if (strcmp(key, "log_level") == 0) {
         log_level_t level;
@@ -409,6 +518,14 @@ int config_validate(const pipesix_config_t *config)
                       config->remote_port);
             return -1;
         }
+        if (strlen(config->client_id) == 0) {
+            log_error("Configuration validation failed: 'client_id' is required in client mode");
+            return -1;
+        }
+        if (config->secret[0] == '\0') {
+            log_error("Configuration validation failed: 'secret' (this client's pre-shared key) is required in client mode");
+            return -1;
+        }
     }
 
     if (strcmp(config->mode, "server") == 0) {
@@ -421,15 +538,32 @@ int config_validate(const pipesix_config_t *config)
                       config->bind_port);
             return -1;
         }
-        if (config->secret[0] == '\0') {
-            log_warn("Server is running without a 'secret': frames are sent in "
-                     "plaintext and any host that can reach the UDP port can "
-                     "inject traffic");
+        if (config->client_count == 0) {
+            log_error("Configuration validation failed: at least one "
+                      "'client = <id>: <secret>' entry is required in "
+                      "server mode");
+            return -1;
+        }
+        if (config->secret[0] != '\0') {
+            log_warn("Server 'secret' is ignored: each client authenticates "
+                     "with its own credential from 'client = <id>: <secret>'");
         }
     }
 
-    if (config->secret[0] != '\0' && strlen(config->secret) < 16) {
+    if (strcmp(config->mode, "client") == 0 &&
+        config->secret[0] != '\0' && strlen(config->secret) < 16) {
         log_warn("Configured 'secret' is short; generate one with 'pipesix --genkey'");
+    }
+
+    {
+        int i;
+
+        for (i = 0; i < config->client_count; i++) {
+            if (strlen(config->clients[i].secret) < 16) {
+                log_warn("Client '%s' uses a short secret; generate one "
+                         "with 'pipesix --genkey'", config->clients[i].id);
+            }
+        }
     }
 
     return 0;
@@ -470,6 +604,17 @@ void config_dump(const pipesix_config_t *config)
 
     log_info("  secret          = %s",
              (config->secret[0] != '\0') ? "(set)" : "(not set)");
+    log_info("  client_id       = %s",
+             (config->client_id[0] != '\0') ? config->client_id : "(not set)");
+
+    if (strcmp(config->mode, "server") == 0) {
+        int i;
+
+        log_info("  clients         = %d configured", config->client_count);
+        for (i = 0; i < config->client_count; i++) {
+            log_info("    client: %s", config->clients[i].id);
+        }
+    }
     log_info("  keepalive       = %d s", config->keepalive);
     log_info("  peer_timeout    = %d s", config->peer_timeout);
     log_info("  session_timeout = %d s", config->session_timeout);

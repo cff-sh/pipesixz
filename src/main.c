@@ -9,14 +9,14 @@
  * Usage:
  *   pipesix [-c <config>]         Start with the given (or default) config
  *   pipesix -t [-c <config>]      Validate the configuration and exit
- *   pipesix --genkey              Print a random 256-bit shared secret
+ *   pipesix --genkey              Print a random 256-bit per-client key
  *   pipesix -V                    Show version information
  *
  * Command-Line Options:
  *   -c, --config <path>     Configuration file (default /etc/pipesix/pipesix.conf)
  *   -t, --check             Validate configuration without touching the network
  *   -l, --log-level <name>  Override the configured log level
- *   -g, --genkey            Generate a shared secret for frame authentication
+ *   -g, --genkey            Generate a per-client pre-shared key
  *   -V, --version           Show version information
  *   -h, --help              Show help
  *
@@ -42,7 +42,7 @@
 #include <string.h>
 #include <time.h>
 
-#define PIPESIX_APP_VERSION "2.0.0"
+#define PIPESIX_APP_VERSION "2.1.0"
 #define DEFAULT_CONFIG_PATH "/etc/pipesix/pipesix.conf"
 
 static void handle_shutdown(int sig)
@@ -120,7 +120,7 @@ static void print_usage(const char *progname)
             "                          (default: %s)\n"
             "  -t, --check             Validate configuration and exit\n"
             "  -l, --log-level <name>  Override log level\n"
-            "  -g, --genkey            Generate a shared secret and exit\n"
+            "  -g, --genkey            Generate a per-client key and exit\n"
             "  -V, --version           Show version information\n"
             "  -h, --help              Show this help message\n"
             "\n"
@@ -134,7 +134,9 @@ static void print_usage(const char *progname)
             "  remote_port     Server port (client mode, default: 8899)\n"
             "  bind_address    Bind address (server mode, default: 0.0.0.0)\n"
             "  bind_port       Bind port (server mode, default: 8899)\n"
-            "  secret          Shared secret enabling HMAC-SHA256 authentication\n"
+            "  secret          This client's pre-shared key (client mode)\n"
+            "  client_id       This client's identity (client mode)\n"
+            "  client          <id>: <secret> entry (server mode, repeatable)\n"
             "  keepalive       Client keepalive seconds (default: 20, 0 = off)\n"
             "  session_timeout Server idle timeout seconds (default: 120)\n"
             "  peer_timeout    Client reconnect timeout seconds (default: 120, 0 = off)\n"
@@ -255,9 +257,7 @@ int main(int argc, char *argv[])
     }
 
     log_info("Frame protection: %s",
-             (config.secret[0] != '\0')
-                 ? "ChaCha20-Poly1305 (encrypted and authenticated)"
-                 : "none (plaintext, unauthenticated)");
+             "ChaCha20-Poly1305 with per-client session keys");
 
     runtime_init();
 

@@ -68,7 +68,8 @@ fi
 mkdir -p /etc/pipesix
 
 if [ "$MODE" = "server" ]; then
-    # 256-bit shared secret; identical on the server and every client.
+    # Each client gets its own credential; nothing is shared.
+    CLIENT_ID="${PIPESIX_CLIENT_ID:-client1}"
     SECRET="$(openssl rand -hex 32 2>/dev/null || \
               head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
@@ -80,7 +81,7 @@ tun_name = tun0
 tun_address = ${TUN_ADDR}
 tun_prefixlen = 64
 tun_mtu = 1500
-secret = ${SECRET}
+client = ${CLIENT_ID}: ${SECRET}
 log_level = info
 EOF
 
@@ -93,20 +94,27 @@ EOF
 
     echo "=== Server setup complete ==="
     echo ""
-    echo "Shared secret (add the same line to every client config):"
+    echo "Client credentials (add these to that client's config):"
+    echo "  client_id = ${CLIENT_ID}"
     echo "  secret = ${SECRET}"
+    echo ""
+    echo "Add another client by appending one line to /etc/pipesix/pipesix.conf:"
+    echo "  client = <id>: $(pipesix --genkey 2>/dev/null || echo '<pipesix --genkey>')"
     echo ""
     echo "Run: sudo pipesix -c /etc/pipesix/pipesix.conf"
 
 else
+    CLIENT_ID="${PIPESIX_CLIENT_ID:-client1}"
+
     if [ -n "${PIPESIX_SECRET:-}" ]; then
         SECRET_LINE="secret = ${PIPESIX_SECRET}"
     else
-        SECRET_LINE="# secret = <the value printed by setup.sh on the server>"
+        SECRET_LINE="# secret = <the key printed by setup.sh on the server>"
     fi
 
     cat > /etc/pipesix/pipesix.conf <<EOF
 mode = client
+client_id = ${CLIENT_ID}
 remote_address = ${VPS_PUBLIC_IP}
 remote_port = 8899
 tun_name = tun0
@@ -127,9 +135,11 @@ EOF
     echo "=== Client setup complete ==="
     echo ""
     if [ -z "${PIPESIX_SECRET:-}" ]; then
-        echo "No secret configured: frames will be sent in plaintext."
-        echo "Re-run as 'PIPESIX_SECRET=<server secret> sudo -E ./setup.sh client ...'"
-        echo "or add the 'secret = ...' line to the config by hand."
+        echo "No credential configured yet: the client cannot connect."
+        echo "Re-run as:"
+        echo "  sudo PIPESIX_CLIENT_ID=${CLIENT_ID} PIPESIX_SECRET=<key from the server> \\"
+        echo "       ./setup.sh client ${VPS_PUBLIC_IP}"
+        echo "or fill in the 'client_id' and 'secret' lines by hand."
         echo ""
     fi
     echo "1. Start pipesix:"

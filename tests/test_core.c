@@ -1,10 +1,11 @@
 /*
  * test_core.c - Unit tests for platform-independent pipesix modules
  *
- * Covers SHA-256/HMAC/ChaCha20-Poly1305 known-answer vectors, key
- * derivation, frame encryption and tamper detection, the replay
- * window (including counter wrap), IPv6 validation and the
- * configuration parser. Run with `make check`; no root required.
+ * Covers SHA-256/HMAC/HKDF/ChaCha20-Poly1305 known-answer vectors, key
+ * derivation, the PSK handshake, per-session key isolation, frame
+ * encryption and tamper detection, the replay window (including
+ * counter wrap), IPv6 validation and the configuration parser.
+ * Run with `make check`; no root required.
  */
 
 #include "config.h"
@@ -116,6 +117,39 @@ static void test_hmac(void)
                  "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
               == 0,
           "HMAC-SHA256 RFC 4231 case 1");
+}
+
+/*
+ * HKDF-SHA256, RFC 5869 test case 1.
+ */
+static void test_hkdf(void)
+{
+    uint8_t ikm[22];
+    uint8_t salt[13];
+    uint8_t info[10];
+    uint8_t okm[42];
+    uint8_t expected[42];
+    int i;
+
+    memset(ikm, 0x0b, sizeof(ikm));
+    for (i = 0; i < (int)sizeof(salt); i++) {
+        salt[i] = (uint8_t)i;
+    }
+    for (i = 0; i < (int)sizeof(info); i++) {
+        info[i] = (uint8_t)(0xf0 + i);
+    }
+
+    check(hex_decode("3cb25f25faacd57a90434f64d0362f2a"
+                     "2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+                     "34007208d5b887185865",
+                     expected, sizeof(expected)) == 42,
+          "decode HKDF vector");
+
+    pipesix_hkdf_sha256(ikm, sizeof(ikm), salt, sizeof(salt),
+                        info, sizeof(info), okm, sizeof(okm));
+
+    check(memcmp(okm, expected, sizeof(expected)) == 0,
+          "HKDF-SHA256 RFC 5869 case 1");
 }
 
 /*
@@ -308,6 +342,7 @@ static void test_frames(void)
     pipesix_frame_t parsed;
     size_t frame_len;
     size_t i;
+    uint16_t flags;
     int rc;
     const uint32_t salt = 0xaabbccddu;
     const uint64_t seq = UINT64_C(0x1122334455667788);
@@ -331,6 +366,10 @@ static void test_frames(void)
      */
     check(memcmp(frame + PIPESIX_HEADER_SIZE, payload, sizeof(payload)) != 0,
           "payload is encrypted on the wire");
+
+    check(pipesix_frame_peek(frame, frame_len, &flags) == PIPESIX_OK,
+          "header peek succeeds");
+    check((flags & PIPESIX_FLAG_AUTH) != 0, "peek reports authentication");
 
     rc = pipesix_frame_parse(frame, frame_len, &parsed, key);
     check(rc == PIPESIX_OK, "encrypted frame parsed");
@@ -367,15 +406,6 @@ static void test_frames(void)
               PIPESIX_ERR_LENGTH,
           "truncated frame rejected");
 
-    /* Plaintext mode */
-    frame_len = pipesix_frame_build(frame, sizeof(frame), 0, salt, 7,
-                                    payload, sizeof(payload), NULL);
-    check(frame_len == PIPESIX_HEADER_SIZE + sizeof(payload),
-          "plain frame size");
-    check(pipesix_frame_parse(frame, frame_len, &parsed, NULL) == PIPESIX_OK,
-          "plain frame parsed");
-    check(parsed.authenticated == 0, "plain frame marked unauthenticated");
-
     /* Keepalive frames carry no payload. */
     frame_len = pipesix_frame_build(frame, sizeof(frame),
                                     PIPESIX_FLAG_KEEPALIVE, salt, 8,
@@ -392,6 +422,200 @@ static void test_frames(void)
     check(pipesix_frame_build(frame, sizeof(frame), PIPESIX_FLAG_KEEPALIVE,
                               salt, 9, payload, 1, key) == 0,
           "keepalive with payload rejected");
+
+    /* Handshake frames are plaintext and must never carry an AEAD tag. */
+    frame_len = pipesix_frame_build(frame, sizeof(frame),
+                                    PIPESIX_FLAG_HANDSHAKE_INIT, salt, 10,
+                                    payload, 16, NULL);
+    check(frame_len == PIPESIX_HEADER_SIZE + 16, "handshake frame is plaintext");
+    check(pipesix_frame_build(frame, sizeof(frame),
+                              PIPESIX_FLAG_HANDSHAKE_INIT, salt, 11,
+                              payload, 16, key) == 0,
+          "handshake frame cannot be AEAD protected");
+    check(pipesix_frame_build(frame, sizeof(frame),
+                              PIPESIX_FLAG_HANDSHAKE_NEEDED, salt, 12,
+                              payload, 1, NULL) == 0,
+          "handshake-needed frame must be empty");
+}
+
+/*
+ * INIT and RESPONSE payloads, including tamper detection.
+ */
+static void test_handshake_payloads(void)
+{
+    uint8_t psk[PIPESIX_KEY_LEN];
+    uint8_t other_psk[PIPESIX_KEY_LEN];
+    uint8_t cnonce[PIPESIX_HANDSHAKE_NONCE_LEN];
+    uint8_t snonce[PIPESIX_HANDSHAKE_NONCE_LEN];
+    uint8_t echoed[PIPESIX_HANDSHAKE_NONCE_LEN];
+    uint8_t init[PIPESIX_HANDSHAKE_INIT_MAX];
+    uint8_t resp[PIPESIX_HANDSHAKE_RESP_MAX];
+    char id[CONFIG_MAX_CLIENT_ID];
+    size_t len;
+    size_t i;
+    char long_id[CONFIG_MAX_CLIENT_ID + 1];
+
+    memset(psk, 0x5a, sizeof(psk));
+    memset(other_psk, 0xa5, sizeof(other_psk));
+    for (i = 0; i < sizeof(cnonce); i++) {
+        cnonce[i] = (uint8_t)(0x10 + i);
+        snonce[i] = (uint8_t)(0x80 + i);
+    }
+
+    /* --- INIT --- */
+
+    len = pipesix_handshake_init_build(init, sizeof(init), "alice", cnonce, psk);
+    check(len == 1u + 5u + PIPESIX_HANDSHAKE_NONCE_LEN +
+                  PIPESIX_HANDSHAKE_MAC_LEN,
+          "INIT payload length");
+
+    check(pipesix_handshake_init_peek(init, len, id, sizeof(id), NULL) ==
+              PIPESIX_OK,
+          "INIT peek succeeds");
+    check(strcmp(id, "alice") == 0, "INIT carries the client id");
+
+    check(pipesix_handshake_init_verify(init, len, psk) == PIPESIX_OK,
+          "INIT verifies with the right PSK");
+    check(pipesix_handshake_init_verify(init, len, other_psk) ==
+              PIPESIX_ERR_AUTH,
+          "INIT rejects the wrong PSK");
+
+    /* A different client id must not authenticate. */
+    init[1] = (uint8_t)'b';
+    check(pipesix_handshake_init_verify(init, len, psk) == PIPESIX_ERR_AUTH,
+          "INIT rejects a modified client id");
+    init[1] = (uint8_t)'a';
+
+    /* Nor may a modified nonce. */
+    init[1 + 5] ^= 0x01u;
+    check(pipesix_handshake_init_verify(init, len, psk) == PIPESIX_ERR_AUTH,
+          "INIT rejects a modified nonce");
+    init[1 + 5] ^= 0x01u;
+
+    check(pipesix_handshake_init_verify(init, len - 1, psk) ==
+              PIPESIX_ERR_LENGTH,
+          "truncated INIT rejected");
+
+    check(pipesix_handshake_init_build(init, sizeof(init), "", cnonce, psk) ==
+              0,
+          "empty client id rejected");
+    memset(long_id, 'x', sizeof(long_id));
+    long_id[sizeof(long_id) - 1] = '\0';
+    check(pipesix_handshake_init_build(init, sizeof(init), long_id, cnonce,
+                                       psk) == 0,
+          "over-long client id rejected");
+
+    /* --- RESPONSE --- */
+
+    len = pipesix_handshake_resp_build(resp, sizeof(resp), cnonce, snonce, psk);
+    check(len == 2u * PIPESIX_HANDSHAKE_NONCE_LEN +
+                  PIPESIX_HANDSHAKE_MAC_LEN,
+          "RESPONSE payload length");
+
+    check(pipesix_handshake_resp_verify(resp, len, psk, echoed) == PIPESIX_OK,
+          "RESPONSE verifies");
+    check(memcmp(echoed, cnonce, sizeof(cnonce)) == 0,
+          "RESPONSE echoes the client nonce");
+
+    check(pipesix_handshake_resp_verify(resp, len, other_psk, echoed) ==
+              PIPESIX_ERR_AUTH,
+          "RESPONSE rejects the wrong PSK");
+
+    resp[PIPESIX_HANDSHAKE_NONCE_LEN] ^= 0x01u;
+    check(pipesix_handshake_resp_verify(resp, len, psk, echoed) ==
+              PIPESIX_ERR_AUTH,
+          "RESPONSE rejects a modified server nonce");
+    resp[PIPESIX_HANDSHAKE_NONCE_LEN] ^= 0x01u;
+
+    check(pipesix_handshake_resp_verify(resp, len - 1, psk, echoed) ==
+              PIPESIX_ERR_LENGTH,
+          "truncated RESPONSE rejected");
+}
+
+/*
+ * Per-client key isolation: two clients never share a keystream, and
+ * the two directions of one session are independent.
+ */
+static void test_session_isolation(void)
+{
+    uint8_t psk_a[PIPESIX_KEY_LEN];
+    uint8_t psk_b[PIPESIX_KEY_LEN];
+    uint8_t cnonce[PIPESIX_HANDSHAKE_NONCE_LEN];
+    uint8_t snonce[PIPESIX_HANDSHAKE_NONCE_LEN];
+    uint8_t cnonce2[PIPESIX_HANDSHAKE_NONCE_LEN];
+    uint8_t a_c2s[PIPESIX_KEY_LEN];
+    uint8_t a_s2c[PIPESIX_KEY_LEN];
+    uint8_t a_c2s_again[PIPESIX_KEY_LEN];
+    uint8_t b_c2s[PIPESIX_KEY_LEN];
+    uint8_t b_s2c[PIPESIX_KEY_LEN];
+    uint8_t c2s2[PIPESIX_KEY_LEN];
+    uint8_t s2c2[PIPESIX_KEY_LEN];
+    uint8_t payload[32];
+    uint8_t frame[PIPESIX_MAX_FRAME];
+    pipesix_frame_t parsed;
+    size_t frame_len;
+
+    memset(psk_a, 0x11, sizeof(psk_a));
+    memset(psk_b, 0x22, sizeof(psk_b));
+    memset(cnonce, 0x33, sizeof(cnonce));
+    memset(snonce, 0x44, sizeof(snonce));
+    memset(cnonce2, 0x35, sizeof(cnonce2));
+    memset(payload, 0x77, sizeof(payload));
+
+    pipesix_session_keys(psk_a, cnonce, snonce, a_c2s, a_s2c);
+    pipesix_session_keys(psk_a, cnonce, snonce, a_c2s_again, b_s2c);
+    pipesix_session_keys(psk_b, cnonce, snonce, b_c2s, b_s2c);
+    pipesix_session_keys(psk_a, cnonce2, snonce, c2s2, s2c2);
+
+    check(memcmp(a_c2s, a_c2s_again, sizeof(a_c2s)) == 0,
+          "session keys are deterministic");
+    check(memcmp(a_c2s, a_s2c, sizeof(a_c2s)) != 0,
+          "the two directions use different keys");
+    check(memcmp(a_c2s, b_c2s, sizeof(a_c2s)) != 0,
+          "different PSKs produce different keys");
+    check(memcmp(a_c2s, c2s2, sizeof(a_c2s)) != 0,
+          "a different handshake produces a different key");
+    check(memcmp(a_c2s, b_s2c, sizeof(a_c2s)) != 0,
+          "client A key differs from client B reverse key");
+
+    /* A frame sealed by client A must not open under any other key. */
+    frame_len = pipesix_frame_build(frame, sizeof(frame), 0, 0x01020304u, 1,
+                                    payload, sizeof(payload), a_c2s);
+    check(frame_len > 0, "client A frame built");
+
+    check(pipesix_frame_parse(frame, frame_len, &parsed, a_c2s) == PIPESIX_OK,
+          "client A frame opens under its own key");
+
+    frame_len = pipesix_frame_build(frame, sizeof(frame), 0, 0x01020304u, 1,
+                                    payload, sizeof(payload), a_c2s);
+    check(pipesix_frame_parse(frame, frame_len, &parsed, a_s2c) ==
+              PIPESIX_ERR_AUTH,
+          "the reverse key cannot open a client frame");
+
+    frame_len = pipesix_frame_build(frame, sizeof(frame), 0, 0x01020304u, 1,
+                                    payload, sizeof(payload), a_c2s);
+    check(pipesix_frame_parse(frame, frame_len, &parsed, b_c2s) ==
+              PIPESIX_ERR_AUTH,
+          "client B cannot open client A's frame");
+
+    /* Two clients using the same sequence and salt still differ. */
+    {
+        uint8_t frame_a[PIPESIX_MAX_FRAME];
+        uint8_t frame_b[PIPESIX_MAX_FRAME];
+        size_t len_a;
+        size_t len_b;
+
+        len_a = pipesix_frame_build(frame_a, sizeof(frame_a), 0, 7u, 7,
+                                    payload, sizeof(payload), a_c2s);
+        len_b = pipesix_frame_build(frame_b, sizeof(frame_b), 0, 7u, 7,
+                                    payload, sizeof(payload), b_c2s);
+        check(len_a == len_b && len_a > 0,
+              "identical inputs produce the same frame length");
+        check(memcmp(frame_a + PIPESIX_HEADER_SIZE,
+                     frame_b + PIPESIX_HEADER_SIZE,
+                     sizeof(payload)) != 0,
+              "identical sequence numbers yield different ciphertext");
+    }
 }
 
 static void test_replay(void)
@@ -439,33 +663,6 @@ static void test_replay_wrap(void)
     check(pipesix_replay_accept(&replay, 1) == 1, "accept after wrap");
     check(pipesix_replay_accept(&replay, UINT64_MAX) == 0,
           "reject pre-wrap replay when outside the window");
-}
-
-static void test_session_reset(void)
-{
-    uint8_t key[PIPESIX_KEY_LEN];
-    uint8_t frame[PIPESIX_MAX_FRAME];
-    pipesix_frame_t parsed;
-    size_t frame_len;
-
-    memset(key, 0x22, sizeof(key));
-
-    frame_len = pipesix_frame_build(frame, sizeof(frame), PIPESIX_FLAG_RESET,
-                                    0x01020304u, 100, NULL, 0, key);
-    check(frame_len > 0, "reset frame built");
-    check(pipesix_frame_parse(frame, frame_len, &parsed, key) == PIPESIX_OK,
-          "reset frame parsed");
-    check((parsed.flags & PIPESIX_FLAG_RESET) != 0, "reset flag preserved");
-    check(parsed.payload_len == 0, "reset frame has no payload");
-
-    check(pipesix_frame_build(frame, sizeof(frame), PIPESIX_FLAG_RESET,
-                              0x01020304u, 101, (const uint8_t *)"x", 1,
-                              key) == 0,
-          "reset with payload rejected");
-    check(pipesix_frame_build(frame, sizeof(frame),
-                              PIPESIX_FLAG_RESET | PIPESIX_FLAG_KEEPALIVE,
-                              0x01020304u, 102, NULL, 0, key) == 0,
-          "reset plus keepalive rejected");
 }
 
 static void test_ipv6_validation(void)
@@ -538,6 +735,7 @@ static void test_config(void)
         "tun_mtu = 1400\n"
         "remote_address = 198.51.100.9\n"
         "remote_port = 9999\n"
+        "client_id = alice\n"
         "secret = 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
         "keepalive = 15\n"
         "session_timeout = 90\n"
@@ -570,6 +768,7 @@ static void test_config(void)
     check(config.session_timeout == 90, "session timeout parsed");
     check(config.stats_interval == 30, "stats interval parsed");
     check(config.log_level == LOG_DEBUG, "log level parsed");
+    check(strcmp(config.client_id, "alice") == 0, "client_id parsed");
     check(config_validate(&config) == 0, "valid config validates");
 
     check(write_temp_file(bad_port_config, path, sizeof(path)) == 0,
@@ -584,12 +783,102 @@ static void test_config(void)
     check(config_validate(&config) != 0, "invalid IPv6 address rejected");
 }
 
+static void test_config_credentials(void)
+{
+    static const char server_config[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client = bob: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
+    static const char duplicate_config[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client = alice: cccccccccccccccccccccccccccccccc\n";
+    static const char malformed_config[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice\n";
+    static const char bad_id_config[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = al ice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+    static const char no_clients_config[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n";
+    static const char client_without_id[] =
+        "mode = client\n"
+        "tun_address = fd00::2/64\n"
+        "remote_address = 198.51.100.9\n"
+        "secret = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+    static const char client_without_secret[] =
+        "mode = client\n"
+        "tun_address = fd00::2/64\n"
+        "remote_address = 198.51.100.9\n"
+        "client_id = alice\n";
+    const pipesix_client_cred_t *cred;
+    pipesix_config_t config;
+    char path[64];
+
+    check(write_temp_file(server_config, path, sizeof(path)) == 0,
+          "write server credentials fixture");
+    check(config_load(path, &config) == 0, "load server credentials");
+    unlink(path);
+
+    check(config.client_count == 2, "client entries parsed");
+    check(strcmp(config.clients[0].id, "alice") == 0, "first client id");
+    check(strcmp(config.clients[1].id, "bob") == 0, "second client id");
+    check(config_validate(&config) == 0, "server credentials validate");
+
+    cred = config_find_client(&config, "bob");
+    check(cred != NULL, "credential lookup by id");
+    check(cred != NULL && strcmp(cred->secret, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") == 0,
+          "credential lookup returns the right secret");
+    check(config_find_client(&config, "carol") == NULL,
+          "unknown client id is not found");
+
+    check(write_temp_file(duplicate_config, path, sizeof(path)) == 0,
+          "write duplicate credential fixture");
+    check(config_load(path, &config) != 0, "duplicate client id rejected");
+    unlink(path);
+
+    check(write_temp_file(malformed_config, path, sizeof(path)) == 0,
+          "write malformed credential fixture");
+    check(config_load(path, &config) != 0, "credential without a secret rejected");
+    unlink(path);
+
+    check(write_temp_file(bad_id_config, path, sizeof(path)) == 0,
+          "write bad client id fixture");
+    check(config_load(path, &config) != 0, "client id with spaces rejected");
+    unlink(path);
+
+    check(write_temp_file(no_clients_config, path, sizeof(path)) == 0,
+          "write server without clients fixture");
+    check(config_load(path, &config) == 0, "server config without clients loads");
+    unlink(path);
+    check(config_validate(&config) != 0, "server without clients rejected");
+
+    check(write_temp_file(client_without_id, path, sizeof(path)) == 0,
+          "write client without id fixture");
+    check(config_load(path, &config) == 0, "client config without id loads");
+    unlink(path);
+    check(config_validate(&config) != 0, "client without client_id rejected");
+
+    check(write_temp_file(client_without_secret, path, sizeof(path)) == 0,
+          "write client without secret fixture");
+    check(config_load(path, &config) == 0, "client config without secret loads");
+    unlink(path);
+    check(config_validate(&config) != 0, "client without secret rejected");
+}
+
 static void test_config_reload(void)
 {
     static const char initial[] =
         "mode = client\n"
         "tun_address = fd00::5/64\n"
         "remote_address = 198.51.100.9\n"
+        "client_id = alice\n"
+        "secret = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
         "keepalive = 5\n"
         "peer_timeout = 30\n"
         "stats_interval = 60\n"
@@ -598,6 +887,8 @@ static void test_config_reload(void)
         "mode = client\n"
         "tun_address = fd00::9/48\n"
         "remote_address = 198.51.100.77\n"
+        "client_id = alice\n"
+        "secret = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
         "keepalive = 99\n"
         "peer_timeout = 45\n"
         "stats_interval = 10\n"
@@ -619,6 +910,8 @@ static void test_config_reload(void)
     check(strcmp(config.tun_address, "fd00::5") == 0,
           "reload keeps tun settings");
     check(config.tun_prefixlen == 64, "reload keeps prefix length");
+    check(strcmp(config.client_id, "alice") == 0,
+          "reload keeps the client identity");
 }
 
 static void test_allow_client(void)
@@ -626,15 +919,18 @@ static void test_allow_client(void)
     static const char allowed_config[] =
         "mode = server\n"
         "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
         "allow_client = 198.51.100.9, 2001:db8::3\n";
     static const char multi_config[] =
         "mode = server\n"
         "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
         "allow_client = 192.0.2.1, 192.0.2.2, 192.0.2.3, 192.0.2.4, "
         "192.0.2.5, 192.0.2.6, 192.0.2.7, 2001:db8::9\n";
     static const char bad_config[] =
         "mode = server\n"
         "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
         "allow_client = not-an-address\n";
     pipesix_config_t config;
     char path[64];
@@ -673,16 +969,19 @@ int main(void)
 
     test_sha256();
     test_hmac();
+    test_hkdf();
     test_chacha20_block();
     test_chacha20_encrypt();
     test_aead_vector();
     test_key_derivation();
     test_frames();
-    test_session_reset();
+    test_handshake_payloads();
+    test_session_isolation();
     test_ipv6_validation();
     test_replay();
     test_replay_wrap();
     test_config();
+    test_config_credentials();
     test_config_reload();
     test_allow_client();
 

@@ -1,21 +1,21 @@
 /*
- * proto.h - pipesix Wire Protocol (version 4)
+ * proto.h - pipesix Wire Protocol (version 5)
  *
- * Each UDP datagram carries a fixed 24-byte header. When a shared
- * secret is configured the header is authenticated as additional data
- * and the payload is encrypted with ChaCha20-Poly1305, followed by a
- * 16-byte tag.
+ * Each UDP datagram carries a fixed 24-byte header. Data frames are
+ * encrypted and authenticated with ChaCha20-Poly1305 under a key that
+ * is unique to the client and to the session, so nonces and replay
+ * windows can never be shared between peers.
  *
  * Frame Format (all multi-byte fields are big-endian):
  *
  *   +-------+-------+-------+-------+
  *   |          magic (4)             | 0x50495849 = "PIXI"
  *   +-------+-------+-------+-------+
- *   |  version (4)   |   flags (2)   | version = 4
+ *   |  version (5)   |   flags (2)   | version = 5
  *   +-------+-------+-------+-------+
  *   |  length (2)    |  reserved (2) | payload length in bytes
  *   +-------+-------+-------+-------+
- *   |           salt (4)             | random per-session nonce salt
+ *   |           salt (4)             | nonce salt for this direction
  *   +-------+-------+-------+-------+
  *   |                               |
  *   +        sequence (8)           | per-session anti-replay counter
@@ -27,24 +27,42 @@
  *   +-------------------------------+
  *
  * Flags:
- *   PIPESIX_FLAG_AUTH       - payload is encrypted and the tag verifies
- *   PIPESIX_FLAG_KEEPALIVE  - keepalive, payload length must be 0
- *   PIPESIX_FLAG_RESET      - resets the peer's replay window, payload
- *                             length must be 0 (sent on session start)
+ *   PIPESIX_FLAG_AUTH              - payload is encrypted and the tag verifies
+ *   PIPESIX_FLAG_KEEPALIVE         - keepalive, payload length must be 0
+ *   PIPESIX_FLAG_HANDSHAKE_INIT    - client handshake request
+ *   PIPESIX_FLAG_HANDSHAKE_RESP    - server handshake response
+ *   PIPESIX_FLAG_HANDSHAKE_NEEDED  - server asks the client to handshake,
+ *                                    payload length must be 0
  *
- * A RESET frame tells the receiver to start a new session: the replay
- * window is cleared, so sequence numbers from a restarted peer are
- * accepted again. Keepalive and reset are mutually exclusive.
+ * Handshake
+ * ---------
+ * Sessions are established by a pre-shared-key handshake. Every client
+ * is configured with a unique client id and PSK; the server stores one
+ * entry per client. The exchange is:
  *
- * The nonce is the 4-byte salt followed by the 8-byte sequence number.
- * The salt is freshly randomised whenever a session starts, so a key
- * never sees a repeated nonce even across restarts. The 64-bit
- * sequence number doubles as the anti-replay counter, which means it
- * cannot wrap in any realistic deployment; the window arithmetic is
- * nevertheless wrap-safe.
+ *   1. Client -> Server  INIT:   id_len, id, cnonce, MAC(psk, ...)
+ *   2. Server -> Client  RESP:   cnonce, snonce, MAC(psk, ...)
  *
- * Replay protection uses a 64-packet sliding window keyed on the
- * sequence number. Sequence numbers start at a random value.
+ * Both MACs are HMAC-SHA256 with the client's PSK and a fixed label, so
+ * only a party holding that PSK can complete the exchange. The client
+ * id travels in the clear (it is an identity, not a secret) and is
+ * authenticated by the INIT MAC.
+ *
+ * Both sides then derive two independent session keys:
+ *
+ *   client-to-server = HKDF-SHA256(psk, salt = cnonce || snonce,
+ *                                  info = "pipesix-v5-client-to-server")
+ *   server-to-client = HKDF-SHA256(psk, salt = cnonce || snonce,
+ *                                  info = "pipesix-v5-server-to-client")
+ *
+ * Because each direction has its own key and each handshake has fresh
+ * random nonces, two clients can never share a keystream, even if they
+ * were accidentally configured with the same PSK, and a restarted
+ * session can never repeat a nonce.
+ *
+ * Data-frame nonces are the 4-byte salt followed by the 8-byte
+ * sequence number. Handshake frames are sent in the clear because they
+ * bootstrap the keys; their integrity comes from the embedded MAC.
  */
 
 #ifndef PIPESIX_PROTO_H
@@ -58,21 +76,36 @@
 /* Magic number: "PIXI" in ASCII */
 #define PIPESIX_MAGIC               0x50495849UL
 
-/* Protocol version. Version 4 adds AEAD encryption and 64-bit sequence. */
-#define PIPESIX_VERSION             4
+/* Protocol version. Version 5 adds the per-client handshake. */
+#define PIPESIX_VERSION             5
 
 /* Frame flags */
-#define PIPESIX_FLAG_AUTH           0x0001u
-#define PIPESIX_FLAG_KEEPALIVE      0x0002u
-#define PIPESIX_FLAG_RESET          0x0004u
+#define PIPESIX_FLAG_AUTH            0x0001u
+#define PIPESIX_FLAG_KEEPALIVE       0x0002u
+#define PIPESIX_FLAG_HANDSHAKE_INIT  0x0004u
+#define PIPESIX_FLAG_HANDSHAKE_RESP  0x0008u
+#define PIPESIX_FLAG_HANDSHAKE_NEEDED 0x0010u
 #define PIPESIX_FLAG_KNOWN          (PIPESIX_FLAG_AUTH | PIPESIX_FLAG_KEEPALIVE | \
-                                     PIPESIX_FLAG_RESET)
+                                     PIPESIX_FLAG_HANDSHAKE_INIT | \
+                                     PIPESIX_FLAG_HANDSHAKE_RESP | \
+                                     PIPESIX_FLAG_HANDSHAKE_NEEDED)
 
 /* Fixed header size on the wire */
 #define PIPESIX_HEADER_SIZE         24
 
 /* Size of the optional ChaCha20-Poly1305 authentication tag */
 #define PIPESIX_AUTH_TAG_SIZE       PIPESIX_AEAD_TAG_LEN
+
+/* Handshake sizes */
+#define PIPESIX_HANDSHAKE_NONCE_LEN 32
+#define PIPESIX_HANDSHAKE_MAC_LEN   PIPESIX_SHA256_LEN
+#define PIPESIX_CLIENT_ID_MAX       31
+
+#define PIPESIX_HANDSHAKE_INIT_MAX  (1u + PIPESIX_CLIENT_ID_MAX + \
+                                     PIPESIX_HANDSHAKE_NONCE_LEN + \
+                                     PIPESIX_HANDSHAKE_MAC_LEN)
+#define PIPESIX_HANDSHAKE_RESP_MAX  (2u * PIPESIX_HANDSHAKE_NONCE_LEN + \
+                                     PIPESIX_HANDSHAKE_MAC_LEN)
 
 /* Packet size limits */
 #define PIPESIX_MAX_MTU             1500
@@ -120,13 +153,13 @@ typedef struct {
  * Parameters:
  *   buf         - Output buffer
  *   bufsize     - Size of the output buffer
- *   flags       - PIPESIX_FLAG_KEEPALIVE, PIPESIX_FLAG_RESET, or 0
+ *   flags       - A control flag (keepalive, handshake) or 0
  *                 (AUTH is added automatically when key is not NULL)
- *   salt        - Nonce salt for this session
+ *   salt        - Nonce salt for this direction
  *   seq         - Sequence number for this frame
- *   payload     - IPv6 packet, or NULL for a keepalive
- *   payload_len - Payload length (must be 0 for keepalive)
- *   key         - 32-byte encryption key, or NULL to disable encryption
+ *   payload     - Payload, or NULL for an empty one
+ *   payload_len - Payload length
+ *   key         - 32-byte session key, or NULL for handshake frames
  *
  * Returns:
  *   Total frame length on success, 0 on invalid parameters or a
@@ -136,6 +169,17 @@ size_t pipesix_frame_build(uint8_t *buf, size_t bufsize, uint16_t flags,
                            uint32_t salt, uint64_t seq,
                            const uint8_t *payload, size_t payload_len,
                            const uint8_t *key);
+
+/*
+ * Read and validate just the frame header.
+ *
+ * This lets a receiver decide which session key to use, or whether the
+ * datagram is a handshake message, before decrypting anything.
+ *
+ * Returns:
+ *   PIPESIX_OK on success, or a negative PIPESIX_ERR_* code.
+ */
+int pipesix_frame_peek(const uint8_t *buf, size_t len, uint16_t *flags);
 
 /*
  * Validate and decode a received datagram.
@@ -149,13 +193,74 @@ size_t pipesix_frame_build(uint8_t *buf, size_t bufsize, uint16_t flags,
  *   buf  - Received datagram (modified in place when decrypting)
  *   len  - Datagram length
  *   out  - Decoded frame (must not be NULL)
- *   key  - 32-byte encryption key, or NULL for plaintext mode
+ *   key  - 32-byte session key, or NULL for handshake frames
  *
  * Returns:
  *   PIPESIX_OK on success, or a negative PIPESIX_ERR_* code.
  */
 int pipesix_frame_parse(uint8_t *buf, size_t len, pipesix_frame_t *out,
                         const uint8_t *key);
+
+/*
+ * Build a handshake INIT payload.
+ *
+ * Returns the payload length, or 0 on invalid parameters. The caller
+ * wraps the payload in a frame with PIPESIX_FLAG_HANDSHAKE_INIT and no
+ * key.
+ */
+size_t pipesix_handshake_init_build(uint8_t *buf, size_t bufsize,
+                                    const char *client_id,
+                                    const uint8_t cnonce[PIPESIX_HANDSHAKE_NONCE_LEN],
+                                    const uint8_t psk[PIPESIX_KEY_LEN]);
+
+/*
+ * Structurally decode an INIT payload without verifying its MAC.
+ *
+ * The server needs the client id in the clear to select the right PSK;
+ * the MAC is checked separately with pipesix_handshake_init_verify().
+ */
+int pipesix_handshake_init_peek(const uint8_t *payload, size_t len,
+                                char *client_id, size_t id_size,
+                                uint8_t cnonce[PIPESIX_HANDSHAKE_NONCE_LEN]);
+
+/*
+ * Verify an INIT payload against a client PSK.
+ *
+ * Returns PIPESIX_OK when the MAC matches, PIPESIX_ERR_AUTH otherwise.
+ */
+int pipesix_handshake_init_verify(const uint8_t *payload, size_t len,
+                                  const uint8_t psk[PIPESIX_KEY_LEN]);
+
+/*
+ * Build a handshake RESPONSE payload.
+ *
+ * Returns the payload length, or 0 on invalid parameters.
+ */
+size_t pipesix_handshake_resp_build(uint8_t *buf, size_t bufsize,
+                                    const uint8_t cnonce[PIPESIX_HANDSHAKE_NONCE_LEN],
+                                    const uint8_t snonce[PIPESIX_HANDSHAKE_NONCE_LEN],
+                                    const uint8_t psk[PIPESIX_KEY_LEN]);
+
+/*
+ * Verify a RESPONSE payload and return the echoed client nonce.
+ *
+ * The caller must compare the returned nonce with the one it sent, so
+ * a replayed response from an earlier handshake cannot be adopted.
+ *
+ * Returns PIPESIX_OK when the MAC matches, PIPESIX_ERR_AUTH otherwise.
+ */
+int pipesix_handshake_resp_verify(const uint8_t *payload, size_t len,
+                                  const uint8_t psk[PIPESIX_KEY_LEN],
+                                  uint8_t cnonce[PIPESIX_HANDSHAKE_NONCE_LEN]);
+
+/*
+ * Derive the two directional session keys from the handshake nonces.
+ */
+void pipesix_session_keys(const uint8_t psk[PIPESIX_KEY_LEN],
+                          const uint8_t cnonce[PIPESIX_HANDSHAKE_NONCE_LEN],
+                          const uint8_t snonce[PIPESIX_HANDSHAKE_NONCE_LEN],
+                          uint8_t client_to_server[PIPESIX_KEY_LEN],
+                          uint8_t server_to_client[PIPESIX_KEY_LEN]);
 
 /*
  * Reset a replay window (call when a new session starts).

@@ -60,13 +60,21 @@ remote_port    = 8899
 # ---------------------------------------------------------------------------
 # Security
 # ---------------------------------------------------------------------------
-# secret:  Shared secret used to encrypt and authenticate every frame with
-#          ChaCha20-Poly1305. Both ends must use the same value.
-#          Generate one with: pipesix --genkey
-#          A 64-character hex string is used as a raw key; any other value
-#          is hashed with SHA-256. When unset, frames are sent in plaintext.
+# Every client has its own pre-shared key and completes a handshake that
+# derives fresh per-session keys, so no key is shared between peers.
+# Generate keys with: pipesix --genkey
 #
-#secret = <output of "pipesix --genkey">
+# Client mode: this host's identity and key.
+#
+client_id = client1
+secret    = replace-this-with-pipesix-genkey-output
+#
+# Server mode: one 'client' line per admitted peer (up to 64). The id
+# must match the client's client_id, and the secret is that client's
+# pre-shared key. Do not share one secret between clients.
+#
+#client = client1: <output of "pipesix --genkey">
+#client = client2: <output of "pipesix --genkey">
 
 # ---------------------------------------------------------------------------
 # Reliability

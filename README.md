@@ -10,6 +10,9 @@ Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] �
 
 ## Features
 
+- Per-client pre-shared keys with a handshake that derives separate
+  client-to-server and server-to-client session keys (HKDF-SHA256), so
+  nonces, replay windows and sequence counters are isolated per peer
 - ChaCha20-Poly1305 authenticated encryption of every frame (RFC 8439), with
   an anti-replay window
 - Multiple concurrent clients per server, each with its own session and
@@ -23,10 +26,9 @@ Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] �
 - SIGHUP reload of log level and timing settings without dropping the tunnel
 - Periodic statistics and on-demand dumps via SIGUSR1
 
-Frames are encrypted and authenticated when `secret` is set on both sides.
-Without a secret the tunnel carries plaintext and should only be used on a
-network you already trust. The wire protocol is version 4, which is not
-compatible with 1.x peers.
+The wire protocol is version 5. It is not compatible with 1.x or 2.0 peers,
+and there is no plaintext mode: a client cannot join without a valid
+credential.
 
 ## Prerequisites
 
@@ -134,14 +136,50 @@ allow-list changes require a restart.
 
 ## Security
 
-- Generate a shared secret with `pipesix --genkey` and put the same value in
-  the `secret` key on both the server and every client.
-- A server without a `secret` logs a warning: frames are plaintext and any
-  host that can reach the UDP port can inject traffic.
-- The server accepts up to 64 concurrent clients, each tracked by endpoint
-  and protected by its own replay window. Sessions idle for longer than
-  `session_timeout` are dropped, and the least recently used session is
-  evicted when the table is full.
+Every client has its own pre-shared key. No key is shared between peers, so
+compromising one client does not expose another client's traffic.
+
+1. Generate a key per client: `pipesix --genkey`
+2. On the server, add one line per client:
+
+   ```
+   client = alice: <alice's key>
+   client = bob:   <bob's key>
+   ```
+
+3. On each client, set its identity and key:
+
+   ```
+   client_id = alice
+   secret    = <alice's key>
+   ```
+
+On first contact the client sends its id and a random nonce, authenticated
+with its key. The server looks the id up, verifies the MAC, and replies with
+its own nonce and a MAC. Both sides then derive two independent session keys:
+
+```
+client-to-server = HKDF-SHA256(psk, salt = cnonce || snonce,
+                               info = "pipesix-v5-client-to-server")
+server-to-client = HKDF-SHA256(psk, salt = cnonce || snonce,
+                               info = "pipesix-v5-server-to-client")
+```
+
+Because the keys are per session and per direction, two clients can never
+reuse a keystream even if they were mistakenly given the same key, and a
+restarted session never repeats a nonce. Handshake frames are the only
+plaintext frames; they carry an HMAC and exist purely to bootstrap the keys.
+
+Server side notes:
+
+- A server refuses to start without at least one `client` entry.
+- Up to 64 clients are tracked at once, each with its own keys and replay
+  window. Sessions idle for longer than `session_timeout` are dropped, and
+  the least recently used session is evicted when the table is full.
+- Unknown client ids and bad handshake MACs are logged and counted as
+  authentication failures.
+- Handshake-required hints are rate limited, so the server cannot be used as
+  a UDP amplifier.
 
 ## Testing
 

@@ -6,17 +6,25 @@
  *   Applications -> TUN -> forward loop -> UDP -> server
  *   Applications <- TUN <- reverse loop <- UDP <- server
  *
+ * Before any traffic flows the client completes a pre-shared-key
+ * handshake with the server (see proto.h). Each handshake derives two
+ * fresh session keys, one per direction, so this client's nonces and
+ * replay state are isolated from every other peer even when several
+ * clients share a server.
+ *
  * Both loops use poll() with a short timeout so shutdown requests are
- * handled promptly. Frames are authenticated with HMAC-SHA256 when a
- * shared secret is configured, protected against replay by a sliding
- * sequence window, and a keepalive is sent when the tunnel is idle so
- * NAT mappings stay open and the server can echo liveness back.
+ * handled promptly. Frames are encrypted with ChaCha20-Poly1305,
+ * protected against replay by a sliding sequence window, and a
+ * keepalive is sent when the tunnel is idle so NAT mappings stay open
+ * and the server can echo liveness back.
  *
  * The main thread watches for dead peers: when no valid frame has been
  * received for peer_timeout seconds it joins the workers, re-resolves
- * the server address, reconnects with exponential backoff, sends a
- * session reset and restarts the workers. SIGHUP reloads the
- * runtime-tunable configuration without dropping the tunnel.
+ * the server address, reconnects, re-handshakes with exponential
+ * backoff and restarts the workers. A handshake request from the
+ * server triggers the same renegotiation without reconnecting. SIGHUP
+ * reloads the runtime-tunable configuration without dropping the
+ * tunnel.
  */
 
 #include "client.h"
@@ -44,18 +52,21 @@
 
 #define POLL_INTERVAL_MS     500
 #define RECONNECT_MAX_DELAY  30u
+#define HANDSHAKE_TIMEOUT_MS 5000
 
 typedef struct {
     pipesix_config_t  *config;
     tun_device_t      *tun;
     int                udp_fd;
-    uint8_t            key[PIPESIX_KEY_LEN];
-    int                auth_enabled;
+    uint8_t            psk[PIPESIX_KEY_LEN];
+    uint8_t            tx_key[PIPESIX_KEY_LEN];
+    uint8_t            rx_key[PIPESIX_KEY_LEN];
     _Atomic uint64_t   seq;
     _Atomic uint32_t   salt;
     _Atomic time_t     last_rx;
     _Atomic int        keepalive;
     _Atomic int        stop_workers;
+    _Atomic int        handshake_needed;
     pipesix_replay_t   replay;
     pipesix_stats_t    stats;
 } client_context_t;
@@ -63,6 +74,23 @@ typedef struct {
 static uint64_t next_seq(client_context_t *ctx)
 {
     return atomic_fetch_add_explicit(&ctx->seq, 1, memory_order_relaxed);
+}
+
+/*
+ * Sleep for whole seconds, waking up early when a shutdown is
+ * requested.
+ */
+static void sleep_seconds(unsigned int seconds)
+{
+    unsigned int i;
+
+    for (i = 0; i < seconds && !runtime_should_stop(); i++) {
+        struct timespec delay;
+
+        delay.tv_sec = 1;
+        delay.tv_nsec = 0;
+        nanosleep(&delay, NULL);
+    }
 }
 
 /*
@@ -80,7 +108,7 @@ static int send_frame(client_context_t *ctx, uint16_t flags,
                                     atomic_load_explicit(&ctx->salt,
                                                          memory_order_relaxed),
                                     next_seq(ctx), payload, payload_len,
-                                    ctx->auth_enabled ? ctx->key : NULL);
+                                    ctx->tx_key);
     if (frame_len == 0) {
         errno = EINVAL;
         return -1;
@@ -93,6 +121,10 @@ static int send_frame(client_context_t *ctx, uint16_t flags,
     return 0;
 }
 
+/*
+ * Start a new session: fresh salt, fresh sequence seed and an empty
+ * replay window.
+ */
 static void reset_session(client_context_t *ctx)
 {
     uint64_t seed = 0;
@@ -111,11 +143,148 @@ static void reset_session(client_context_t *ctx)
     pipesix_replay_reset(&ctx->replay);
 }
 
-static void send_session_reset(client_context_t *ctx)
+/*
+ * Run one handshake attempt.
+ *
+ * Returns 0 once session keys are installed, -1 if the attempt timed
+ * out, was rejected, or the server went away.
+ */
+static int handshake_once(client_context_t *ctx, int timeout_ms)
 {
-    if (send_frame(ctx, PIPESIX_FLAG_RESET, NULL, 0) != 0) {
-        log_debug("Failed to send session reset: %s", strerror(errno));
+    uint8_t init_body[PIPESIX_HANDSHAKE_INIT_MAX];
+    uint8_t frame[PIPESIX_MAX_FRAME];
+    uint8_t buf[PIPESIX_RECV_BUF_SIZE];
+    uint8_t cnonce[PIPESIX_HANDSHAKE_NONCE_LEN];
+    uint8_t echoed_cnonce[PIPESIX_HANDSHAKE_NONCE_LEN];
+    uint8_t snonce[PIPESIX_HANDSHAKE_NONCE_LEN];
+    size_t body_len;
+    size_t frame_len;
+    time_t deadline;
+    struct pollfd pfd;
+
+    if (pipesix_random_bytes(cnonce, sizeof(cnonce)) != 0) {
+        log_error("Cannot generate a handshake nonce: %s", strerror(errno));
+        return -1;
     }
+
+    body_len = pipesix_handshake_init_build(init_body, sizeof(init_body),
+                                            ctx->config->client_id, cnonce,
+                                            ctx->psk);
+    if (body_len == 0) {
+        log_error("Cannot build the handshake request (check 'client_id')");
+        return -1;
+    }
+
+    frame_len = pipesix_frame_build(frame, sizeof(frame),
+                                    PIPESIX_FLAG_HANDSHAKE_INIT, 0, 0,
+                                    init_body, body_len, NULL);
+    if (frame_len == 0) {
+        log_error("Cannot build the handshake frame");
+        return -1;
+    }
+
+    if (send(ctx->udp_fd, frame, frame_len, 0) != (ssize_t)frame_len) {
+        log_warn("Failed to send the handshake request: %s", strerror(errno));
+        return -1;
+    }
+
+    pfd.fd = ctx->udp_fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    deadline = time(NULL) + (time_t)((timeout_ms + 999) / 1000);
+
+    while (!runtime_should_stop() && time(NULL) <= deadline) {
+        pipesix_frame_t parsed;
+        uint16_t flags;
+        ssize_t nread;
+        int ready;
+
+        ready = poll(&pfd, 1, POLL_INTERVAL_MS);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            log_warn("poll() during handshake failed: %s", strerror(errno));
+            return -1;
+        }
+        if (ready == 0) {
+            continue;
+        }
+
+        nread = recv(ctx->udp_fd, buf, sizeof(buf), 0);
+        if (nread < 0) {
+            if (errno == EINTR) continue;
+            log_warn("Handshake receive failed: %s", strerror(errno));
+            return -1;
+        }
+
+        if (pipesix_frame_peek(buf, (size_t)nread, &flags) != PIPESIX_OK) {
+            continue;
+        }
+        if ((flags & PIPESIX_FLAG_HANDSHAKE_RESP) == 0) {
+            continue; /* Stale data frame from an earlier session. */
+        }
+
+        if (pipesix_frame_parse(buf, (size_t)nread, &parsed, NULL) !=
+            PIPESIX_OK) {
+            continue;
+        }
+
+        if (pipesix_handshake_resp_verify(parsed.payload, parsed.payload_len,
+                                          ctx->psk, echoed_cnonce) !=
+            PIPESIX_OK) {
+            log_warn("Handshake response from the server failed verification");
+            stats_add_auth_failure(&ctx->stats);
+            return -1;
+        }
+
+        if (memcmp(echoed_cnonce, cnonce, sizeof(cnonce)) != 0) {
+            continue; /* Response to a different attempt. */
+        }
+
+        memcpy(snonce, parsed.payload + PIPESIX_HANDSHAKE_NONCE_LEN,
+               sizeof(snonce));
+
+        pipesix_session_keys(ctx->psk, cnonce, snonce,
+                             ctx->tx_key, ctx->rx_key);
+
+        log_info("Handshake completed as client '%s'",
+                 ctx->config->client_id);
+        return 0;
+    }
+
+    return -1;
+}
+
+/*
+ * Handshake until it succeeds or a shutdown is requested.
+ *
+ * Returns 0 on success, -1 if shutdown interrupted the attempts.
+ */
+static int handshake(client_context_t *ctx)
+{
+    unsigned int delay = 1u;
+
+    while (!runtime_should_stop()) {
+        if (handshake_once(ctx, HANDSHAKE_TIMEOUT_MS) == 0) {
+            return 0;
+        }
+        if (runtime_should_stop()) {
+            break;
+        }
+
+        log_warn("Handshake with the server failed; retrying in %u seconds",
+                 delay);
+        sleep_seconds(delay);
+
+        if (delay < RECONNECT_MAX_DELAY) {
+            delay *= 2u;
+            if (delay > RECONNECT_MAX_DELAY) {
+                delay = RECONNECT_MAX_DELAY;
+            }
+        }
+    }
+
+    return -1;
 }
 
 /*
@@ -209,6 +378,7 @@ static void *reverse_loop(void *arg)
     while (!runtime_should_stop() && !atomic_load(&ctx->stop_workers)) {
         int ready = poll(&pfd, 1, POLL_INTERVAL_MS);
         pipesix_frame_t frame;
+        uint16_t flags;
         int rc;
         ssize_t nread;
 
@@ -232,8 +402,24 @@ static void *reverse_loop(void *arg)
             break;
         }
 
+        if (pipesix_frame_peek(frame_buf, (size_t)nread, &flags) != PIPESIX_OK) {
+            stats_add_invalid(&ctx->stats);
+            continue;
+        }
+
+        if ((flags & PIPESIX_FLAG_HANDSHAKE_NEEDED) != 0) {
+            log_info("Server requested a new handshake");
+            atomic_store(&ctx->handshake_needed, 1);
+            continue;
+        }
+
+        if ((flags & (PIPESIX_FLAG_HANDSHAKE_INIT |
+                      PIPESIX_FLAG_HANDSHAKE_RESP)) != 0) {
+            continue;
+        }
+
         rc = pipesix_frame_parse(frame_buf, (size_t)nread, &frame,
-                                 ctx->auth_enabled ? ctx->key : NULL);
+                                 ctx->rx_key);
         if (rc != PIPESIX_OK) {
             log_warn("Dropping invalid frame (%zd bytes): %s",
                      nread, pipesix_strerror(rc));
@@ -244,27 +430,14 @@ static void *reverse_loop(void *arg)
             continue;
         }
 
-        /*
-         * A reset starts a new session: clear the replay window before
-         * recording the reset frame's own sequence number.
-         */
-        if ((frame.flags & PIPESIX_FLAG_RESET) != 0) {
-            pipesix_replay_reset(&ctx->replay);
-            log_info("Server reset the tunnel session");
-        }
-
         if (!pipesix_replay_accept(&ctx->replay, frame.seq)) {
-            log_warn("Dropping replayed/out-of-window frame (seq=%u)",
-                     (unsigned)frame.seq);
+            log_warn("Dropping replayed/out-of-window frame (seq=%llu)",
+                     (unsigned long long)frame.seq);
             stats_add_replayed(&ctx->stats);
             continue;
         }
 
         atomic_store(&ctx->last_rx, time(NULL));
-
-        if ((frame.flags & PIPESIX_FLAG_RESET) != 0) {
-            continue;
-        }
 
         if ((frame.flags & PIPESIX_FLAG_KEEPALIVE) != 0) {
             log_debug("Keepalive received from server");
@@ -376,18 +549,7 @@ static int reconnect_peer(client_context_t *ctx)
         }
 
         log_warn("Reconnect failed; retrying in %u seconds", delay);
-
-        {
-            unsigned int i;
-
-            for (i = 0; i < delay && !runtime_should_stop(); i++) {
-                struct timespec ts;
-
-                ts.tv_sec = 1;
-                ts.tv_nsec = 0;
-                nanosleep(&ts, NULL);
-            }
-        }
+        sleep_seconds(delay);
 
         if (delay < RECONNECT_MAX_DELAY) {
             delay *= 2u;
@@ -422,6 +584,35 @@ static int start_workers(client_context_t *ctx, pthread_t *forward,
     return 0;
 }
 
+/*
+ * Stop both worker threads and wait for them.
+ */
+static void stop_workers(client_context_t *ctx, pthread_t *forward,
+                         pthread_t *reverse)
+{
+    atomic_store(&ctx->stop_workers, 1);
+    pthread_join(*forward, NULL);
+    pthread_join(*reverse, NULL);
+    atomic_store(&ctx->stop_workers, 0);
+}
+
+/*
+ * Renegotiate the session on the existing socket.
+ *
+ * Returns 0 on success, -1 on shutdown or failure to restart workers.
+ */
+static int renegotiate(client_context_t *ctx)
+{
+    if (handshake(ctx) != 0) {
+        return -1;
+    }
+
+    reset_session(ctx);
+    atomic_store(&ctx->last_rx, time(NULL));
+
+    return 0;
+}
+
 int client_start(pipesix_config_t *config)
 {
     tun_device_t tun;
@@ -444,13 +635,10 @@ int client_start(pipesix_config_t *config)
     ctx.tun = &tun;
     ctx.udp_fd = -1;
 
-    if (config->secret[0] != '\0') {
-        if (pipesix_key_from_string(config->secret, ctx.key) != 0) {
-            log_error("Failed to derive authentication key from 'secret'");
-            tun_close(&tun);
-            return -1;
-        }
-        ctx.auth_enabled = 1;
+    if (pipesix_key_from_string(config->secret, ctx.psk) != 0) {
+        log_error("Failed to derive the pre-shared key from 'secret'");
+        tun_close(&tun);
+        return -1;
     }
 
     atomic_init(&ctx.seq, 0);
@@ -458,6 +646,7 @@ int client_start(pipesix_config_t *config)
     atomic_init(&ctx.last_rx, time(NULL));
     atomic_init(&ctx.keepalive, config->keepalive);
     atomic_init(&ctx.stop_workers, 0);
+    atomic_init(&ctx.handshake_needed, 0);
     pipesix_replay_reset(&ctx.replay);
     stats_init(&ctx.stats);
 
@@ -468,7 +657,13 @@ int client_start(pipesix_config_t *config)
     }
 
     reset_session(&ctx);
-    send_session_reset(&ctx);
+
+    if (handshake(&ctx) != 0) {
+        log_info("Shutdown requested before the handshake completed");
+        close(ctx.udp_fd);
+        tun_close(&tun);
+        return 0;
+    }
 
     if (start_workers(&ctx, &forward_thread, &reverse_thread) != 0) {
         close(ctx.udp_fd);
@@ -477,9 +672,10 @@ int client_start(pipesix_config_t *config)
     }
     workers_running = 1;
 
-    log_info("Client tunnel ready (crypto=%s, keepalive=%ds, peer_timeout=%ds)",
-             ctx.auth_enabled ? "chacha20-poly1305" : "plaintext",
-             atomic_load(&ctx.keepalive), config->peer_timeout);
+    log_info("Client tunnel ready (crypto=chacha20-poly1305, client_id=%s, "
+             "keepalive=%ds, peer_timeout=%ds)",
+             config->client_id, atomic_load(&ctx.keepalive),
+             config->peer_timeout);
     log_info("Client is running. Send SIGINT/SIGTERM to stop, "
              "SIGUSR1 for stats, SIGHUP to reload.");
 
@@ -519,6 +715,28 @@ int client_start(pipesix_config_t *config)
                 last_report = now;
             }
 
+            if (atomic_exchange_explicit(&ctx.handshake_needed, 0,
+                                         memory_order_relaxed) != 0) {
+                log_info("Renegotiating the session with the server");
+
+                stop_workers(&ctx, &forward_thread, &reverse_thread);
+                workers_running = 0;
+
+                if (renegotiate(&ctx) != 0) {
+                    break;
+                }
+
+                if (start_workers(&ctx, &forward_thread,
+                                  &reverse_thread) != 0) {
+                    close(ctx.udp_fd);
+                    tun_close(&tun);
+                    return -1;
+                }
+                workers_running = 1;
+                last_report = now;
+                continue;
+            }
+
             keepalive = atomic_load(&ctx.keepalive);
             if (config->peer_timeout > 0 && keepalive > 0 &&
                 (now - atomic_load(&ctx.last_rx)) >=
@@ -526,9 +744,7 @@ int client_start(pipesix_config_t *config)
                 log_warn("No traffic from the server for %d seconds; "
                          "reconnecting", config->peer_timeout);
 
-                atomic_store(&ctx.stop_workers, 1);
-                pthread_join(forward_thread, NULL);
-                pthread_join(reverse_thread, NULL);
+                stop_workers(&ctx, &forward_thread, &reverse_thread);
                 workers_running = 0;
 
                 close(ctx.udp_fd);
@@ -538,10 +754,9 @@ int client_start(pipesix_config_t *config)
                     break;
                 }
 
-                reset_session(&ctx);
-                send_session_reset(&ctx);
-                atomic_store(&ctx.last_rx, time(NULL));
-                atomic_store(&ctx.stop_workers, 0);
+                if (renegotiate(&ctx) != 0) {
+                    break;
+                }
 
                 if (start_workers(&ctx, &forward_thread,
                                   &reverse_thread) != 0) {
@@ -559,14 +774,18 @@ int client_start(pipesix_config_t *config)
 
     log_info("Initiating graceful shutdown...");
 
-    atomic_store(&ctx.stop_workers, 1);
     if (workers_running) {
+        atomic_store(&ctx.stop_workers, 1);
         pthread_join(forward_thread, NULL);
         log_info("Forward thread joined");
 
         pthread_join(reverse_thread, NULL);
         log_info("Reverse thread joined");
     }
+
+    memset(ctx.psk, 0, sizeof(ctx.psk));
+    memset(ctx.tx_key, 0, sizeof(ctx.tx_key));
+    memset(ctx.rx_key, 0, sizeof(ctx.rx_key));
 
     if (ctx.udp_fd >= 0) {
         close(ctx.udp_fd);

@@ -219,6 +219,61 @@ void pipesix_hmac_sha256(const uint8_t *key, size_t keylen,
     pipesix_sha256_final(&ctx, out);
 }
 
+void pipesix_hkdf_sha256(const uint8_t *ikm, size_t ikm_len,
+                         const uint8_t *salt, size_t salt_len,
+                         const void *info, size_t info_len,
+                         uint8_t *out, size_t out_len)
+{
+    static const uint8_t empty_salt[PIPESIX_SHA256_LEN];
+    uint8_t prk[PIPESIX_SHA256_LEN];
+    uint8_t block[PIPESIX_SHA256_LEN];
+    uint8_t buffer[PIPESIX_SHA256_LEN + 256u + 1u];
+    const uint8_t *info_bytes = (const uint8_t *)info;
+    size_t produced = 0;
+    size_t block_len = 0;
+    size_t take;
+    uint8_t counter = 1;
+
+    if (out == NULL || out_len == 0) return;
+    if (ikm == NULL && ikm_len > 0) return;
+    if (info_bytes == NULL && info_len > 0) return;
+    if (info_len > 256u) return;
+    if (out_len > 255u * PIPESIX_SHA256_LEN) return;
+
+    if (salt == NULL || salt_len == 0) {
+        salt = empty_salt;
+        salt_len = sizeof(empty_salt);
+    }
+
+    /* HKDF-Extract */
+    pipesix_hmac_sha256(salt, salt_len, ikm, ikm_len, prk);
+
+    /* HKDF-Expand */
+    while (produced < out_len) {
+        memcpy(buffer, block, block_len);
+        if (info_len > 0) {
+            memcpy(buffer + block_len, info_bytes, info_len);
+        }
+        buffer[block_len + info_len] = counter;
+
+        pipesix_hmac_sha256(prk, sizeof(prk), buffer,
+                            block_len + info_len + 1u, block);
+        block_len = sizeof(block);
+
+        take = out_len - produced;
+        if (take > sizeof(block)) {
+            take = sizeof(block);
+        }
+        memcpy(out + produced, block, take);
+        produced += take;
+        counter++;
+    }
+
+    memset(prk, 0, sizeof(prk));
+    memset(block, 0, sizeof(block));
+    memset(buffer, 0, sizeof(buffer));
+}
+
 /*
  * ---------------------------------------------------------------------
  * ChaCha20-Poly1305 (RFC 8439)

@@ -6,24 +6,23 @@
  *   Client -> UDP -> receiver loop -> TUN -> upstream gateway
  *   Client <- UDP <- sender loop   <- TUN <- upstream gateway
  *
- * Multiple clients are supported concurrently. Each session is keyed
- * by its UDP endpoint and owns its own replay window, so one client's
- * restarts and NAT rebinds never disturb another's. Sessions are
- * created on the first valid frame and expire after 'session_timeout'
- * seconds without traffic; when the table is full the least recently
- * used session is evicted.
+ * Every client completes a pre-shared-key handshake before it can send
+ * traffic. The server holds one credential per client id, and a
+ * successful handshake derives two fresh session keys (one per
+ * direction) that exist only for that client and that session. Nonces,
+ * replay windows and sequence counters therefore never mix between
+ * peers, even if several clients are behind the same NAT.
+ *
+ * Multiple clients are supported concurrently. Sessions are keyed by
+ * UDP endpoint, expire after 'session_timeout' seconds without traffic,
+ * and the least recently used session is evicted when the table is
+ * full.
  *
  * Return traffic is routed by learning which session a client's inner
  * IPv6 source addresses arrive from. The sender looks the packet's
- * destination address up in that table, which lets several clients
- * share one tunnel without any per-client configuration. When exactly
- * one client is connected the lookup falls back to that session, so
- * traffic to an address that has not been learned yet still flows.
- *
- * With a 'secret' configured, every frame is encrypted and
- * authenticated with ChaCha20-Poly1305; a session is only ever
- * established from a frame whose tag verified. Keepalives are echoed
- * so clients get a liveness signal for dead-peer detection.
+ * destination address up in that table. When exactly one client is
+ * connected the lookup falls back to that session, so traffic to an
+ * address that has not been learned yet still flows.
  *
  * An optional allow-list ('allow_client') restricts which source
  * addresses may reach the tunnel at all.
@@ -52,14 +51,21 @@
 #include <time.h>
 #include <unistd.h>
 
-#define POLL_INTERVAL_MS   500
-#define SERVER_MAX_CLIENTS 64
-#define SERVER_MAX_ROUTES  512
+#define POLL_INTERVAL_MS        500
+#define SERVER_MAX_CLIENTS      64
+#define SERVER_MAX_ROUTES       512
+#define SERVER_MAX_HINTS_PER_SEC 10
 
 typedef struct {
     int                     active;
+    int                     established;
+    char                    client_id[CONFIG_MAX_CLIENT_ID];
     struct sockaddr_storage addr;
     socklen_t               addr_len;
+    uint8_t                 rx_key[PIPESIX_KEY_LEN];
+    uint8_t                 tx_key[PIPESIX_KEY_LEN];
+    uint8_t                 cnonce[PIPESIX_HANDSHAKE_NONCE_LEN];
+    uint8_t                 snonce[PIPESIX_HANDSHAKE_NONCE_LEN];
     pipesix_replay_t        replay;
     time_t                  last_seen;
     uint64_t                frames;
@@ -81,13 +87,13 @@ typedef struct {
     tun_device_t      *tun;
     int                udp_fd;
     int                sock_family;
-    uint8_t            key[PIPESIX_KEY_LEN];
-    int                auth_enabled;
     _Atomic uint64_t   seq;
     uint32_t           salt;
     _Atomic int        session_timeout;
     server_session_t   sessions[SERVER_MAX_CLIENTS];
     server_route_t     routes[SERVER_MAX_ROUTES];
+    time_t             hint_window;
+    int                hint_count;
     pthread_mutex_t    lock;
     pipesix_stats_t    stats;
 } server_context_t;
@@ -174,31 +180,6 @@ static int peer_allowed(const server_context_t *ctx,
 }
 
 /*
- * Send a control frame (RESET or KEEPALIVE) to a peer.
- */
-static void send_control(server_context_t *ctx,
-                         const struct sockaddr_storage *peer,
-                         socklen_t peer_len, uint16_t flags)
-{
-    uint8_t frame[PIPESIX_MAX_FRAME];
-    size_t frame_len;
-
-    frame_len = pipesix_frame_build(frame, sizeof(frame), flags, ctx->salt,
-                                    next_seq(ctx), NULL, 0,
-                                    ctx->auth_enabled ? ctx->key : NULL);
-    if (frame_len == 0) {
-        log_debug("Failed to build control frame");
-        return;
-    }
-
-    if (sendto(ctx->udp_fd, frame, frame_len, 0,
-               (const struct sockaddr *)peer, peer_len) !=
-        (ssize_t)frame_len) {
-        log_debug("Failed to send control frame: %s", strerror(errno));
-    }
-}
-
-/*
  * ---------------------------------------------------------------------
  * Session and route tables (all helpers require ctx->lock)
  * ---------------------------------------------------------------------
@@ -253,10 +234,9 @@ static int session_alloc(server_context_t *ctx,
     }
 
     if (slot < 0) {
-        time_t oldest = 0;
+        time_t oldest = ctx->sessions[0].last_seen;
 
         slot = 0;
-        oldest = ctx->sessions[0].last_seen;
         for (i = 1; i < SERVER_MAX_CLIENTS; i++) {
             if (ctx->sessions[i].last_seen < oldest) {
                 oldest = ctx->sessions[i].last_seen;
@@ -302,7 +282,7 @@ static int sole_session(const server_context_t *ctx)
     int found = -1;
 
     for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
-        if (ctx->sessions[i].active) {
+        if (ctx->sessions[i].active && ctx->sessions[i].established) {
             if (found >= 0) {
                 return -1;
             }
@@ -372,7 +352,8 @@ static int route_lookup(server_context_t *ctx, const uint8_t addr[16])
 
         if (ctx->routes[i].session >= 0 &&
             ctx->routes[i].session < SERVER_MAX_CLIENTS &&
-            ctx->sessions[ctx->routes[i].session].active) {
+            ctx->sessions[ctx->routes[i].session].active &&
+            ctx->sessions[ctx->routes[i].session].established) {
             return ctx->routes[i].session;
         }
 
@@ -382,6 +363,263 @@ static int route_lookup(server_context_t *ctx, const uint8_t addr[16])
     }
 
     return -1;
+}
+
+/*
+ * ---------------------------------------------------------------------
+ * Control frames
+ * ---------------------------------------------------------------------
+ */
+
+/*
+ * Ask a peer to run the handshake, rate limited so a flood of spoofed
+ * datagrams cannot turn the server into an amplifier.
+ */
+static void send_need_handshake(server_context_t *ctx,
+                                const struct sockaddr_storage *peer,
+                                socklen_t peer_len)
+{
+    uint8_t frame[PIPESIX_MAX_FRAME];
+    size_t frame_len;
+    time_t now = time(NULL);
+    int allowed = 0;
+
+    pthread_mutex_lock(&ctx->lock);
+    if (ctx->hint_window != now) {
+        ctx->hint_window = now;
+        ctx->hint_count = 0;
+    }
+    if (ctx->hint_count < SERVER_MAX_HINTS_PER_SEC) {
+        ctx->hint_count++;
+        allowed = 1;
+    }
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (!allowed) {
+        return;
+    }
+
+    frame_len = pipesix_frame_build(frame, sizeof(frame),
+                                    PIPESIX_FLAG_HANDSHAKE_NEEDED, 0, 0,
+                                    NULL, 0, NULL);
+    if (frame_len == 0) {
+        return;
+    }
+
+    if (sendto(ctx->udp_fd, frame, frame_len, 0,
+               (const struct sockaddr *)peer, peer_len) !=
+        (ssize_t)frame_len) {
+        log_debug("Failed to send handshake request: %s", strerror(errno));
+    }
+}
+
+/*
+ * Echo a keepalive back to the client that sent one.
+ */
+static void send_keepalive(server_context_t *ctx,
+                           const struct sockaddr_storage *peer,
+                           socklen_t peer_len)
+{
+    uint8_t frame[PIPESIX_MAX_FRAME];
+    uint8_t key[PIPESIX_KEY_LEN];
+    size_t frame_len;
+    int slot;
+
+    pthread_mutex_lock(&ctx->lock);
+    slot = session_find(ctx, peer);
+    if (slot >= 0 && ctx->sessions[slot].established) {
+        memcpy(key, ctx->sessions[slot].tx_key, sizeof(key));
+    } else {
+        slot = -1;
+    }
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (slot < 0) {
+        return;
+    }
+
+    frame_len = pipesix_frame_build(frame, sizeof(frame),
+                                    PIPESIX_FLAG_KEEPALIVE, ctx->salt,
+                                    next_seq(ctx), NULL, 0, key);
+    memset(key, 0, sizeof(key));
+
+    if (frame_len == 0) {
+        return;
+    }
+
+    if (sendto(ctx->udp_fd, frame, frame_len, 0,
+               (const struct sockaddr *)peer, peer_len) !=
+        (ssize_t)frame_len) {
+        log_debug("Failed to send keepalive: %s", strerror(errno));
+    }
+}
+
+/*
+ * ---------------------------------------------------------------------
+ * Handshake
+ * ---------------------------------------------------------------------
+ */
+
+static void handle_handshake_init(server_context_t *ctx,
+                                  const struct sockaddr_storage *peer,
+                                  socklen_t peer_len,
+                                  const uint8_t *payload, size_t payload_len)
+{
+    char id[CONFIG_MAX_CLIENT_ID];
+    char peer_str[NI_MAXHOST + NI_MAXSERV + 8];
+    const pipesix_client_cred_t *cred;
+    uint8_t psk[PIPESIX_KEY_LEN];
+    uint8_t cnonce[PIPESIX_HANDSHAKE_NONCE_LEN];
+    uint8_t snonce[PIPESIX_HANDSHAKE_NONCE_LEN];
+    uint8_t c2s[PIPESIX_KEY_LEN];
+    uint8_t s2c[PIPESIX_KEY_LEN];
+    uint8_t resp[PIPESIX_HANDSHAKE_RESP_MAX];
+    uint8_t frame[PIPESIX_MAX_FRAME];
+    size_t resp_len;
+    size_t frame_len;
+    int slot;
+    int retransmit = 0;
+    int id_changed = 0;
+    int evicted = 0;
+    int session_count;
+
+    if (pipesix_handshake_init_peek(payload, payload_len, id, sizeof(id),
+                                    cnonce) != PIPESIX_OK) {
+        stats_add_invalid(&ctx->stats);
+        return;
+    }
+
+    cred = config_find_client(ctx->config, id);
+    if (cred == NULL) {
+        format_peer((const struct sockaddr *)peer, peer_len,
+                    peer_str, sizeof(peer_str));
+        log_warn("Handshake from %s for unknown client '%s'",
+                 peer_str, id);
+        stats_add_auth_failure(&ctx->stats);
+        return;
+    }
+
+    if (pipesix_key_from_string(cred->secret, psk) != 0) {
+        log_error("Cannot derive a key for client '%s'", id);
+        return;
+    }
+
+    if (pipesix_handshake_init_verify(payload, payload_len, psk) !=
+        PIPESIX_OK) {
+        format_peer((const struct sockaddr *)peer, peer_len,
+                    peer_str, sizeof(peer_str));
+        log_warn("Handshake from %s failed authentication for client '%s'",
+                 peer_str, id);
+        stats_add_auth_failure(&ctx->stats);
+        memset(psk, 0, sizeof(psk));
+        return;
+    }
+
+    pthread_mutex_lock(&ctx->lock);
+
+    slot = session_find(ctx, peer);
+    if (slot < 0) {
+        slot = session_alloc(ctx, peer, peer_len, &evicted);
+    }
+
+    if (ctx->sessions[slot].established &&
+        strcmp(ctx->sessions[slot].client_id, id) == 0 &&
+        memcmp(ctx->sessions[slot].cnonce, cnonce, sizeof(cnonce)) == 0) {
+        /*
+         * The client retransmitted its request because the response was
+         * lost. Repeat the same response so both ends stay on one key
+         * set instead of half-committing to a new one.
+         */
+        memcpy(snonce, ctx->sessions[slot].snonce, sizeof(snonce));
+        retransmit = 1;
+    } else {
+        if (ctx->sessions[slot].established &&
+            strcmp(ctx->sessions[slot].client_id, id) != 0) {
+            id_changed = 1;
+        }
+
+        if (pipesix_random_bytes(snonce, sizeof(snonce)) != 0) {
+            /* Never leave a half-established session usable. */
+            ctx->sessions[slot].active = 0;
+            routes_clear_slot(ctx, slot);
+            pthread_mutex_unlock(&ctx->lock);
+            memset(psk, 0, sizeof(psk));
+            log_error("Cannot generate a handshake nonce: %s",
+                      strerror(errno));
+            return;
+        }
+
+        pipesix_session_keys(psk, cnonce, snonce, c2s, s2c);
+
+        if (id_changed) {
+            /* A different identity now owns this endpoint. */
+            routes_clear_slot(ctx, slot);
+        }
+
+        memcpy(ctx->sessions[slot].rx_key, c2s, sizeof(c2s));
+        memcpy(ctx->sessions[slot].tx_key, s2c, sizeof(s2c));
+        memcpy(ctx->sessions[slot].cnonce, cnonce, sizeof(cnonce));
+        memcpy(ctx->sessions[slot].snonce, snonce, sizeof(snonce));
+        memset(ctx->sessions[slot].client_id, 0,
+               sizeof(ctx->sessions[slot].client_id));
+        snprintf(ctx->sessions[slot].client_id,
+                 sizeof(ctx->sessions[slot].client_id), "%s", id);
+        ctx->sessions[slot].established = 1;
+        ctx->sessions[slot].addr = *peer;
+        ctx->sessions[slot].addr_len = peer_len;
+        ctx->sessions[slot].frames = 0;
+        pipesix_replay_reset(&ctx->sessions[slot].replay);
+    }
+
+    ctx->sessions[slot].last_seen = time(NULL);
+    session_count = count_active(ctx);
+
+    pthread_mutex_unlock(&ctx->lock);
+
+    memset(c2s, 0, sizeof(c2s));
+    memset(s2c, 0, sizeof(s2c));
+
+    /* The PSK is still needed to sign the response. */
+    resp_len = pipesix_handshake_resp_build(resp, sizeof(resp),
+                                            cnonce, snonce, psk);
+    memset(psk, 0, sizeof(psk));
+
+    if (resp_len == 0) {
+        log_error("Cannot build the handshake response");
+        return;
+    }
+
+    frame_len = pipesix_frame_build(frame, sizeof(frame),
+                                    PIPESIX_FLAG_HANDSHAKE_RESP, 0, 0,
+                                    resp, resp_len, NULL);
+    if (frame_len == 0) {
+        log_error("Cannot build the handshake response frame");
+        return;
+    }
+
+    if (sendto(ctx->udp_fd, frame, frame_len, 0,
+               (const struct sockaddr *)peer, peer_len) !=
+        (ssize_t)frame_len) {
+        log_warn("Failed to send the handshake response: %s",
+                 strerror(errno));
+        return;
+    }
+
+    if (retransmit) {
+        log_debug("Resent handshake response to client '%s'", id);
+        return;
+    }
+
+    format_peer((const struct sockaddr *)peer, peer_len,
+                peer_str, sizeof(peer_str));
+
+    if (evicted) {
+        log_warn("Session table full; evicted the least recently used "
+                 "client to admit '%s'", id);
+    }
+
+    log_info("Client '%s' handshake from %s (crypto=chacha20-poly1305, "
+             "%d active)", id, peer_str, session_count);
 }
 
 /*
@@ -411,6 +649,9 @@ static void sessions_expire(server_context_t *ctx, time_t now)
         }
 
         session->active = 0;
+        session->established = 0;
+        memset(session->rx_key, 0, sizeof(session->rx_key));
+        memset(session->tx_key, 0, sizeof(session->tx_key));
         routes_clear_slot(ctx, i);
         expired[count++] = i;
     }
@@ -423,9 +664,10 @@ static void sessions_expire(server_context_t *ctx, time_t now)
 
         format_peer((const struct sockaddr *)&session->addr, session->addr_len,
                     peer_str, sizeof(peer_str));
-        log_info("Client session %s expired after %d seconds of inactivity "
-                 "(%llu frames)", peer_str, timeout,
-                 (unsigned long long)session->frames);
+        log_info("Client '%s' session %s expired after %d seconds of "
+                 "inactivity (%llu frames)",
+                 session->client_id[0] != '\0' ? session->client_id : "?",
+                 peer_str, timeout, (unsigned long long)session->frames);
     }
 }
 
@@ -448,14 +690,11 @@ static void *receiver_loop(void *arg)
         struct sockaddr_storage peer;
         socklen_t peer_len = sizeof(peer);
         pipesix_frame_t frame;
+        uint16_t flags;
         ssize_t nread;
         int ready;
         int rc;
         int slot;
-        int new_session = 0;
-        int evicted = 0;
-        int reset_requested;
-        int session_count;
         time_t now;
         char peer_str[NI_MAXHOST + NI_MAXSERV + 8];
 
@@ -483,16 +722,53 @@ static void *receiver_loop(void *arg)
         }
 
         if (!peer_allowed(ctx, (struct sockaddr *)&peer, peer_len)) {
+            log_debug("Dropping datagram from a non-allowed peer");
+            stats_add_dropped(&ctx->stats);
+            continue;
+        }
+
+        rc = pipesix_frame_peek(frame_buf, (size_t)nread, &flags);
+        if (rc != PIPESIX_OK) {
             format_peer((struct sockaddr *)&peer, peer_len,
                         peer_str, sizeof(peer_str));
-            log_debug("Dropping datagram from non-allowed peer %s", peer_str);
+            log_warn("Dropping malformed datagram (%zd bytes) from %s: %s",
+                     nread, peer_str, pipesix_strerror(rc));
+            stats_add_invalid(&ctx->stats);
+            continue;
+        }
+
+        if ((flags & PIPESIX_FLAG_HANDSHAKE_INIT) != 0) {
+            pipesix_frame_t init;
+
+            if (pipesix_frame_parse(frame_buf, (size_t)nread, &init, NULL) ==
+                PIPESIX_OK) {
+                handle_handshake_init(ctx, &peer, peer_len,
+                                      init.payload, init.payload_len);
+            } else {
+                stats_add_invalid(&ctx->stats);
+            }
+            continue;
+        }
+
+        if ((flags & (PIPESIX_FLAG_HANDSHAKE_RESP |
+                      PIPESIX_FLAG_HANDSHAKE_NEEDED)) != 0) {
+            continue;
+        }
+
+        pthread_mutex_lock(&ctx->lock);
+
+        slot = session_find(ctx, &peer);
+        if (slot < 0 || !ctx->sessions[slot].established) {
+            pthread_mutex_unlock(&ctx->lock);
+            send_need_handshake(ctx, &peer, peer_len);
             stats_add_dropped(&ctx->stats);
             continue;
         }
 
         rc = pipesix_frame_parse(frame_buf, (size_t)nread, &frame,
-                                 ctx->auth_enabled ? ctx->key : NULL);
+                                 ctx->sessions[slot].rx_key);
         if (rc != PIPESIX_OK) {
+            pthread_mutex_unlock(&ctx->lock);
             format_peer((struct sockaddr *)&peer, peer_len,
                         peer_str, sizeof(peer_str));
             log_warn("Dropping invalid datagram (%zd bytes) from %s: %s",
@@ -504,33 +780,15 @@ static void *receiver_loop(void *arg)
             continue;
         }
 
-        reset_requested = (frame.flags & PIPESIX_FLAG_RESET) != 0;
-        now = time(NULL);
-
-        pthread_mutex_lock(&ctx->lock);
-
-        slot = session_find(ctx, &peer);
-        if (slot < 0) {
-            slot = session_alloc(ctx, &peer, peer_len, &evicted);
-            new_session = 1;
-        } else if (reset_requested) {
-            /*
-             * Start the client's replay window from scratch so a
-             * restarted client's fresh sequence numbers are accepted.
-             */
-            pipesix_replay_reset(&ctx->sessions[slot].replay);
-        }
-
         if (!pipesix_replay_accept(&ctx->sessions[slot].replay, frame.seq)) {
             pthread_mutex_unlock(&ctx->lock);
-            format_peer((struct sockaddr *)&peer, peer_len,
-                        peer_str, sizeof(peer_str));
-            log_warn("Rejected replayed/out-of-window frame (seq=%llu) from %s",
-                     (unsigned long long)frame.seq, peer_str);
+            log_warn("Rejected replayed/out-of-window frame (seq=%llu)",
+                     (unsigned long long)frame.seq);
             stats_add_replayed(&ctx->stats);
             continue;
         }
 
+        now = time(NULL);
         ctx->sessions[slot].last_seen = now;
         ctx->sessions[slot].frames++;
 
@@ -543,38 +801,11 @@ static void *receiver_loop(void *arg)
             }
         }
 
-        session_count = count_active(ctx);
-
         pthread_mutex_unlock(&ctx->lock);
-
-        if (new_session) {
-            format_peer((struct sockaddr *)&peer, peer_len,
-                        peer_str, sizeof(peer_str));
-
-            if (evicted) {
-                log_warn("Session table full; evicted the least recently "
-                         "used client to admit %s", peer_str);
-            }
-
-            if (reset_requested) {
-                log_info("Client session reset from %s", peer_str);
-            } else {
-                log_info("Client connected from %s (crypto=%s, %d active)",
-                         peer_str,
-                         ctx->auth_enabled ? "chacha20-poly1305" : "plaintext",
-                         session_count);
-            }
-
-            send_control(ctx, &peer, peer_len, PIPESIX_FLAG_RESET);
-        }
-
-        if (reset_requested) {
-            continue;
-        }
 
         if ((frame.flags & PIPESIX_FLAG_KEEPALIVE) != 0) {
             log_debug("Keepalive received from client");
-            send_control(ctx, &peer, peer_len, PIPESIX_FLAG_KEEPALIVE);
+            send_keepalive(ctx, &peer, peer_len);
             continue;
         }
 
@@ -627,6 +858,7 @@ static void *sender_loop(void *arg)
         struct sockaddr_storage dest;
         socklen_t dest_len = 0;
         const pipesix_ipv6_header_t *header;
+        uint8_t key[PIPESIX_KEY_LEN];
         ssize_t nread;
         int ready;
         int slot;
@@ -663,6 +895,7 @@ static void *sender_loop(void *arg)
         }
 
         memset(&dest, 0, sizeof(dest));
+        memset(key, 0, sizeof(key));
 
         pthread_mutex_lock(&ctx->lock);
 
@@ -675,6 +908,7 @@ static void *sender_loop(void *arg)
         if (slot >= 0) {
             dest = ctx->sessions[slot].addr;
             dest_len = ctx->sessions[slot].addr_len;
+            memcpy(key, ctx->sessions[slot].tx_key, sizeof(key));
         }
 
         pthread_mutex_unlock(&ctx->lock);
@@ -686,8 +920,9 @@ static void *sender_loop(void *arg)
 
         seq = next_seq(ctx);
         frame_len = pipesix_frame_build(frame, sizeof(frame), 0, ctx->salt,
-                                        seq, packet, (size_t)nread,
-                                        ctx->auth_enabled ? ctx->key : NULL);
+                                        seq, packet, (size_t)nread, key);
+        memset(key, 0, sizeof(key));
+
         if (frame_len == 0) {
             log_warn("Failed to build frame for %zd-byte packet", nread);
             stats_add_dropped(&ctx->stats);
@@ -801,16 +1036,6 @@ int server_start(pipesix_config_t *config)
         return -1;
     }
 
-    if (config->secret[0] != '\0') {
-        if (pipesix_key_from_string(config->secret, ctx.key) != 0) {
-            log_error("Failed to derive encryption key from 'secret'");
-            close(ctx.udp_fd);
-            tun_close(&tun);
-            return -1;
-        }
-        ctx.auth_enabled = 1;
-    }
-
     if (pipesix_random_bytes(&seed, sizeof(seed)) != 0) {
         seed = ((uint64_t)time(NULL) << 32) | (uint64_t)(uint32_t)getpid();
     }
@@ -851,11 +1076,10 @@ int server_start(pipesix_config_t *config)
         return -1;
     }
 
-    log_info("Server tunnel ready (crypto=%s, max_clients=%d, "
-             "session_timeout=%ds, allow_client=%d)",
-             ctx.auth_enabled ? "chacha20-poly1305" : "plaintext",
-             SERVER_MAX_CLIENTS, config->session_timeout,
-             config->allow_client_count);
+    log_info("Server tunnel ready (crypto=chacha20-poly1305, clients=%d, "
+             "max_clients=%d, session_timeout=%ds, allow_client=%d)",
+             config->client_count, SERVER_MAX_CLIENTS,
+             config->session_timeout, config->allow_client_count);
     log_info("Server is running. Send SIGINT/SIGTERM to stop, "
              "SIGUSR1 for stats, SIGHUP to reload.");
 
@@ -907,6 +1131,15 @@ int server_start(pipesix_config_t *config)
 
     pthread_join(sender_thread, NULL);
     log_info("Sender thread joined");
+
+    {
+        int i;
+
+        for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+            memset(ctx.sessions[i].rx_key, 0, sizeof(ctx.sessions[i].rx_key));
+            memset(ctx.sessions[i].tx_key, 0, sizeof(ctx.sessions[i].tx_key));
+        }
+    }
 
     pthread_mutex_destroy(&ctx.lock);
     close(ctx.udp_fd);

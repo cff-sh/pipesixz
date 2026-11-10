@@ -85,6 +85,28 @@ int pipesix_constant_time_eq(const uint8_t *a, const uint8_t *b, size_t len);
 int pipesix_key_from_string(const char *secret, uint8_t out[PIPESIX_KEY_LEN]);
 
 /*
+ * HKDF-SHA256 (RFC 5869).
+ *
+ * Extracts a pseudo-random key from ikm and expands it with the given
+ * info string into out_len bytes. A NULL or empty salt is treated as
+ * HashLen zero bytes, as the RFC specifies.
+ *
+ * Parameters:
+ *   ikm      - Input keying material
+ *   ikm_len  - IKM length
+ *   salt     - Optional salt (may be NULL when salt_len is 0)
+ *   salt_len - Salt length
+ *   info     - Context/domain-separation string (may be binary)
+ *   info_len - Info length
+ *   out      - Output buffer
+ *   out_len  - Number of bytes to produce (at most 255 * 32)
+ */
+void pipesix_hkdf_sha256(const uint8_t *ikm, size_t ikm_len,
+                         const uint8_t *salt, size_t salt_len,
+                         const void *info, size_t info_len,
+                         uint8_t *out, size_t out_len);
+
+/*
  * XOR a buffer with the ChaCha20 keystream (RFC 8439, section 2.4).
  *
  * The transformation is its own inverse, so the same call encrypts
