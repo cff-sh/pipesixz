@@ -10,6 +10,7 @@
 #include "logger.h"
 
 #include <arpa/inet.h>
+#include <string.h>
 
 /*
  * Extract the IPv6 version from the first 32-bit word.
@@ -64,6 +65,38 @@ int ipv6_validate_packet(const uint8_t *data, size_t length)
     }
 
     return 0;
+}
+
+int ipv6_prefix_match(const uint8_t prefix[16], int prefix_len,
+                      const uint8_t addr[16])
+{
+    int whole_bytes;
+    int remainder;
+    uint8_t mask;
+
+    if (prefix == NULL || addr == NULL) {
+        return 0;
+    }
+    if (prefix_len < 0 || prefix_len > 128) {
+        return 0;
+    }
+
+    whole_bytes = prefix_len / 8;
+    remainder = prefix_len % 8;
+
+    if (whole_bytes > 0 &&
+        memcmp(prefix, addr, (size_t)whole_bytes) != 0) {
+        return 0;
+    }
+
+    if (remainder == 0) {
+        return 1;
+    }
+
+    /* whole_bytes <= 15 whenever remainder > 0, so this index is safe. */
+    mask = (uint8_t)(0xFFu << (8 - remainder));
+
+    return (prefix[whole_bytes] & mask) == (addr[whole_bytes] & mask);
 }
 
 void ipv6_log_packet(const uint8_t *data, size_t length, const char *prefix)

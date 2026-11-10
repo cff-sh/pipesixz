@@ -75,6 +75,15 @@ secret    = replace-this-with-pipesix-genkey-output
 #
 #client = client1: <output of "pipesix --genkey">
 #client = client2: <output of "pipesix --genkey">
+#
+# client_route: the inner IPv6 prefix each client owns, used to route
+# return traffic. Matching is longest-prefix-first, a bare address means
+# /128, and the line must follow its 'client' line. Two clients may not
+# share a prefix. Without a route a client only receives return traffic
+# while it is the only one connected.
+#
+#client_route = client1 2001:db8:1::2/128
+#client_route = client2 2001:db8:1:2::/64
 
 # ---------------------------------------------------------------------------
 # Reliability
@@ -97,7 +106,7 @@ stats_interval  = 60
 # log_level: Controls verbosity. Options: debug, info, warn, error, fatal
 #
 # SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout and
-# stats_interval. Interface, endpoint, secret, mode and allow_client
-# changes take effect after a restart.
+# stats_interval. Interface, endpoint, credentials, routes, mode and
+# allow_client changes take effect after a restart.
 #
 log_level = info

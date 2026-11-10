@@ -106,6 +106,24 @@ int ipv6_parse_header(const uint8_t *data, size_t length,
 int ipv6_validate_packet(const uint8_t *data, size_t length);
 
 /*
+ * Test whether an address falls inside a prefix.
+ *
+ * Compares whole bytes first, then the remaining bits of the final
+ * partial byte, so any prefix length from 0 to 128 works.
+ *
+ * Parameters:
+ *   prefix     - 16-byte network prefix in network byte order
+ *   prefix_len - Prefix length in bits (0-128)
+ *   addr       - 16-byte address to test
+ *
+ * Returns:
+ *   1 when the address matches, 0 when it does not or the arguments
+ *   are invalid.
+ */
+int ipv6_prefix_match(const uint8_t prefix[16], int prefix_len,
+                      const uint8_t addr[16]);
+
+/*
  * Log a summary of the IPv6 packet.
  *
  * Extracts and logs source/destination addresses, payload length,

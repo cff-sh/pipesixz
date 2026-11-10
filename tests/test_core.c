@@ -14,6 +14,7 @@
 #include "logger.h"
 #include "proto.h"
 
+#include <arpa/inet.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,6 +73,18 @@ static int hex_decode(const char *hex, uint8_t *out, size_t out_size)
     }
 
     return (int)(len / 2u);
+}
+
+static int parse_ipv6(const char *text, uint8_t out[16])
+{
+    struct in6_addr addr;
+
+    if (inet_pton(AF_INET6, text, &addr) != 1) {
+        return -1;
+    }
+
+    memcpy(out, &addr, 16);
+    return 0;
 }
 
 static void test_sha256(void)
@@ -618,6 +631,49 @@ static void test_session_isolation(void)
     }
 }
 
+static void test_ipv6_prefix_match(void)
+{
+    uint8_t prefix[16];
+    uint8_t addr[16];
+
+    check(parse_ipv6("fd00:dead:beef::", prefix) == 0, "parse /64 prefix");
+    check(parse_ipv6("fd00:dead:beef::2", addr) == 0, "parse address in /64");
+    check(ipv6_prefix_match(prefix, 64, addr) == 1,
+          "/64 matches an address inside it");
+
+    check(parse_ipv6("fd00:dead:beee::2", addr) == 0,
+          "parse address outside /64");
+    check(ipv6_prefix_match(prefix, 64, addr) == 0,
+          "/64 rejects another range");
+
+    check(parse_ipv6("fd00:dead:beef::2", prefix) == 0, "parse host prefix");
+    check(parse_ipv6("fd00:dead:beef::2", addr) == 0, "parse host address");
+    check(ipv6_prefix_match(prefix, 128, addr) == 1,
+          "/128 matches itself");
+
+    check(parse_ipv6("fd00:dead:beef::3", addr) == 0,
+          "parse neighbouring host");
+    check(ipv6_prefix_match(prefix, 128, addr) == 0,
+          "/128 rejects another host");
+    check(ipv6_prefix_match(prefix, 127, addr) == 1,
+          "/127 covers two addresses");
+
+    check(ipv6_prefix_match(prefix, 0, addr) == 1, "/0 matches everything");
+    check(ipv6_prefix_match(prefix, 129, addr) == 0,
+          "prefix length 129 rejected");
+    check(ipv6_prefix_match(prefix, -1, addr) == 0,
+          "negative prefix length rejected");
+
+    /* Non-byte-aligned prefixes must compare the trailing bits. */
+    check(parse_ipv6("fd00::", prefix) == 0, "parse /16 prefix");
+    check(parse_ipv6("fd00:1::", addr) == 0, "parse address in /16");
+    check(ipv6_prefix_match(prefix, 16, addr) == 1,
+          "/16 matches its own range");
+    check(parse_ipv6("fd01::", addr) == 0, "parse address outside /16");
+    check(ipv6_prefix_match(prefix, 16, addr) == 0,
+          "/16 rejects another range");
+}
+
 static void test_replay(void)
 {
     pipesix_replay_t replay;
@@ -871,6 +927,129 @@ static void test_config_credentials(void)
     check(config_validate(&config) != 0, "client without secret rejected");
 }
 
+static void test_client_routes(void)
+{
+    static const char routed_config[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_route = alice fd00:dead:beef::2/128\n"
+        "client = bob: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+        "client_route = bob fd00:dead:beef:1::/64\n";
+    static const char bare_route_config[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_route = alice fd00:dead:beef::2\n";
+    static const char unknown_client_config[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_route = carol fd00::1/128\n";
+    static const char malformed_config[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_route = alice not-an-address/64\n";
+    static const char bad_len_config[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_route = alice fd00::1/129\n";
+    static const char zero_len_config[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_route = alice ::/0\n";
+    static const char duplicate_config[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_route = alice fd00::1/128\n"
+        "client_route = alice fd00::2/128\n";
+    static const char clash_config[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client = bob: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+        "client_route = alice fd00:dead:beef::2/128\n"
+        "client_route = bob fd00:dead:beef::2/128\n";
+    const pipesix_client_cred_t *cred;
+    pipesix_config_t config;
+    uint8_t addr[16];
+    char path[64];
+
+    check(write_temp_file(routed_config, path, sizeof(path)) == 0,
+          "write routed credentials fixture");
+    check(config_load(path, &config) == 0, "load routed credentials");
+    unlink(path);
+    check(config_validate(&config) == 0, "routed credentials validate");
+
+    cred = config_find_client(&config, "alice");
+    check(cred != NULL && cred->prefix_len == 128, "host route parsed");
+    check(parse_ipv6("fd00:dead:beef::2", addr) == 0,
+          "parse routed host address");
+    check(cred != NULL &&
+              ipv6_prefix_match(cred->prefix, cred->prefix_len, addr) == 1,
+          "host route matches its address");
+
+    cred = config_find_client(&config, "bob");
+    check(cred != NULL && cred->prefix_len == 64, "prefix route parsed");
+    check(parse_ipv6("fd00:dead:beef:1::9", addr) == 0,
+          "parse address inside the prefix");
+    check(cred != NULL &&
+              ipv6_prefix_match(cred->prefix, cred->prefix_len, addr) == 1,
+          "prefix route matches an address inside it");
+    check(parse_ipv6("fd00:dead:beef::2", addr) == 0,
+          "parse address outside the prefix");
+    check(cred != NULL &&
+              ipv6_prefix_match(cred->prefix, cred->prefix_len, addr) == 0,
+          "prefix route rejects a neighbouring prefix");
+
+    check(write_temp_file(bare_route_config, path, sizeof(path)) == 0,
+          "write bare route fixture");
+    check(config_load(path, &config) == 0, "load bare route");
+    unlink(path);
+    cred = config_find_client(&config, "alice");
+    check(cred != NULL && cred->prefix_len == 128,
+          "bare address defaults to /128");
+
+    check(write_temp_file(unknown_client_config, path, sizeof(path)) == 0,
+          "write route for an unknown client fixture");
+    check(config_load(path, &config) != 0,
+          "route for an unknown client rejected");
+    unlink(path);
+
+    check(write_temp_file(malformed_config, path, sizeof(path)) == 0,
+          "write malformed route fixture");
+    check(config_load(path, &config) != 0, "malformed route prefix rejected");
+    unlink(path);
+
+    check(write_temp_file(bad_len_config, path, sizeof(path)) == 0,
+          "write bad route length fixture");
+    check(config_load(path, &config) != 0, "prefix length 129 rejected");
+    unlink(path);
+
+    check(write_temp_file(zero_len_config, path, sizeof(path)) == 0,
+          "write /0 route fixture");
+    check(config_load(path, &config) != 0,
+          "default route to a single client rejected");
+    unlink(path);
+
+    check(write_temp_file(duplicate_config, path, sizeof(path)) == 0,
+          "write duplicate route fixture");
+    check(config_load(path, &config) != 0,
+          "second route for the same client rejected");
+    unlink(path);
+
+    check(write_temp_file(clash_config, path, sizeof(path)) == 0,
+          "write clashing route fixture");
+    check(config_load(path, &config) == 0, "clashing routes load");
+    unlink(path);
+    check(config_validate(&config) != 0,
+          "duplicate prefixes across clients rejected");
+}
+
 static void test_config_reload(void)
 {
     static const char initial[] =
@@ -978,10 +1157,12 @@ int main(void)
     test_handshake_payloads();
     test_session_isolation();
     test_ipv6_validation();
+    test_ipv6_prefix_match();
     test_replay();
     test_replay_wrap();
     test_config();
     test_config_credentials();
+    test_client_routes();
     test_config_reload();
     test_allow_client();
 

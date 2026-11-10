@@ -18,11 +18,13 @@
  * and the least recently used session is evicted when the table is
  * full.
  *
- * Return traffic is routed by learning which session a client's inner
- * IPv6 source addresses arrive from. The sender looks the packet's
- * destination address up in that table. When exactly one client is
- * connected the lookup falls back to that session, so traffic to an
- * address that has not been learned yet still flows.
+ * Return traffic is routed by static per-client prefixes ('client_route'
+ * in the configuration) rather than by watching where traffic came from,
+ * so the server can send to a client that has never sent anything and a
+ * client cannot inherit another client's addresses. The sender picks the
+ * longest matching prefix. When exactly one client is connected the
+ * lookup falls back to that session, so a single-client deployment needs
+ * no routes at all.
  *
  * An optional allow-list ('allow_client') restricts which source
  * addresses may reach the tunnel at all.
@@ -53,7 +55,6 @@
 
 #define POLL_INTERVAL_MS        500
 #define SERVER_MAX_CLIENTS      64
-#define SERVER_MAX_ROUTES       512
 #define SERVER_MAX_HINTS_PER_SEC 10
 
 typedef struct {
@@ -66,21 +67,13 @@ typedef struct {
     uint8_t                 tx_key[PIPESIX_KEY_LEN];
     uint8_t                 cnonce[PIPESIX_HANDSHAKE_NONCE_LEN];
     uint8_t                 snonce[PIPESIX_HANDSHAKE_NONCE_LEN];
+    /* Static route for return traffic, copied from the credential. */
+    uint8_t                 prefix[16];
+    int                     prefix_len;
     pipesix_replay_t        replay;
     time_t                  last_seen;
     uint64_t                frames;
 } server_session_t;
-
-/*
- * Learned mapping from an inner IPv6 address to the session it was
- * last seen on.
- */
-typedef struct {
-    int     active;
-    uint8_t addr[16];
-    int     session;
-    time_t  last_seen;
-} server_route_t;
 
 typedef struct {
     pipesix_config_t  *config;
@@ -91,7 +84,6 @@ typedef struct {
     uint32_t           salt;
     _Atomic int        session_timeout;
     server_session_t   sessions[SERVER_MAX_CLIENTS];
-    server_route_t     routes[SERVER_MAX_ROUTES];
     time_t             hint_window;
     int                hint_count;
     pthread_mutex_t    lock;
@@ -185,17 +177,6 @@ static int peer_allowed(const server_context_t *ctx,
  * ---------------------------------------------------------------------
  */
 
-static void routes_clear_slot(server_context_t *ctx, int slot)
-{
-    int i;
-
-    for (i = 0; i < SERVER_MAX_ROUTES; i++) {
-        if (ctx->routes[i].active && ctx->routes[i].session == slot) {
-            ctx->routes[i].active = 0;
-        }
-    }
-}
-
 static int session_find(const server_context_t *ctx,
                         const struct sockaddr_storage *peer)
 {
@@ -213,9 +194,7 @@ static int session_find(const server_context_t *ctx,
 
 /*
  * Allocate a session slot for a new peer, evicting the least recently
- * used session when the table is full. Stale routes pointing at the
- * reused slot are cleared so another client's addresses can never be
- * sent to the new one.
+ * used session when the table is full.
  */
 static int session_alloc(server_context_t *ctx,
                          const struct sockaddr_storage *peer,
@@ -245,8 +224,6 @@ static int session_alloc(server_context_t *ctx,
         }
         *evicted = 1;
     }
-
-    routes_clear_slot(ctx, slot);
 
     memset(&ctx->sessions[slot], 0, sizeof(ctx->sessions[slot]));
     ctx->sessions[slot].active = 1;
@@ -294,75 +271,40 @@ static int sole_session(const server_context_t *ctx)
 }
 
 /*
- * Remember that an inner address lives behind a session.
- */
-static void route_learn(server_context_t *ctx, int slot,
-                        const uint8_t addr[16], time_t now)
-{
-    int i;
-    int free_slot = -1;
-
-    for (i = 0; i < SERVER_MAX_ROUTES; i++) {
-        if (!ctx->routes[i].active) {
-            if (free_slot < 0) {
-                free_slot = i;
-            }
-            continue;
-        }
-
-        if (memcmp(ctx->routes[i].addr, addr, sizeof(ctx->routes[i].addr)) == 0) {
-            ctx->routes[i].session = slot;
-            ctx->routes[i].last_seen = now;
-            return;
-        }
-    }
-
-    if (free_slot < 0) {
-        time_t oldest = ctx->routes[0].last_seen;
-
-        free_slot = 0;
-        for (i = 1; i < SERVER_MAX_ROUTES; i++) {
-            if (ctx->routes[i].last_seen < oldest) {
-                oldest = ctx->routes[i].last_seen;
-                free_slot = i;
-            }
-        }
-    }
-
-    ctx->routes[free_slot].active = 1;
-    ctx->routes[free_slot].session = slot;
-    ctx->routes[free_slot].last_seen = now;
-    memcpy(ctx->routes[free_slot].addr, addr, sizeof(ctx->routes[free_slot].addr));
-}
-
-/*
- * Resolve an inner destination address to a session index, or -1.
+ * Resolve an inner destination address to a session using the static
+ * per-client routes ('client_route' in the configuration).
+ *
+ * The most specific prefix wins, so a host route can be carved out of a
+ * client's broader prefix. Prefixes are copied into the session at
+ * handshake time, so routing never walks the configuration under the
+ * lock.
+ *
+ * Returns the session index, or -1 when no configured route matches.
  */
 static int route_lookup(server_context_t *ctx, const uint8_t addr[16])
 {
+    int best = -1;
+    int best_len = -1;
     int i;
 
-    for (i = 0; i < SERVER_MAX_ROUTES; i++) {
-        if (!ctx->routes[i].active) {
+    for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+        if (!ctx->sessions[i].established ||
+            ctx->sessions[i].prefix_len <= 0) {
             continue;
         }
-        if (memcmp(ctx->routes[i].addr, addr, sizeof(ctx->routes[i].addr)) != 0) {
+        if (ctx->sessions[i].prefix_len <= best_len) {
+            continue;
+        }
+        if (!ipv6_prefix_match(ctx->sessions[i].prefix,
+                               ctx->sessions[i].prefix_len, addr)) {
             continue;
         }
 
-        if (ctx->routes[i].session >= 0 &&
-            ctx->routes[i].session < SERVER_MAX_CLIENTS &&
-            ctx->sessions[ctx->routes[i].session].active &&
-            ctx->sessions[ctx->routes[i].session].established) {
-            return ctx->routes[i].session;
-        }
-
-        /* The session went away: forget the route. */
-        ctx->routes[i].active = 0;
-        return -1;
+        best = i;
+        best_len = ctx->sessions[i].prefix_len;
     }
 
-    return -1;
+    return best;
 }
 
 /*
@@ -479,7 +421,6 @@ static void handle_handshake_init(server_context_t *ctx,
     size_t frame_len;
     int slot;
     int retransmit = 0;
-    int id_changed = 0;
     int evicted = 0;
     int session_count;
 
@@ -533,15 +474,9 @@ static void handle_handshake_init(server_context_t *ctx,
         memcpy(snonce, ctx->sessions[slot].snonce, sizeof(snonce));
         retransmit = 1;
     } else {
-        if (ctx->sessions[slot].established &&
-            strcmp(ctx->sessions[slot].client_id, id) != 0) {
-            id_changed = 1;
-        }
-
         if (pipesix_random_bytes(snonce, sizeof(snonce)) != 0) {
             /* Never leave a half-established session usable. */
             ctx->sessions[slot].active = 0;
-            routes_clear_slot(ctx, slot);
             pthread_mutex_unlock(&ctx->lock);
             memset(psk, 0, sizeof(psk));
             log_error("Cannot generate a handshake nonce: %s",
@@ -550,11 +485,6 @@ static void handle_handshake_init(server_context_t *ctx,
         }
 
         pipesix_session_keys(psk, cnonce, snonce, c2s, s2c);
-
-        if (id_changed) {
-            /* A different identity now owns this endpoint. */
-            routes_clear_slot(ctx, slot);
-        }
 
         memcpy(ctx->sessions[slot].rx_key, c2s, sizeof(c2s));
         memcpy(ctx->sessions[slot].tx_key, s2c, sizeof(s2c));
@@ -571,6 +501,9 @@ static void handle_handshake_init(server_context_t *ctx,
         pipesix_replay_reset(&ctx->sessions[slot].replay);
     }
 
+    memcpy(ctx->sessions[slot].prefix, cred->prefix,
+           sizeof(ctx->sessions[slot].prefix));
+    ctx->sessions[slot].prefix_len = cred->prefix_len;
     ctx->sessions[slot].last_seen = time(NULL);
     session_count = count_active(ctx);
 
@@ -652,7 +585,6 @@ static void sessions_expire(server_context_t *ctx, time_t now)
         session->established = 0;
         memset(session->rx_key, 0, sizeof(session->rx_key));
         memset(session->tx_key, 0, sizeof(session->tx_key));
-        routes_clear_slot(ctx, i);
         expired[count++] = i;
     }
 
@@ -845,15 +777,6 @@ static void *receiver_loop(void *arg)
         now = time(NULL);
         ctx->sessions[slot].last_seen = now;
         ctx->sessions[slot].frames++;
-
-        if (frame.payload_len > 0) {
-            const pipesix_ipv6_header_t *header;
-
-            if (ipv6_parse_header(frame.payload, frame.payload_len,
-                                  &header) == 0) {
-                route_learn(ctx, slot, header->source_addr, now);
-            }
-        }
 
         pthread_mutex_unlock(&ctx->lock);
 
@@ -1130,10 +1053,22 @@ int server_start(pipesix_config_t *config)
         return -1;
     }
 
-    log_info("Server tunnel ready (crypto=chacha20-poly1305, clients=%d, "
-             "max_clients=%d, session_timeout=%ds, allow_client=%d)",
-             config->client_count, SERVER_MAX_CLIENTS,
-             config->session_timeout, config->allow_client_count);
+    {
+        int i;
+        int routed = 0;
+
+        for (i = 0; i < config->client_count; i++) {
+            if (config->clients[i].prefix_len > 0) {
+                routed++;
+            }
+        }
+
+        log_info("Server tunnel ready (crypto=chacha20-poly1305, "
+                 "clients=%d, routed=%d, max_clients=%d, "
+                 "session_timeout=%ds, allow_client=%d)",
+                 config->client_count, routed, SERVER_MAX_CLIENTS,
+                 config->session_timeout, config->allow_client_count);
+    }
     log_info("Server is running. Send SIGINT/SIGTERM to stop, "
              "SIGUSR1 for stats, SIGHUP to reload.");
 

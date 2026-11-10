@@ -82,6 +82,7 @@ tun_address = ${TUN_ADDR}
 tun_prefixlen = 64
 tun_mtu = 1500
 client = ${CLIENT_ID}: ${SECRET}
+client_route = ${CLIENT_ID} ${CLIENT_ADDR}/128
 log_level = info
 EOF
 
@@ -98,8 +99,9 @@ EOF
     echo "  client_id = ${CLIENT_ID}"
     echo "  secret = ${SECRET}"
     echo ""
-    echo "Add another client by appending one line to /etc/pipesix/pipesix.conf:"
+    echo "Add another client by appending two lines to /etc/pipesix/pipesix.conf:"
     echo "  client = <id>: $(pipesix --genkey 2>/dev/null || echo '<pipesix --genkey>')"
+    echo "  client_route = <id> <inner ipv6 prefix, e.g. /128 host route>"
     echo ""
     echo "Run: sudo pipesix -c /etc/pipesix/pipesix.conf"
 

@@ -24,6 +24,8 @@
  *   secret           - This client's pre-shared key (client mode)
  *   client_id        - This client's identity (client mode)
  *   client           - <id>: <secret> credential (server mode, repeatable)
+ *   client_route     - <id> <ipv6[/len]> inner prefix for return traffic
+ *                      (server mode, repeatable, follows its client line)
  *   keepalive        - Client keepalive interval in seconds (0 disables)
  *   session_timeout  - Server session idle timeout in seconds (0 disables)
  *   peer_timeout     - Client dead-peer timeout in seconds (0 disables)
@@ -41,6 +43,8 @@
 #define PIPESIX_CONFIG_H
 
 #include "logger.h"
+
+#include <stdint.h>
 
 /*
  * Maximum lengths for configuration string fields.
@@ -71,11 +75,16 @@
 #define CONFIG_DEFAULT_PEER_TIMEOUT      120
 
 /*
- * Per-client credential: a stable identity plus its own pre-shared key.
+ * Per-client credential: a stable identity, its own pre-shared key, and
+ * the inner IPv6 prefix the server routes return traffic to.
+ *
+ * prefix_len is 0 when no 'client_route' was configured for the client.
  */
 typedef struct {
-    char id[CONFIG_MAX_CLIENT_ID];
-    char secret[CONFIG_MAX_SECRET];
+    char    id[CONFIG_MAX_CLIENT_ID];
+    char    secret[CONFIG_MAX_SECRET];
+    uint8_t prefix[16];
+    int     prefix_len;
 } pipesix_client_cred_t;
 
 /*

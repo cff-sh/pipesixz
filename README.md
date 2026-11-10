@@ -16,8 +16,8 @@ Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] �
 - ChaCha20-Poly1305 authenticated encryption of every frame (RFC 8439), with
   an anti-replay window
 - Multiple concurrent clients per server, each with its own session and
-  replay window; return traffic is routed by learning each client's inner
-  IPv6 addresses
+  replay window; return traffic is routed by static per-client inner prefixes
+  (`client_route`), longest match first
 - Client keepalives, echoed by the server for liveness
 - Automatic client reconnect with DNS re-resolution and backoff when the
   peer goes silent (`peer_timeout`)
@@ -165,6 +165,20 @@ compromising one client does not expose another client's traffic.
    client_id = alice
    secret    = <alice's key>
    ```
+
+4. On the server, give each client the inner prefix it owns, so return
+   traffic can be routed back to it:
+
+   ```
+   client = alice: <alice's key>
+   client_route = alice 2001:db8:1::/64
+   ```
+
+   `client_route` must follow its `client` line. A bare address means a
+   `/128` host route, and the most specific prefix wins, so a host route can
+   be carved out of a client's broader prefix. Two clients may not claim the
+   same prefix. Without a route a client only receives return traffic while
+   it is the single connected client.
 
 On first contact the client sends its id and a random nonce, authenticated
 with its key. The server looks the id up, verifies the MAC, and replies with

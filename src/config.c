@@ -281,6 +281,88 @@ static int set_client_cred(pipesix_config_t *config, const char *value)
     return 0;
 }
 
+/*
+ * Parse "client_route = <id> <ipv6-prefix>" and attach the prefix to
+ * the named client's credential.
+ *
+ * A bare address means a /128 host route. The 'client' line for that id
+ * must come first, so the route is rejected rather than silently
+ * dropped when the id is not known yet.
+ */
+static int set_client_route(pipesix_config_t *config, const char *value)
+{
+    pipesix_client_cred_t *cred = NULL;
+    struct in6_addr parsed;
+    char work[CONFIG_MAX_CLIENT_ID + CONFIG_MAX_ADDRESS + 2];
+    char *id;
+    char *prefix;
+    char *slash;
+    size_t len;
+    int prefix_len = 128;
+    int i;
+
+    if (value == NULL) return -1;
+
+    len = strlen(value);
+    if (len == 0 || len >= sizeof(work)) return -1;
+    memcpy(work, value, len + 1);
+
+    id = work;
+    while (isspace((unsigned char)*id)) id++;
+
+    prefix = id;
+    while (*prefix != '\0' && !isspace((unsigned char)*prefix)) prefix++;
+    if (*prefix == '\0') return -1; /* Missing prefix. */
+    *prefix = '\0';
+    prefix++;
+    while (isspace((unsigned char)*prefix)) prefix++;
+
+    len = strlen(prefix);
+    while (len > 0 && isspace((unsigned char)prefix[len - 1])) {
+        prefix[--len] = '\0';
+    }
+
+    if (!valid_client_id(id)) return -1;
+
+    slash = strchr(prefix, '/');
+    if (slash != NULL) {
+        *slash = '\0';
+        if (parse_int(slash + 1, &prefix_len) != 0) {
+            return -1;
+        }
+    }
+
+    /* /0 is not expressible: prefix_len 0 means "no route configured". */
+    if (prefix_len < 1 || prefix_len > 128) return -1;
+
+    for (i = 0; i < config->client_count; i++) {
+        if (strcmp(config->clients[i].id, id) == 0) {
+            cred = &config->clients[i];
+            break;
+        }
+    }
+
+    if (cred == NULL) {
+        log_error("client_route: unknown client '%s' (the 'client' line "
+                  "must come before its 'client_route')", id);
+        return -1;
+    }
+
+    if (cred->prefix_len != 0) {
+        log_error("client_route: client '%s' already has a route", id);
+        return -1;
+    }
+
+    if (inet_pton(AF_INET6, prefix, &parsed) != 1) {
+        return -1;
+    }
+
+    memcpy(cred->prefix, &parsed, sizeof(cred->prefix));
+    cred->prefix_len = prefix_len;
+
+    return 0;
+}
+
 const pipesix_client_cred_t *config_find_client(const pipesix_config_t *config,
                                                 const char *id)
 {
@@ -359,6 +441,9 @@ static int config_set_value(pipesix_config_t *config, const char *key,
     }
     if (strcmp(key, "client") == 0) {
         return set_client_cred(config, value);
+    }
+    if (strcmp(key, "client_route") == 0) {
+        return set_client_route(config, value);
     }
     if (strcmp(key, "log_level") == 0) {
         log_level_t level;
@@ -548,6 +633,54 @@ int config_validate(const pipesix_config_t *config)
             log_warn("Server 'secret' is ignored: each client authenticates "
                      "with its own credential from 'client = <id>: <secret>'");
         }
+
+        /*
+         * Two clients claiming the same prefix would make return routing
+         * ambiguous, so reject that instead of picking one at random.
+         */
+        {
+            int i;
+            int j;
+            int routed = 0;
+
+            for (i = 0; i < config->client_count; i++) {
+                if (config->clients[i].prefix_len > 0) {
+                    routed++;
+                }
+            }
+
+            for (i = 0; i < config->client_count; i++) {
+                if (config->clients[i].prefix_len <= 0) {
+                    continue;
+                }
+
+                for (j = i + 1; j < config->client_count; j++) {
+                    if (config->clients[j].prefix_len !=
+                        config->clients[i].prefix_len) {
+                        continue;
+                    }
+                    if (memcmp(config->clients[j].prefix,
+                               config->clients[i].prefix,
+                               sizeof(config->clients[i].prefix)) != 0) {
+                        continue;
+                    }
+
+                    log_error("Configuration validation failed: clients "
+                              "'%s' and '%s' are configured with the same "
+                              "route prefix",
+                              config->clients[i].id,
+                              config->clients[j].id);
+                    return -1;
+                }
+            }
+
+            if (config->client_count > 1 && routed < config->client_count) {
+                log_warn("%d client(s) have no 'client_route'; return "
+                         "traffic to them is dropped unless it is the "
+                         "only connected client",
+                         config->client_count - routed);
+            }
+        }
     }
 
     if (strcmp(config->mode, "client") == 0 &&
@@ -612,7 +745,20 @@ void config_dump(const pipesix_config_t *config)
 
         log_info("  clients         = %d configured", config->client_count);
         for (i = 0; i < config->client_count; i++) {
-            log_info("    client: %s", config->clients[i].id);
+            char prefix_str[INET6_ADDRSTRLEN];
+
+            if (config->clients[i].prefix_len <= 0) {
+                log_info("    client: %s (no route)", config->clients[i].id);
+                continue;
+            }
+
+            if (inet_ntop(AF_INET6, config->clients[i].prefix, prefix_str,
+                          sizeof(prefix_str)) == NULL) {
+                memcpy(prefix_str, "?", sizeof("?"));
+            }
+
+            log_info("    client: %s route %s/%d", config->clients[i].id,
+                     prefix_str, config->clients[i].prefix_len);
         }
     }
     log_info("  keepalive       = %d s", config->keepalive);
