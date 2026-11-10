@@ -25,7 +25,8 @@ Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] �
   it to or after reconnecting, so a restart on either side never leaves a
   stale session blocking the tunnel
 - Server client allow-list (`allow_client`, up to 64 entries)
-- SIGHUP reload of log level and timing settings without dropping the tunnel
+- SIGHUP reload of log level, timing settings and, on a server, the client
+  credential table, so a key can be rotated without dropping other tunnels
 - Periodic statistics and on-demand dumps via SIGUSR1
 
 The wire protocol is version 5. It is not compatible with 1.x or 2.0 peers,
@@ -133,8 +134,29 @@ sudo systemctl reload pipesix     # apply log_level/keepalive/peer_timeout/...
 sudo kill -USR1 $(pidof pipesix)  # dump statistics now
 ```
 
-`systemctl reload` sends SIGHUP. Interface, endpoint, credentials, mode and
-allow-list changes require a restart.
+`systemctl reload` sends SIGHUP. It applies `log_level`, `keepalive`,
+`peer_timeout`, `session_timeout`, `stats_interval` and, on a server, the
+`client`/`client_route` table. Interface, endpoint, the client's own
+credentials, mode and allow-list changes require a restart.
+
+### Rotating a client key
+
+Change that client's `client` line and reload. The server drops only that
+client's session, asks it to handshake again, and leaves every other client
+connected:
+
+```bash
+NEWKEY=$(pipesix --genkey)
+sudo sed -i "s|^client = alice:.*|client = alice: ${NEWKEY}|" \
+    /etc/pipesix/pipesix.conf
+sudo systemctl reload pipesix
+```
+
+Until the client's own `secret` is updated to `$NEWKEY` its handshakes are
+rejected, which is what makes the same procedure work as revocation.
+Removing a `client` line and reloading disconnects that client immediately.
+Changing only a `client_route` updates routing for the live session without
+a re-handshake.
 
 On a server, `SIGUSR1` also lists every connected client with its id, peer
 address, frame count and idle time, so you can see who is actually online

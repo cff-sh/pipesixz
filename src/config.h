@@ -33,10 +33,10 @@
  *   stats_interval   - Periodic stats log interval in seconds (0 disables)
  *   log_level        - debug, info, warn, error, fatal
  *
- * SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout
- * and stats_interval from the original configuration file. Changes to
- * the interface, endpoints, credentials, mode or allow_client require
- * a restart.
+ * SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout,
+ * stats_interval and, in server mode, the client credential table from
+ * the original configuration file. Changes to the interface, endpoints,
+ * the client's own credentials, mode or allow_client require a restart.
  */
 
 #ifndef PIPESIX_CONFIG_H
@@ -166,9 +166,11 @@ void config_dump(const pipesix_config_t *config);
 /*
  * Re-read runtime-tunable settings from config->config_path.
  *
- * Applies log_level, keepalive, peer_timeout, session_timeout and
- * stats_interval. Interface, endpoint, secret, mode and allow-list
- * changes are ignored until the process restarts.
+ * Applies log_level, keepalive, peer_timeout, session_timeout,
+ * stats_interval and, in server mode, the per-client credential table
+ * (so client keys can be rotated without a restart). Interface,
+ * endpoint, the client's own credentials, mode and allow-list changes
+ * are ignored until the process restarts.
  *
  * Returns:
  *   0 on success, -1 if the file cannot be loaded or validated (the

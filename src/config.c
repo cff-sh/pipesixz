@@ -795,5 +795,15 @@ int config_reload_runtime(pipesix_config_t *config)
     config->session_timeout = fresh.session_timeout;
     config->stats_interval  = fresh.stats_interval;
 
+    /*
+     * In server mode the credential table is reloadable too: this is how
+     * an operator rotates a client's key without restarting the relay.
+     * The caller (the server) decides which live sessions that affects.
+     */
+    if (strcmp(config->mode, "server") == 0) {
+        config->client_count = fresh.client_count;
+        memcpy(config->clients, fresh.clients, sizeof(config->clients));
+    }
+
     return 0;
 }

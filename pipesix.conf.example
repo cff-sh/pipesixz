@@ -105,8 +105,10 @@ stats_interval  = 60
 # ---------------------------------------------------------------------------
 # log_level: Controls verbosity. Options: debug, info, warn, error, fatal
 #
-# SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout and
-# stats_interval. Interface, endpoint, credentials, routes, mode and
-# allow_client changes take effect after a restart.
+# SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout,
+# stats_interval and, on a server, the 'client'/'client_route' table, so a
+# client key can be rotated without a restart. Interface, endpoint, the
+# local client's own credentials, mode and allow_client changes take
+# effect after a restart.
 #
 log_level = info

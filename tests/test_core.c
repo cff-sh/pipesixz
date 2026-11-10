@@ -927,6 +927,25 @@ static void test_config_credentials(void)
     check(config_validate(&config) != 0, "client without secret rejected");
 }
 
+static int overwrite_file(const char *path, const char *text)
+{
+    FILE *fp = fopen(path, "w");
+    size_t len;
+
+    if (fp == NULL) {
+        return -1;
+    }
+
+    len = strlen(text);
+    if (fwrite(text, 1, len, fp) != len) {
+        fclose(fp);
+        return -1;
+    }
+
+    fclose(fp);
+    return 0;
+}
+
 static void test_client_routes(void)
 {
     static const char routed_config[] =
@@ -1093,6 +1112,97 @@ static void test_config_reload(void)
           "reload keeps the client identity");
 }
 
+static void test_credential_rotation(void)
+{
+    static const char initial[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "keepalive = 20\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_route = alice fd00:dead:beef::2/128\n";
+    static const char rotated[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "keepalive = 45\n"
+        "client = alice: cccccccccccccccccccccccccccccccc\n"
+        "client_route = alice fd00:dead:beef::9/128\n"
+        "client = bob: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
+    const pipesix_client_cred_t *cred;
+    pipesix_config_t config;
+    uint8_t addr[16];
+    char path[64];
+
+    check(write_temp_file(initial, path, sizeof(path)) == 0,
+          "write initial credential fixture");
+    check(config_load(path, &config) == 0, "load initial credentials");
+    check(config_reload_runtime(&config) == 0,
+          "reload an unchanged configuration");
+    cred = config_find_client(&config, "alice");
+    check(cred != NULL &&
+              strcmp(cred->secret, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == 0,
+          "unchanged reload keeps the current key");
+
+    /* Rewrite the same file, as an operator doing a rotation would. */
+    check(overwrite_file(config.config_path, rotated) == 0,
+          "rewrite the configuration for rotation");
+    check(config_reload_runtime(&config) == 0, "reload rotated credentials");
+    unlink(path);
+
+    check(config.keepalive == 45, "reload applied the timing settings");
+    check(config.client_count == 2, "reload adopted the new client count");
+
+    cred = config_find_client(&config, "alice");
+    check(cred != NULL &&
+              strcmp(cred->secret, "cccccccccccccccccccccccccccccccc") == 0,
+          "reload replaced the client's key");
+    check(parse_ipv6("fd00:dead:beef::9", addr) == 0,
+          "parse the rotated route");
+    check(cred != NULL &&
+              ipv6_prefix_match(cred->prefix, cred->prefix_len, addr) == 1,
+          "reload applied the new return route");
+    check(config_find_client(&config, "bob") != NULL,
+          "reload added a new client");
+
+    /* Removing a client from the file must remove it from the table. */
+    check(write_temp_file(initial, path, sizeof(path)) == 0,
+          "write the pre-rotation fixture again");
+    check(overwrite_file(path, initial) == 0, "restore the initial file");
+    check(config_load(path, &config) == 0, "reload the initial credentials");
+    unlink(path);
+    check(config_find_client(&config, "bob") == NULL,
+          "a client absent from the file is gone after reload");
+    check(config.client_count == 1, "reload adopted the smaller client count");
+}
+
+static void test_client_secret_needs_restart(void)
+{
+    static const char initial[] =
+        "mode = client\n"
+        "tun_address = fd00::2/64\n"
+        "remote_address = 203.0.113.1\n"
+        "client_id = alice\n"
+        "secret = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+    static const char changed[] =
+        "mode = client\n"
+        "tun_address = fd00::2/64\n"
+        "remote_address = 203.0.113.1\n"
+        "client_id = alice\n"
+        "secret = cccccccccccccccccccccccccccccccc\n";
+    pipesix_config_t config;
+    char path[64];
+
+    check(write_temp_file(initial, path, sizeof(path)) == 0,
+          "write client credential fixture");
+    check(config_load(path, &config) == 0, "load client credentials");
+    check(overwrite_file(config.config_path, changed) == 0,
+          "rewrite the client key");
+    check(config_reload_runtime(&config) == 0, "reload a client with a new key");
+    unlink(path);
+
+    check(strcmp(config.secret, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == 0,
+          "a client's own key still requires a restart");
+}
+
 static void test_allow_client(void)
 {
     static const char allowed_config[] =
@@ -1164,6 +1274,8 @@ int main(void)
     test_config_credentials();
     test_client_routes();
     test_config_reload();
+    test_credential_rotation();
+    test_client_secret_needs_restart();
     test_allow_client();
 
     printf("%d checks, %d failure(s)\n", g_checks, g_failures);

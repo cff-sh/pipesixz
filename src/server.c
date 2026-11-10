@@ -314,6 +314,29 @@ static int route_lookup(server_context_t *ctx, const uint8_t addr[16])
  */
 
 /*
+ * Send an empty control frame (no payload, no key) to a peer.
+ */
+static void send_empty_control(server_context_t *ctx,
+                              const struct sockaddr_storage *peer,
+                              socklen_t peer_len, uint16_t flags)
+{
+    uint8_t frame[PIPESIX_MAX_FRAME];
+    size_t frame_len;
+
+    frame_len = pipesix_frame_build(frame, sizeof(frame), flags, 0, 0,
+                                    NULL, 0, NULL);
+    if (frame_len == 0) {
+        return;
+    }
+
+    if (sendto(ctx->udp_fd, frame, frame_len, 0,
+               (const struct sockaddr *)peer, peer_len) !=
+        (ssize_t)frame_len) {
+        log_debug("Failed to send a control frame: %s", strerror(errno));
+    }
+}
+
+/*
  * Ask a peer to run the handshake, rate limited so a flood of spoofed
  * datagrams cannot turn the server into an amplifier.
  */
@@ -321,8 +344,6 @@ static void send_need_handshake(server_context_t *ctx,
                                 const struct sockaddr_storage *peer,
                                 socklen_t peer_len)
 {
-    uint8_t frame[PIPESIX_MAX_FRAME];
-    size_t frame_len;
     time_t now = time(NULL);
     int allowed = 0;
 
@@ -341,18 +362,7 @@ static void send_need_handshake(server_context_t *ctx,
         return;
     }
 
-    frame_len = pipesix_frame_build(frame, sizeof(frame),
-                                    PIPESIX_FLAG_HANDSHAKE_NEEDED, 0, 0,
-                                    NULL, 0, NULL);
-    if (frame_len == 0) {
-        return;
-    }
-
-    if (sendto(ctx->udp_fd, frame, frame_len, 0,
-               (const struct sockaddr *)peer, peer_len) !=
-        (ssize_t)frame_len) {
-        log_debug("Failed to send handshake request: %s", strerror(errno));
-    }
+    send_empty_control(ctx, peer, peer_len, PIPESIX_FLAG_HANDSHAKE_NEEDED);
 }
 
 /*
@@ -410,6 +420,7 @@ static void handle_handshake_init(server_context_t *ctx,
     char id[CONFIG_MAX_CLIENT_ID];
     char peer_str[NI_MAXHOST + NI_MAXSERV + 8];
     const pipesix_client_cred_t *cred;
+    pipesix_client_cred_t cred_copy;
     uint8_t psk[PIPESIX_KEY_LEN];
     uint8_t cnonce[PIPESIX_HANDSHAKE_NONCE_LEN];
     uint8_t snonce[PIPESIX_HANDSHAKE_NONCE_LEN];
@@ -430,7 +441,18 @@ static void handle_handshake_init(server_context_t *ctx,
         return;
     }
 
+    /*
+     * Copy the credential while holding the session lock: a SIGHUP reload
+     * may replace the whole table at any moment, and the rest of the
+     * handshake must see one consistent entry.
+     */
+    pthread_mutex_lock(&ctx->lock);
     cred = config_find_client(ctx->config, id);
+    if (cred != NULL) {
+        cred_copy = *cred;
+    }
+    pthread_mutex_unlock(&ctx->lock);
+
     if (cred == NULL) {
         format_peer((const struct sockaddr *)peer, peer_len,
                     peer_str, sizeof(peer_str));
@@ -440,7 +462,7 @@ static void handle_handshake_init(server_context_t *ctx,
         return;
     }
 
-    if (pipesix_key_from_string(cred->secret, psk) != 0) {
+    if (pipesix_key_from_string(cred_copy.secret, psk) != 0) {
         log_error("Cannot derive a key for client '%s'", id);
         return;
     }
@@ -501,9 +523,9 @@ static void handle_handshake_init(server_context_t *ctx,
         pipesix_replay_reset(&ctx->sessions[slot].replay);
     }
 
-    memcpy(ctx->sessions[slot].prefix, cred->prefix,
+    memcpy(ctx->sessions[slot].prefix, cred_copy.prefix,
            sizeof(ctx->sessions[slot].prefix));
-    ctx->sessions[slot].prefix_len = cred->prefix_len;
+    ctx->sessions[slot].prefix_len = cred_copy.prefix_len;
     ctx->sessions[slot].last_seen = time(NULL);
     session_count = count_active(ctx);
 
@@ -655,6 +677,158 @@ static void sessions_dump(server_context_t *ctx)
                  ids[i], peers[i], (unsigned long long)frames[i],
                  (long)(now - last_seen[i]));
     }
+}
+
+/*
+ * Look up a credential in a snapshot of the credential table.
+ */
+static const pipesix_client_cred_t *find_cred_in(
+    const pipesix_client_cred_t *table, int count, const char *id)
+{
+    int i;
+
+    for (i = 0; i < count; i++) {
+        if (strcmp(table[i].id, id) == 0) {
+            return &table[i];
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * Apply a SIGHUP reload.
+ *
+ * Timing settings are replaced in place. In server mode the per-client
+ * credential table is replaced as well, and live sessions are reconciled
+ * against it:
+ *
+ *   - a client whose key changed has its session torn down and is asked
+ *     to handshake again, so the old key stops working immediately;
+ *   - a client removed from the configuration is disconnected;
+ *   - a changed 'client_route' is applied to the live session, which is
+ *     safe because that session is already authenticated.
+ *
+ * Sessions that are not mentioned above are left alone, so rotating one
+ * key does not disturb any other client.
+ */
+static void reload_config(server_context_t *ctx)
+{
+    pipesix_client_cred_t before[CONFIG_MAX_CLIENTS];
+    struct sockaddr_storage hint_addr[SERVER_MAX_CLIENTS];
+    socklen_t hint_addr_len[SERVER_MAX_CLIENTS];
+    char hint_ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
+    char dropped_ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
+    int before_count = ctx->config->client_count;
+    int hint_count = 0;
+    int dropped_count = 0;
+    int rerouted = 0;
+    int rc;
+    int i;
+
+    memcpy(before, ctx->config->clients, sizeof(before));
+
+    /*
+     * The table swap has to exclude the receiver thread, which reads
+     * credentials while handling a handshake.
+     */
+    pthread_mutex_lock(&ctx->lock);
+    rc = config_reload_runtime(ctx->config);
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (rc != 0) {
+        log_error("Configuration reload failed; keeping the previous "
+                  "settings and credentials");
+        return;
+    }
+
+    logger_set_level(ctx->config->log_level);
+    atomic_store(&ctx->session_timeout, ctx->config->session_timeout);
+
+    pthread_mutex_lock(&ctx->lock);
+
+    for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+        server_session_t *session = &ctx->sessions[i];
+        const pipesix_client_cred_t *old_cred;
+        const pipesix_client_cred_t *new_cred;
+
+        if (!session->active) {
+            continue;
+        }
+
+        old_cred = find_cred_in(before, before_count, session->client_id);
+        new_cred = config_find_client(ctx->config, session->client_id);
+
+        if (new_cred == NULL) {
+            snprintf(dropped_ids[dropped_count],
+                     sizeof(dropped_ids[dropped_count]), "%s",
+                     session->client_id);
+            dropped_count++;
+
+            session->active = 0;
+            session->established = 0;
+            session->prefix_len = 0;
+            memset(session->rx_key, 0, sizeof(session->rx_key));
+            memset(session->tx_key, 0, sizeof(session->tx_key));
+            continue;
+        }
+
+        if (old_cred == NULL ||
+            strcmp(old_cred->secret, new_cred->secret) != 0) {
+            /*
+             * The key rotated: the session must not outlive it. The
+             * address is snapshotted under the lock because the receiver
+             * thread may reuse this slot as soon as we let go.
+             */
+            hint_addr[hint_count] = session->addr;
+            hint_addr_len[hint_count] = session->addr_len;
+            snprintf(hint_ids[hint_count],
+                     sizeof(hint_ids[hint_count]), "%s",
+                     session->client_id);
+            hint_count++;
+
+            session->established = 0;
+            session->prefix_len = 0;
+            memset(session->rx_key, 0, sizeof(session->rx_key));
+            memset(session->tx_key, 0, sizeof(session->tx_key));
+            pipesix_replay_reset(&session->replay);
+            continue;
+        }
+
+        if (session->prefix_len != new_cred->prefix_len ||
+            memcmp(session->prefix, new_cred->prefix,
+                   sizeof(session->prefix)) != 0) {
+            memcpy(session->prefix, new_cred->prefix,
+                   sizeof(session->prefix));
+            session->prefix_len = new_cred->prefix_len;
+            rerouted++;
+        }
+    }
+
+    pthread_mutex_unlock(&ctx->lock);
+
+    /* Frames go out after the lock is released. */
+    for (i = 0; i < hint_count; i++) {
+        send_empty_control(ctx, &hint_addr[i], hint_addr_len[i],
+                           PIPESIX_FLAG_HANDSHAKE_NEEDED);
+        log_warn("Client '%s' key changed; session revoked and a new "
+                 "handshake requested", hint_ids[i]);
+    }
+
+    for (i = 0; i < dropped_count; i++) {
+        log_warn("Client '%s' was removed from the configuration; its "
+                 "session was dropped", dropped_ids[i]);
+    }
+
+    if (rerouted > 0) {
+        log_info("%d live session(s) picked up a new return route",
+                 rerouted);
+    }
+
+    log_info("Configuration reloaded (log_level, keepalive, "
+             "session_timeout, stats_interval, %d credential(s)); "
+             "interface, endpoint and mode changes need a restart",
+             ctx->config->client_count);
 }
 
 /*
@@ -1085,17 +1259,7 @@ int server_start(pipesix_config_t *config)
             now = time(NULL);
 
             if (runtime_take_reload_request()) {
-                if (config_reload_runtime(config) == 0) {
-                    logger_set_level(config->log_level);
-                    atomic_store(&ctx.session_timeout,
-                                 config->session_timeout);
-                    log_info("Configuration reloaded (log_level, "
-                             "session_timeout, stats_interval); other "
-                             "changes need a restart");
-                } else {
-                    log_error("Configuration reload failed; keeping the "
-                              "previous settings");
-                }
+                reload_config(&ctx);
                 last_report = now;
             }
 

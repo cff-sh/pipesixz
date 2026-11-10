@@ -151,7 +151,8 @@ static void print_usage(const char *progname)
             "\n"
             "Signal SIGUSR1 dumps traffic statistics immediately.\n"
             "Signal SIGHUP reloads log_level, keepalive, peer_timeout,\n"
-            "session_timeout and stats_interval.\n",
+            "session_timeout, stats_interval and, on a server, client\n"
+            "credentials (key rotation).\n",
             progname, progname, progname, PIPESIX_APP_VERSION,
             DEFAULT_CONFIG_PATH);
 }
