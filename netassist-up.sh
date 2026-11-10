@@ -13,7 +13,6 @@ if [ -z "$LOCAL" ]; then
 fi
 
 SERVER_IPV4="62.205.132.12"
-SERVER_IPV6="2a01:d0:ffff:233f::1"
 CLIENT_IPV6="2a01:d0:ffff:233f::2"
 
 # The broker sends protocol 41 back to the address in your panel, so a
@@ -38,6 +37,11 @@ ip addr add ${CLIENT_IPV6}/64 dev netassist
 ip -6 route replace ::/0 dev netassist
 
 echo "NetAssist tunnel is up"
-echo "Test: ping -6 ${SERVER_IPV6}"
-echo "If it does not answer, check that IPv4 protocol 41 reaches this host"
+# The gateway address published in the panel (2a01:d0:ffff:233f::1) does not
+# answer ICMP: those packets are routed back into our own tunnel and die of
+# a hop-limit loop, which looks like a broken tunnel but is not one. Verify
+# against the broker's DNS server and a public host instead.
+echo "Test: ping -6 2a01:d0::1                 # broker DNS"
+echo "      ping -6 2001:4860:4860::8888       # internet"
+echo "If neither answers, check that IPv4 protocol 41 reaches this host"
 echo "and that UDP/8899 is open for pipesix clients."

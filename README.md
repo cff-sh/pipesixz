@@ -68,14 +68,15 @@ sudo ./netassist-up.sh <your_vps_public_ipv4>
 Example:
 
 ```bash
-sudo ./netassist-up.sh 82.39.86.20
+sudo ./netassist-up.sh 184.107.84.10
 ```
 
 Verification (either option):
 
 ```bash
-ping6 2a01:d0:ffff:233f::1   # NetAssist gateway
-ping6 2a11:6c7:f27:86::1     # Route64 gateway
+ping -6 2a01:d0::1           # NetAssist DNS (the documented /64 gateway
+                             # address does not answer ICMP on this broker)
+ping -6 2a11:6c7:f27:86::1   # Route64 gateway
 ```
 
 ## 3. Setup pipesix
@@ -113,8 +114,8 @@ sudo systemctl enable --now pipesix
 | Test | Command | Expected |
 |---|---|---|
 | Tunnel to VPS | `ping6 2a01:d0:a33f::1` | Replies from VPS |
-| Upstream gateway | `ping6 2a01:d0:ffff:233f::1` | Replies from NetAssist |
-| Internet IPv6 | `ping6 2001:4860:4860::8888` | Replies from Google |
+| Upstream | `ping -6 2a01:d0::1` | Replies via NetAssist (the documented gateway address loops and never answers) |
+| Internet IPv6 | `ping -6 2001:4860:4860::8888` | Replies from Google |
 | Public IPv6 | `curl -6 https://ifconfig.co` | Shows your /48 address |
 | Browser | Open `https://test-ipv6.com` | 10/10 |
 

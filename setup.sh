@@ -36,25 +36,32 @@ fi
 # ------ CONFIGURATION (edit these for your subnet) ------
 
 if [ "$BACKEND" = "route64" ]; then
-    GATEWAY="2a11:6c7:f27:86::1"
+    VERIFY="2a11:6c7:f27:86::1"
     SUBNET="2a11:6c7:f27:86::/64"
+    TUN_MTU=1500
     if [ "$MODE" = "server" ]; then
         TUN_ADDR="2a11:6c7:f27:86::2"
         CLIENT_ADDR="2a11:6c7:f27:86::3"
         UPSTREAM_IFACE="wg0"
     else
         TUN_ADDR="2a11:6c7:f27:86::3"
+        PEER_ADDR="2a11:6c7:f27:86::2"
     fi
 else
-    # NetAssist
-    GATEWAY="2a01:d0:ffff:233f::1"
+    # NetAssist. The gateway address from the panel (2a01:d0:ffff:233f::1)
+    # does not answer ICMP: packets to it loop back into our own tunnel, so a
+    # failed ping there proves nothing. Verify against the broker's DNS.
+    VERIFY="2a01:d0::1"
     SUBNET="2a01:d0:a33f::/48"
+    # 1480-byte SIT path minus 68 bytes of outer IPv4/UDP and pipesix headers.
+    TUN_MTU=1400
     if [ "$MODE" = "server" ]; then
         TUN_ADDR="2a01:d0:a33f::1"
         CLIENT_ADDR="2a01:d0:a33f::2"
         UPSTREAM_IFACE="netassist"
     else
         TUN_ADDR="2a01:d0:a33f::2"
+        PEER_ADDR="2a01:d0:a33f::1"
     fi
 fi
 
@@ -85,7 +92,7 @@ bind_port = 8899
 tun_name = tun0
 tun_address = ${TUN_ADDR}
 tun_prefixlen = 64
-tun_mtu = 1500
+tun_mtu = ${TUN_MTU}
 client = ${CLIENT_ID}: ${SECRET}
 client_route = ${CLIENT_ID} ${CLIENT_ADDR}/128
 log_level = info
@@ -144,7 +151,7 @@ remote_port = 8899
 tun_name = tun0
 tun_address = ${TUN_ADDR}
 tun_prefixlen = 64
-tun_mtu = 1500
+tun_mtu = ${TUN_MTU}
 ${SECRET_LINE}
 log_level = info
 EOF
@@ -152,7 +159,9 @@ EOF
     # Write route-up script (run AFTER starting pipesix)
     cat > /etc/pipesix/route-up.sh <<EOF
 #!/bin/bash
-ip -6 route add default via ${TUN_ADDR} dev tun0 2>/dev/null || true
+# Default route through the tunnel: the gateway is the SERVER's tun address,
+# not this client's own address.
+ip -6 route replace default via ${PEER_ADDR} dev tun0
 EOF
     chmod +x /etc/pipesix/route-up.sh
 
@@ -176,4 +185,4 @@ EOF
 fi
 
 echo ""
-echo "Verify with: ping -6 ${GATEWAY}"
+echo "Verify with: ping -6 ${VERIFY}"
