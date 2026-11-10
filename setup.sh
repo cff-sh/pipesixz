@@ -61,7 +61,12 @@ fi
 # -- 1. Enable IPv6 forwarding (only matters on server) --
 if [ "$MODE" = "server" ]; then
     echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
-    echo "net.ipv6.conf.all.forwarding = 1" >> /etc/sysctl.d/99-pipesix.conf
+    # Idempotent: re-running must not stack duplicate lines in the file.
+    if ! grep -qx 'net.ipv6.conf.all.forwarding = 1' \
+            /etc/sysctl.d/99-pipesix.conf 2>/dev/null; then
+        echo "net.ipv6.conf.all.forwarding = 1" \
+            >> /etc/sysctl.d/99-pipesix.conf
+    fi
 fi
 
 # -- 2. Create pipesix config --
@@ -86,12 +91,29 @@ client_route = ${CLIENT_ID} ${CLIENT_ADDR}/128
 log_level = info
 EOF
 
-    ip -6 route del ${SUBNET} dev tun0 2>/dev/null || true
-   # ip -6 route add ${CLIENT_ADDR}/128 dev tun0
+    # tun0 does not exist until pipesix starts, so anything that needs the
+    # device is done by route-up.sh, which the service runs after startup.
+    cat > /etc/pipesix/route-up.sh <<EOF
+#!/bin/bash
+# Runs after pipesix has created tun0.
+EOF
 
-    ip6tables -t nat -A POSTROUTING -s ${CLIENT_ADDR}/128 -o ${UPSTREAM_IFACE} -j MASQUERADE 2>/dev/null || true
-    mkdir -p /etc/iptables
-    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    if [ "$BACKEND" = "netassist" ]; then
+        # NetAssist routes the whole /48 to this host, so client addresses
+        # are globally reachable: no NAT, and the block belongs on tun0.
+        cat >> /etc/pipesix/route-up.sh <<EOF
+ip -6 route replace ${SUBNET} dev tun0
+EOF
+    else
+        cat >> /etc/pipesix/route-up.sh <<EOF
+# Route64: client traffic is masqueraded onto the WireGuard uplink.
+EOF
+        ip6tables -t nat -A POSTROUTING -s ${CLIENT_ADDR}/128 -o ${UPSTREAM_IFACE} -j MASQUERADE 2>/dev/null || true
+        mkdir -p /etc/iptables
+        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    fi
+
+    chmod +x /etc/pipesix/route-up.sh
 
     echo "=== Server setup complete ==="
     echo ""
@@ -154,4 +176,4 @@ EOF
 fi
 
 echo ""
-echo "Verify with: ping6 ${GATEWAY}"
+echo "Verify with: ping -6 ${GATEWAY}"

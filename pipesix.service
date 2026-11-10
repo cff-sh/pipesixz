@@ -4,9 +4,11 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStartPre=/sbin/modprobe tun
+ExecStartPre=-/sbin/modprobe tun
 ExecStart=/usr/local/sbin/pipesix -c /etc/pipesix/pipesix.conf
-ExecStartPost=/bin/sh -c 'sleep 1 && /etc/pipesix/route-up.sh'
+# '-' so a host without route-up.sh cannot mark a working tunnel failed.
+ExecStartPost=-/bin/sh -c 'sleep 1 && /etc/pipesix/route-up.sh'
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 

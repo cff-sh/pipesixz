@@ -16,6 +16,17 @@ SERVER_IPV4="62.205.132.12"
 SERVER_IPV6="2a01:d0:ffff:233f::1"
 CLIENT_IPV6="2a01:d0:ffff:233f::2"
 
+# The broker sends protocol 41 back to the address in your panel, so a
+# tunnel claiming an address this host does not own fails without saying so.
+if ! ip -4 -o addr show | grep -qw "${LOCAL}"; then
+    echo "Error: ${LOCAL} is not configured on this host." >&2
+    echo "Use the address from 'ip -4 addr' and update the NetAssist panel." >&2
+    exit 1
+fi
+
+# Re-running must not fail on the leftover tunnel from a previous run.
+ip tunnel del netassist 2>/dev/null || true
+
 # Create SIT tunnel
 ip tunnel add netassist mode sit remote ${SERVER_IPV4} local ${LOCAL} ttl 200
 ip link set netassist up
@@ -23,8 +34,10 @@ ip link set netassist up
 # Assign IPv6 address
 ip addr add ${CLIENT_IPV6}/64 dev netassist
 
-# Default route via NetAssist
-ip -6 route add ::/0 dev netassist
+# Default route via NetAssist; 'replace' so a previous default is taken over
+ip -6 route replace ::/0 dev netassist
 
 echo "NetAssist tunnel is up"
-echo "Test: ping6 ${SERVER_IPV6}"
+echo "Test: ping -6 ${SERVER_IPV6}"
+echo "If it does not answer, check that IPv4 protocol 41 reaches this host"
+echo "and that UDP/8899 is open for pipesix clients."
