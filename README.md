@@ -40,6 +40,7 @@ credential.
 - VPS with a public IPv4
 - Route64 or NetAssist tunnel account
 - `make`, `gcc`, `libpthread`
+- macOS client: Xcode command line tools (`xcode-select --install`)
 - Windows client: MinGW-w64 and `wintun.dll` (see [Windows client](#windows-client))
 
 ## 1. Build & Install
@@ -342,6 +343,83 @@ Server side notes:
   authentication failures.
 - Handshake-required hints are rate limited, so the server cannot be used as
   a UDP amplifier.
+
+## macOS client
+
+The client also runs on macOS through the kernel's `utun` driver; server mode
+stays on the VPS. Build it on the Mac with the command line tools:
+
+```bash
+xcode-select --install     # once, if clang is not installed yet
+git clone <your-repo> && cd pipesix
+make
+sudo make install          # optional; ./pipesix works without it
+```
+
+Creating a `utun` interface needs root, so run pipesix with `sudo`. The
+configuration is the same as on Linux; `tun_name` is ignored because the
+kernel hands out the next free `utunN`. Copy the tunnel prefix from the
+server's `tun_address` / `route-up.sh` rather than from
+`pipesix.conf.example`: `tun_address` must sit inside the prefix the relay
+routes to its `tun0`, or replies are dropped on the VPS and the client sees
+silent packet loss.
+
+```ini
+mode = client
+client_id = mac1
+remote_address = 184.107.84.10
+remote_port = 8899
+tun_address = 2a01:d0:a33f::3
+tun_prefixlen = 64
+tun_mtu = 1400
+secret = <the key the server printed for mac1>
+log_level = info
+```
+
+On the VPS, create the matching client and give it its own inner address:
+
+```bash
+sudo pipesix --add-client mac1 --route 2a01:d0:a33f::3/128 \
+    -c /etc/pipesix/pipesix.conf
+```
+
+Start the client and note the interface name in the log:
+
+```bash
+sudo pipesix -c /etc/pipesix/pipesix.conf
+# [INFO] TUN device 'utun4' created (fd=5)
+```
+
+In a second terminal, send the default route through that interface, using the
+name from the log:
+
+```bash
+sudo route add -inet6 default -interface utun4
+```
+
+macOS may keep preferring the router-advertised default on `en0`. Check with
+`netstat -rn -f inet6 | head`; if traffic still leaves through `en0`, replace
+the default:
+
+```bash
+sudo route change -inet6 default -interface utun4
+```
+
+After stopping pipesix, remove the route so normal connectivity returns:
+
+```bash
+sudo route delete -inet6 default -interface utun4
+```
+
+Verify with `ping6 2001:4860:4860::8888` and `curl -6 https://ifconfig.co`.
+Signals behave as on Linux: `sudo killall -HUP pipesix` reloads the
+configuration (for example after rotating `secret`) and
+`sudo killall -USR1 pipesix` dumps the statistics. `sudo pipesix --status
+-c <config>` works too; on macOS the control socket lives in `/tmp`, since
+there is no `/run`.
+
+`setup.sh`, `pipesix.service` and the `ip`/`route` scripts target Linux, so on
+macOS the configuration and route are set by hand as shown above.
 
 ## Windows client
 

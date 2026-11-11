@@ -13,9 +13,11 @@
  * arrays, so interface names and addresses cannot be interpreted by a
  * shell.
  *
- * The TUN device operates in Layer 3 (IFF_TUN) mode without packet
- * information headers (IFF_NO_PI on Linux, equivalent on macOS),
- * meaning each read/write delivers or expects a raw IP packet.
+ * The TUN device operates in Layer 3 mode, meaning each read/write
+ * delivers or expects a raw IP packet. Linux selects that with IFF_TUN
+ * | IFF_NO_PI; utun instead prefixes every packet with a 4-byte address
+ * family in network byte order, which the read and write helpers below
+ * strip and add so the rest of pipesix sees a bare IPv6 packet.
  */
 
 #include "tun.h"
@@ -42,6 +44,7 @@
 #ifdef __APPLE__
 #include <sys/sys_domain.h>
 #include <sys/kern_control.h>
+#include <sys/uio.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #ifndef UTUN_CONTROL_NAME
@@ -384,28 +387,98 @@ ssize_t tun_read(tun_device_t *tun, void *buf, size_t size)
     }
 
     n = read(tun->fd, buf, size);
-    if (n < 0 && errno != EINTR) {
-        log_error("TUN read error (fd=%d): %s", tun->fd, strerror(errno));
+    if (n < 0) {
+        if (errno != EINTR) {
+            log_error("TUN read error (fd=%d): %s", tun->fd, strerror(errno));
+        }
+        return n;
     }
+
+#if defined(__APPLE__)
+    /*
+     * A utun read() returns the packet's address family as a 4-byte
+     * network-order word followed by the IP packet, while every caller
+     * expects a bare IPv6 packet. Drop the word here so the worker loops
+     * stay platform independent.
+     */
+    if (n > 0) {
+        uint32_t family;
+
+        if ((size_t)n <= sizeof(family)) {
+            log_error("utun returned %zd bytes without a packet", n);
+            errno = EIO;
+            return -1;
+        }
+
+        memcpy(&family, buf, sizeof(family));
+        family = ntohl(family);
+        if (family != (uint32_t)AF_INET6) {
+            log_debug("Ignoring a non-IPv6 utun packet (family %u)",
+                      (unsigned int)family);
+        }
+
+        n -= (ssize_t)sizeof(family);
+        memmove(buf, (uint8_t *)buf + sizeof(family), (size_t)n);
+    }
+#endif
 
     return n;
 }
 
 ssize_t tun_write(tun_device_t *tun, const void *buf, size_t length)
 {
-    ssize_t n;
-
     if (tun == NULL || tun->fd < 0 || buf == NULL) {
         errno = EBADF;
         return -1;
     }
 
-    n = write(tun->fd, buf, length);
-    if (n < 0 && errno != EINTR) {
-        log_error("TUN write error (fd=%d): %s", tun->fd, strerror(errno));
-    }
+#if defined(__APPLE__)
+    /*
+     * utun wants the same 4-byte family word in front of the packet.
+     * writev() adds it without copying the payload into a second buffer.
+     */
+    {
+        uint32_t family = htonl((uint32_t)AF_INET6);
+        struct iovec iov[2];
+        ssize_t written;
 
-    return n;
+        iov[0].iov_base = &family;
+        iov[0].iov_len = sizeof(family);
+        iov[1].iov_base = (void *)buf;
+        iov[1].iov_len = length;
+
+        written = writev(tun->fd, iov, 2);
+        if (written < 0) {
+            if (errno != EINTR) {
+                log_error("TUN write error (fd=%d): %s", tun->fd,
+                          strerror(errno));
+            }
+            return written;
+        }
+
+        if ((size_t)written != sizeof(family) + length) {
+            log_warn("Short TUN write: %zd of %zu bytes", written,
+                     sizeof(family) + length);
+        }
+        if (written < (ssize_t)sizeof(family)) {
+            errno = EIO;
+            return -1;
+        }
+
+        return written - (ssize_t)sizeof(family);
+    }
+#else
+    {
+        ssize_t n = write(tun->fd, buf, length);
+
+        if (n < 0 && errno != EINTR) {
+            log_error("TUN write error (fd=%d): %s", tun->fd,
+                      strerror(errno));
+        }
+
+        return n;
+    }
+#endif
 }
 
 int tun_wait(tun_device_t *tun, int timeout_ms)

@@ -21,7 +21,10 @@ mode = client
 # TUN Device Configuration
 # ---------------------------------------------------------------------------
 # tun_name:        Name of the TUN interface (default: tun0)
-# tun_address:     IPv6 address assigned to the TUN device
+# tun_address:     IPv6 address assigned to the TUN device. It must lie
+#                  inside the relay's tunnel prefix (what setup.sh routes to
+#                  tun0 on the server, e.g. 2a01:d0:a33f::/48), otherwise
+#                  return traffic reaches the VPS with no route back.
 # tun_prefixlen:   Prefix length for the address (default: 64)
 # tun_mtu:         MTU of the TUN device (default: 1500)
 #
@@ -82,7 +85,7 @@ secret    = replace-this-with-pipesix-genkey-output
 # share a prefix. Without a route a client only receives return traffic
 # while it is the only one connected.
 #
-#client_route = client1 2001:db8:1::2/128
+#client_route = client1 2001:db8:1::2/128  # keep it inside tun_address' prefix
 #client_route = client2 2001:db8:1:2::/64
 
 # ---------------------------------------------------------------------------
