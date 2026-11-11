@@ -720,10 +720,20 @@ int main(int argc, char *argv[])
         }
         report_rotated_keys(&config);
 
+#if defined(_WIN32)
+        /* No signals: the running instance is reached through its events. */
+        signalled = control_request_reload(config.config_path);
+#else
         signalled = signal_running_instances(config.config_path, SIGHUP);
+#endif
         if (signalled > 0) {
+#if defined(_WIN32)
+            printf("Asked the running pipesix to reload; the server has "
+                   "adopted\nthe new keys.\n");
+#else
             printf("Signalled %d running pipesix process(es) with SIGHUP; "
                    "the server\nhas adopted the new keys.\n", signalled);
+#endif
         } else if (signalled == 0) {
             printf("No running pipesix uses this configuration. Live "
                    "sessions keep\ntheir current keys until it is reloaded:\n"

@@ -184,8 +184,12 @@ WINDOWS_TARGET   = pipesix.exe
 # mixes int, DWORD, SIZE_T and pointer-sized SOCKET values by design, so the
 # POSIX warning set would fire on every call rather than on every bug.
 WINDOWS_CFLAGS  ?= -O2 -g -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 \
-                   -Werror -D_WIN32_WINNT=0x0601
-WINDOWS_LDLIBS   = -lws2_32 -lbcrypt -lwinpthread
+                   -Werror -D_WIN32_WINNT=0x0601 \
+                   -D__USE_MINGW_ANSI_STDIO=1
+# winpthread is linked statically so the zip needs no extra runtime DLL;
+# the C99 stdio shim makes %zu/%llu correct on the legacy msvcrt.
+WINDOWS_LDLIBS   = -lws2_32 -lbcrypt \
+                   -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic
 WINDOWS_SOURCES  = $(filter-out $(SRCDIR)/tun.c $(SRCDIR)/server.c,$(SOURCES)) \
                    $(SRCDIR)/tun_windows.c $(SRCDIR)/platform_win.c
 

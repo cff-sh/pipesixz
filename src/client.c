@@ -41,14 +41,16 @@
 #include "tun.h"
 
 #include <errno.h>
+#if !defined(_WIN32)
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
+#endif
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -404,8 +406,8 @@ static void *reverse_loop(void *arg)
         rc = pipesix_frame_parse(frame_buf, (size_t)nread, &frame,
                                  ctx->rx_key);
         if (rc != PIPESIX_OK) {
-            log_warn("Dropping invalid frame (%zd bytes): %s",
-                     nread, pipesix_strerror(rc));
+            log_warn("Dropping invalid frame (%lld bytes): %s",
+                     (long long)nread, pipesix_strerror(rc));
             stats_add_invalid(&ctx->stats);
             if (rc == PIPESIX_ERR_AUTH) {
                 stats_add_auth_failure(&ctx->stats);

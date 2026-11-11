@@ -121,7 +121,12 @@ void logger_log(log_level_t level, const char *file, int line,
         struct tm tm_info;
 
         clock_gettime(CLOCK_REALTIME, &ts);
+#if defined(_WIN32)
+        /* MinGW exposes the MSVC signature: result first, time second. */
+        localtime_s(&tm_info, &ts.tv_sec);
+#else
         localtime_r(&ts.tv_sec, &tm_info);
+#endif
 
         strftime(timestamp, sizeof(timestamp),
                  "%Y-%m-%d %H:%M:%S", &tm_info);

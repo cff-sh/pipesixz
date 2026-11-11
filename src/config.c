@@ -15,7 +15,13 @@
 #include "config.h"
 #include "crypto.h"
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <io.h>
+#else
 #include <arpa/inet.h>
+#endif
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -25,6 +31,22 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/*
+ * Flush a rewritten configuration to disk.
+ *
+ * POSIX uses fsync(); the Windows CRT spells the same operation _commit()
+ * on a descriptor. Windows also has no fchmod(), so permission
+ * preservation is POSIX-only there (it uses ACLs, not mode bits).
+ */
+static int sync_file(FILE *fp)
+{
+#if defined(_WIN32)
+    return _commit(_fileno(fp));
+#else
+    return fsync(fileno(fp));
+#endif
+}
 
 /*
  * Trim leading and trailing whitespace from a string in place.
@@ -875,12 +897,14 @@ static int rewrite_client_keys(const char *path,
     }
 
     /* Keep the permissions the operator set on the original file. */
+#if !defined(_WIN32)
     if (fchmod(fd, st.st_mode & (mode_t)07777) != 0) {
         close(fd);
         unlink(tmp_path);
         fclose(in);
         return -1;
     }
+#endif
 
     out = fdopen(fd, "w");
     if (out == NULL) {
@@ -984,7 +1008,7 @@ static int rewrite_client_keys(const char *path,
         goto cleanup;
     }
 
-    if (fflush(out) != 0 || fsync(fileno(out)) != 0) {
+    if (fflush(out) != 0 || sync_file(out) != 0) {
         goto cleanup;
     }
 
@@ -1180,11 +1204,13 @@ static int open_replacement(const char *path, char *tmp_path,
         return -1;
     }
 
+#if !defined(_WIN32)
     if (fchmod(fd, st.st_mode & (mode_t)07777) != 0) {
         close(fd);
         unlink(tmp_path);
         return -1;
     }
+#endif
 
     *out = fdopen(fd, "w");
     if (*out == NULL) {
@@ -1299,7 +1325,7 @@ int config_add_client(pipesix_config_t *config, const char *id,
         }
     }
 
-    if (fflush(out) != 0 || fsync(fileno(out)) != 0) {
+    if (fflush(out) != 0 || sync_file(out) != 0) {
         goto cleanup;
     }
     if (fclose(out) != 0) {
@@ -1414,7 +1440,7 @@ int config_remove_client(pipesix_config_t *config, const char *id)
         goto cleanup;
     }
 
-    if (fflush(out) != 0 || fsync(fileno(out)) != 0) {
+    if (fflush(out) != 0 || sync_file(out) != 0) {
         goto cleanup;
     }
     if (fclose(out) != 0) {

@@ -111,6 +111,8 @@ static int wintun_load(void)
      * void * would trip -Wpedantic, which forbids converting between
      * object and function pointers.
      */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-function-type"
     s_api.create_adapter = (wintun_create_adapter_fn)
         GetProcAddress(s_api.dll, "WintunCreateAdapter");
     s_api.open_adapter = (wintun_open_adapter_fn)
@@ -131,6 +133,7 @@ static int wintun_load(void)
         GetProcAddress(s_api.dll, "WintunAllocateSendPacket");
     s_api.send_packet = (wintun_send_packet_fn)
         GetProcAddress(s_api.dll, "WintunSendPacket");
+#pragma GCC diagnostic pop
 
     if (s_api.create_adapter == NULL || s_api.open_adapter == NULL ||
         s_api.close_adapter == NULL || s_api.start_session == NULL ||
@@ -264,7 +267,8 @@ static int run_netsh(const char *const *args, size_t count)
     for (i = 0; i < count; i++) {
         if (psix_utf8_to_wide(args[i], wide,
                               sizeof(wide) / sizeof(wide[0])) != 0) {
-            log_warn("netsh argument %zu is too long", i);
+            log_warn("netsh argument %llu is too long",
+                     (unsigned long long)i);
             return -1;
         }
 
@@ -604,7 +608,8 @@ ssize_t tun_write(tun_device_t *tun, const void *buf, size_t length)
         Sleep(1);
     }
 
-    log_warn("Wintun send ring is full; dropping a %zu-byte packet", length);
+    log_warn("Wintun send ring is full; dropping a %llu-byte packet",
+             (unsigned long long)length);
     errno = ENOBUFS;
     return -1;
 }
