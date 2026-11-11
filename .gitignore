@@ -3,8 +3,10 @@
 *.d
 pipesix
 pipesix.exe
+dist/
 *.exe
 tests/test_core
+tests/test_control
 
 # Local secrets and generated configuration
 privatekey

@@ -32,6 +32,7 @@
 
 #include "server.h"
 #include "config.h"
+#include "control.h"
 #include "crypto.h"
 #include "ipv6.h"
 #include "logger.h"
@@ -40,11 +41,14 @@
 #include "stats.h"
 #include "tun.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,6 +77,10 @@ typedef struct {
     pipesix_replay_t        replay;
     time_t                  last_seen;
     uint64_t                frames;
+    uint64_t                rx_bytes;
+    uint64_t                tx_bytes;
+    /* Set once a packet's source fell outside the session's route. */
+    int                     route_warned;
 } server_session_t;
 
 typedef struct {
@@ -233,6 +241,47 @@ static int session_alloc(server_context_t *ctx,
     pipesix_replay_reset(&ctx->sessions[slot].replay);
 
     return slot;
+}
+
+/*
+ * Drop sessions for 'client_id' that are still bound to another endpoint.
+ *
+ * A client that re-handshakes from a new source port (NAT rebind, restart,
+ * or a second instance) leaves its previous session behind, and that
+ * session keeps the client's static route until session_timeout. Return
+ * traffic then has two candidates for the same client id, and the route
+ * table may keep picking the dead one. The newest authenticated handshake
+ * wins, so older endpoints are dropped here.
+ *
+ * Requires ctx->lock. Returns the number of sessions dropped.
+ */
+static int session_drop_superseded(server_context_t *ctx, const char *client_id,
+                                   const struct sockaddr_storage *peer)
+{
+    int dropped = 0;
+    int i;
+
+    for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+        server_session_t *session = &ctx->sessions[i];
+
+        if (!session->active || !session->established) {
+            continue;
+        }
+        if (strcmp(session->client_id, client_id) != 0) {
+            continue;
+        }
+        if (sockaddr_equal(&session->addr, peer)) {
+            continue;
+        }
+
+        session->active = 0;
+        session->established = 0;
+        memset(session->rx_key, 0, sizeof(session->rx_key));
+        memset(session->tx_key, 0, sizeof(session->tx_key));
+        dropped++;
+    }
+
+    return dropped;
 }
 
 static int count_active(const server_context_t *ctx)
@@ -433,6 +482,7 @@ static void handle_handshake_init(server_context_t *ctx,
     int slot;
     int retransmit = 0;
     int evicted = 0;
+    int superseded = 0;
     int session_count;
 
     if (pipesix_handshake_init_peek(payload, payload_len, id, sizeof(id),
@@ -480,6 +530,13 @@ static void handle_handshake_init(server_context_t *ctx,
 
     pthread_mutex_lock(&ctx->lock);
 
+    /*
+     * The client now lives at this endpoint, so retire any session it
+     * left on an earlier one before allocating its slot. Otherwise the
+     * stale entry would keep competing for the client's route.
+     */
+    superseded = session_drop_superseded(ctx, id, peer);
+
     slot = session_find(ctx, peer);
     if (slot < 0) {
         slot = session_alloc(ctx, peer, peer_len, &evicted);
@@ -520,6 +577,7 @@ static void handle_handshake_init(server_context_t *ctx,
         ctx->sessions[slot].addr = *peer;
         ctx->sessions[slot].addr_len = peer_len;
         ctx->sessions[slot].frames = 0;
+        ctx->sessions[slot].route_warned = 0;
         pipesix_replay_reset(&ctx->sessions[slot].replay);
     }
 
@@ -530,6 +588,14 @@ static void handle_handshake_init(server_context_t *ctx,
     session_count = count_active(ctx);
 
     pthread_mutex_unlock(&ctx->lock);
+
+    if (superseded > 0) {
+        format_peer((const struct sockaddr *)peer, peer_len,
+                    peer_str, sizeof(peer_str));
+        log_info("Client '%s' re-handshook from %s; dropped %d stale "
+                 "session(s) on the previous endpoint", id, peer_str,
+                 superseded);
+    }
 
     memset(c2s, 0, sizeof(c2s));
     memset(s2c, 0, sizeof(s2c));
@@ -801,6 +867,7 @@ static void reload_config(server_context_t *ctx)
             memcpy(session->prefix, new_cred->prefix,
                    sizeof(session->prefix));
             session->prefix_len = new_cred->prefix_len;
+            session->route_warned = 0;
             rerouted++;
         }
     }
@@ -857,6 +924,11 @@ static void *receiver_loop(void *arg)
         int slot;
         time_t now;
         char peer_str[NI_MAXHOST + NI_MAXSERV + 8];
+        char mismatch_id[CONFIG_MAX_CLIENT_ID];
+        uint8_t mismatch_src[16];
+        uint8_t mismatch_prefix[16];
+        int mismatch_prefix_len = 0;
+        int mismatch = 0;
 
         ready = poll(&pfd, 1, POLL_INTERVAL_MS);
         if (ready < 0) {
@@ -951,8 +1023,54 @@ static void *receiver_loop(void *arg)
         now = time(NULL);
         ctx->sessions[slot].last_seen = now;
         ctx->sessions[slot].frames++;
+        ctx->sessions[slot].rx_bytes += (uint64_t)frame.payload_len;
+
+        /*
+         * A client whose inner source address falls outside the route it
+         * was given never sees the replies: the sender has no route for
+         * that address. That is what a client and server configured for
+         * different upstreams look like on the wire, and it is silent
+         * otherwise, so report it once per session.
+         */
+        if (!ctx->sessions[slot].route_warned &&
+            ctx->sessions[slot].prefix_len > 0 &&
+            frame.payload_len >= IPV6_HEADER_LEN) {
+            const pipesix_ipv6_header_t *inner = NULL;
+
+            if (ipv6_parse_header(frame.payload, frame.payload_len,
+                                  &inner) == 0 &&
+                !ipv6_prefix_match(ctx->sessions[slot].prefix,
+                                   ctx->sessions[slot].prefix_len,
+                                   inner->source_addr)) {
+                ctx->sessions[slot].route_warned = 1;
+                mismatch = 1;
+                memcpy(mismatch_src, inner->source_addr,
+                       sizeof(mismatch_src));
+                memcpy(mismatch_prefix, ctx->sessions[slot].prefix,
+                       sizeof(mismatch_prefix));
+                mismatch_prefix_len = ctx->sessions[slot].prefix_len;
+                snprintf(mismatch_id, sizeof(mismatch_id), "%s",
+                         ctx->sessions[slot].client_id);
+            }
+        }
 
         pthread_mutex_unlock(&ctx->lock);
+
+        if (mismatch) {
+            char src_str[INET6_ADDRSTRLEN];
+            char prefix_str[INET6_ADDRSTRLEN];
+
+            ipv6_addr_to_str(mismatch_src, src_str, sizeof(src_str));
+            ipv6_addr_to_str(mismatch_prefix, prefix_str,
+                             sizeof(prefix_str));
+
+            log_warn("Client '%s' sends from %s, which is outside its "
+                     "route %s/%d; return traffic will not reach it (check "
+                     "that the client and server use the same "
+                     "subnet/backend)",
+                     mismatch_id, src_str, prefix_str,
+                     mismatch_prefix_len);
+        }
 
         if ((frame.flags & PIPESIX_FLAG_KEEPALIVE) != 0) {
             log_debug("Keepalive received from client");
@@ -1060,6 +1178,11 @@ static void *sender_loop(void *arg)
             dest = ctx->sessions[slot].addr;
             dest_len = ctx->sessions[slot].addr_len;
             memcpy(key, ctx->sessions[slot].tx_key, sizeof(key));
+            /*
+             * Counted when the packet is handed to sendto(); attributing
+             * a rare send failure would need a second pass over the lock.
+             */
+            ctx->sessions[slot].tx_bytes += (uint64_t)nread;
         }
 
         pthread_mutex_unlock(&ctx->lock);
@@ -1159,6 +1282,392 @@ static int bind_socket(const pipesix_config_t *config)
     return fd;
 }
 
+/*
+ * ---------------------------------------------------------------------
+ * Control channel (--status, --kick)
+ * ---------------------------------------------------------------------
+ */
+
+/*
+ * Append to a reply buffer, reporting when the text no longer fits.
+ *
+ * The format attribute makes every call site compile-checked. The
+ * diagnostic pragma below covers the vsnprintf() inside this wrapper,
+ * which necessarily receives the format as a parameter; with the
+ * attribute in place that is the only place the format is not a literal.
+ */
+static int server_control_append(char *buf, size_t size, size_t *used,
+                                 const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+
+static int server_control_append(char *buf, size_t size, size_t *used,
+                                 const char *fmt, ...)
+{
+    va_list args;
+    int n;
+
+    if (*used >= size) {
+        return -1;
+    }
+
+    va_start(args, fmt);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+    n = vsnprintf(buf + *used, size - *used, fmt, args);
+#pragma GCC diagnostic pop
+    va_end(args);
+
+    if (n < 0) {
+        return -1;
+    }
+    if ((size_t)n >= size - *used) {
+        buf[size - 1] = '\0';
+        return -1;
+    }
+
+    *used += (size_t)n;
+    return 0;
+}
+
+/*
+ * Format the current state into a control reply.
+ *
+ * The session table is snapshotted under the lock and formatted after it
+ * is released, so an operator running --status never stalls the data
+ * path behind getnameinfo() or a large write.
+ */
+static int server_status(server_context_t *ctx, char *reply, size_t size)
+{
+    char ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
+    char peers[SERVER_MAX_CLIENTS][96];
+    char routes[SERVER_MAX_CLIENTS][INET6_ADDRSTRLEN + 8];
+    uint64_t frames[SERVER_MAX_CLIENTS];
+    uint64_t rx_bytes[SERVER_MAX_CLIENTS];
+    uint64_t tx_bytes[SERVER_MAX_CLIENTS];
+    long idle[SERVER_MAX_CLIENTS];
+    time_t now = time(NULL);
+    time_t started = ctx->stats.started;
+    unsigned long uptime;
+    size_t used = 0;
+    int count = 0;
+    int i;
+
+    pthread_mutex_lock(&ctx->lock);
+
+    for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+        server_session_t *session = &ctx->sessions[i];
+
+        if (!session->active) {
+            continue;
+        }
+
+        snprintf(ids[count], sizeof(ids[count]), "%s",
+                 session->client_id[0] != '\0' ? session->client_id : "?");
+        format_peer((const struct sockaddr *)&session->addr,
+                    session->addr_len, peers[count], sizeof(peers[count]));
+
+        if (session->prefix_len > 0) {
+            char prefix_str[INET6_ADDRSTRLEN];
+
+            if (inet_ntop(AF_INET6, session->prefix, prefix_str,
+                          sizeof(prefix_str)) != NULL) {
+                snprintf(routes[count], sizeof(routes[count]), "%s/%d",
+                         prefix_str, session->prefix_len);
+            } else {
+                snprintf(routes[count], sizeof(routes[count]), "?/%d",
+                         session->prefix_len);
+            }
+        } else {
+            snprintf(routes[count], sizeof(routes[count]), "none");
+        }
+
+        frames[count] = session->frames;
+        rx_bytes[count] = session->rx_bytes;
+        tx_bytes[count] = session->tx_bytes;
+        idle[count] = (long)(now - session->last_seen);
+        count++;
+    }
+
+    pthread_mutex_unlock(&ctx->lock);
+
+    uptime = (now > started) ? (unsigned long)(now - started) : 0ul;
+
+    if (server_control_append(reply, size, &used, "OK\n") != 0 ||
+        server_control_append(reply, size, &used, "mode: server\n") != 0 ||
+        server_control_append(reply, size, &used, "config: %s\n",
+                              ctx->config->config_path) != 0 ||
+        server_control_append(reply, size, &used, "uptime: %lus\n",
+                              uptime) != 0 ||
+        server_control_append(reply, size, &used, "tun: %s %s/%d\n",
+                              ctx->config->tun_name,
+                              ctx->config->tun_address,
+                              ctx->config->tun_prefixlen) != 0 ||
+        server_control_append(reply, size, &used, "listen: %s:%d\n",
+                              ctx->config->bind_address,
+                              ctx->config->bind_port) != 0 ||
+        server_control_append(reply, size, &used, "sessions: %d of %d\n",
+                              count, SERVER_MAX_CLIENTS) != 0) {
+        return -1;
+    }
+
+    for (i = 0; i < count; i++) {
+        if (server_control_append(reply, size, &used,
+                                  "  %s from %s rx=%llu B tx=%llu B "
+                                  "frames=%llu idle=%lds route=%s\n",
+                                  ids[i], peers[i],
+                                  (unsigned long long)rx_bytes[i],
+                                  (unsigned long long)tx_bytes[i],
+                                  (unsigned long long)frames[i],
+                                  idle[i], routes[i]) != 0) {
+            return -1;
+        }
+    }
+
+    {
+        char stats_line[512];
+
+        stats_format(&ctx->stats, "server", stats_line, sizeof(stats_line));
+
+        if (server_control_append(reply, size, &used, "%s\n",
+                                  stats_line) != 0) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Format the current state as JSON, for --status --json.
+ *
+ * Same snapshot as server_status(): the session table is copied under the
+ * lock and formatted afterwards. Client ids come from validated
+ * configuration, and peers and routes are numeric, so only the strings an
+ * operator sets need escaping.
+ */
+static int server_status_json(server_context_t *ctx, char *reply, size_t size)
+{
+    char ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
+    char peers[SERVER_MAX_CLIENTS][96];
+    char routes[SERVER_MAX_CLIENTS][INET6_ADDRSTRLEN + 12];
+    uint64_t frames[SERVER_MAX_CLIENTS];
+    uint64_t rx_bytes[SERVER_MAX_CLIENTS];
+    uint64_t tx_bytes[SERVER_MAX_CLIENTS];
+    long idle[SERVER_MAX_CLIENTS];
+    char config_esc[1024];
+    char tun_name_esc[256];
+    char tun_addr_esc[256];
+    char bind_esc[256];
+    char stats_json[512];
+    time_t now = time(NULL);
+    time_t started = ctx->stats.started;
+    unsigned long uptime;
+    size_t used = 0;
+    int count = 0;
+    int i;
+
+    pthread_mutex_lock(&ctx->lock);
+
+    for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+        server_session_t *session = &ctx->sessions[i];
+
+        if (!session->active) {
+            continue;
+        }
+
+        snprintf(ids[count], sizeof(ids[count]), "%s",
+                 session->client_id[0] != '\0' ? session->client_id : "?");
+        format_peer((const struct sockaddr *)&session->addr,
+                    session->addr_len, peers[count], sizeof(peers[count]));
+
+        if (session->prefix_len > 0) {
+            char prefix_str[INET6_ADDRSTRLEN];
+
+            if (inet_ntop(AF_INET6, session->prefix, prefix_str,
+                          sizeof(prefix_str)) != NULL) {
+                snprintf(routes[count], sizeof(routes[count]),
+                         "\"%s/%d\"", prefix_str, session->prefix_len);
+            } else {
+                snprintf(routes[count], sizeof(routes[count]),
+                         "\"?/%d\"", session->prefix_len);
+            }
+        } else {
+            snprintf(routes[count], sizeof(routes[count]), "null");
+        }
+
+        frames[count] = session->frames;
+        rx_bytes[count] = session->rx_bytes;
+        tx_bytes[count] = session->tx_bytes;
+        idle[count] = (long)(now - session->last_seen);
+        count++;
+    }
+
+    pthread_mutex_unlock(&ctx->lock);
+
+    uptime = (now > started) ? (unsigned long)(now - started) : 0ul;
+
+    if (control_json_escape(ctx->config->config_path, config_esc,
+                            sizeof(config_esc)) != 0 ||
+        control_json_escape(ctx->config->tun_name, tun_name_esc,
+                            sizeof(tun_name_esc)) != 0 ||
+        control_json_escape(ctx->config->tun_address, tun_addr_esc,
+                            sizeof(tun_addr_esc)) != 0 ||
+        control_json_escape(ctx->config->bind_address, bind_esc,
+                            sizeof(bind_esc)) != 0) {
+        snprintf(reply, size, "ERR cannot encode the status as JSON\n");
+        return -1;
+    }
+
+    if (server_control_append(
+            reply, size, &used,
+            "OK\n{\"mode\":\"server\",\"config\":\"%s\","
+            "\"uptime_seconds\":%lu,"
+            "\"tun\":{\"name\":\"%s\",\"address\":\"%s\","
+            "\"prefixlen\":%d},"
+            "\"listen\":{\"address\":\"%s\",\"port\":%d},"
+            "\"sessions\":{\"active\":%d,\"capacity\":%d,"
+            "\"clients\":[",
+            config_esc, uptime, tun_name_esc, tun_addr_esc,
+            ctx->config->tun_prefixlen, bind_esc, ctx->config->bind_port,
+            count, SERVER_MAX_CLIENTS) != 0) {
+        goto too_large;
+    }
+
+    for (i = 0; i < count; i++) {
+        if (server_control_append(
+                reply, size, &used,
+                "%s{\"client_id\":\"%s\",\"peer\":\"%s\","
+                "\"rx_bytes\":%llu,\"tx_bytes\":%llu,\"frames\":%llu,"
+                "\"idle_seconds\":%ld,\"route\":%s}",
+                i > 0 ? "," : "", ids[i], peers[i],
+                (unsigned long long)rx_bytes[i],
+                (unsigned long long)tx_bytes[i],
+                (unsigned long long)frames[i], idle[i], routes[i]) != 0) {
+            goto too_large;
+        }
+    }
+
+    stats_format_json(&ctx->stats, "server", stats_json,
+                      sizeof(stats_json));
+
+    if (server_control_append(reply, size, &used, "]},\"stats\":%s}\n",
+                              stats_json) != 0) {
+        goto too_large;
+    }
+
+    return 0;
+
+too_large:
+    snprintf(reply, size, "ERR status is too large to report\n");
+    return -1;
+}
+
+/*
+ * Drop every session that belongs to a client id.
+ *
+ * The client is sent a handshake hint afterwards, so a peer that still
+ * holds the configured key reconnects at once - which clears the stale
+ * session a restarted client would otherwise leave behind - while a
+ * revoked peer simply stops.
+ */
+static int server_kick(server_context_t *ctx, const char *id, char *reply,
+                       size_t size)
+{
+    struct sockaddr_storage peers[SERVER_MAX_CLIENTS];
+    socklen_t peer_len[SERVER_MAX_CLIENTS];
+    int count = 0;
+    int i;
+
+    if (id[0] == '\0') {
+        snprintf(reply, size, "ERR usage: kick <client-id>\n");
+        return -1;
+    }
+
+    pthread_mutex_lock(&ctx->lock);
+
+    for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+        server_session_t *session = &ctx->sessions[i];
+
+        if (!session->active || strcmp(session->client_id, id) != 0) {
+            continue;
+        }
+
+        peers[count] = session->addr;
+        peer_len[count] = session->addr_len;
+        count++;
+
+        session->active = 0;
+        session->established = 0;
+        session->prefix_len = 0;
+        memset(session->rx_key, 0, sizeof(session->rx_key));
+        memset(session->tx_key, 0, sizeof(session->tx_key));
+        pipesix_replay_reset(&session->replay);
+    }
+
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (count == 0) {
+        snprintf(reply, size, "ERR no session for client '%s'\n", id);
+        return -1;
+    }
+
+    for (i = 0; i < count; i++) {
+        send_need_handshake(ctx, &peers[i], peer_len[i]);
+    }
+
+    snprintf(reply, size,
+             "OK dropped %d session(s) for client '%s'; it will handshake "
+             "again\n", count, id);
+    return 0;
+}
+
+static int server_control_handler(const char *request, char *reply,
+                                  size_t size, void *arg)
+{
+    server_context_t *ctx = (server_context_t *)arg;
+
+    if (strcmp(request, "status json") == 0) {
+        return server_status_json(ctx, reply, size);
+    }
+
+    if (strcmp(request, "status") == 0) {
+        return server_status(ctx, reply, size);
+    }
+
+    if (strcmp(request, "stats") == 0) {
+        size_t used = 0;
+
+        if (server_control_append(reply, size, &used, "OK\n") != 0) {
+            return -1;
+        }
+        stats_format(&ctx->stats, "server", reply + used, size - used);
+        return 0;
+    }
+
+    if (strcmp(request, "reload") == 0) {
+        /*
+         * The CLI has already rewritten and validated the file; this only
+         * asks the main loop to adopt it. The reload lands on the next
+         * tick, so the reply says "requested" rather than "reloaded".
+         */
+        runtime_request_reload();
+        snprintf(reply, size, "OK reload requested\n");
+        return 0;
+    }
+
+    if (strncmp(request, "kick ", 5) == 0) {
+        return server_kick(ctx, request + 5, reply, size);
+    }
+
+    if (strcmp(request, "kick") == 0) {
+        snprintf(reply, size, "ERR usage: kick <client-id>\n");
+        return -1;
+    }
+
+    snprintf(reply, size, "ERR unknown request '%s'\n", request);
+    return -1;
+}
+
 int server_start(pipesix_config_t *config)
 {
     tun_device_t tun;
@@ -1227,6 +1736,8 @@ int server_start(pipesix_config_t *config)
         return -1;
     }
 
+    control_set_handler(server_control_handler, &ctx);
+
     {
         int i;
         int routed = 0;
@@ -1277,6 +1788,12 @@ int server_start(pipesix_config_t *config)
             sessions_expire(&ctx, now);
         }
     }
+
+    /*
+     * Stops the control thread, so no handler runs while the state it
+     * reports on is torn down.
+     */
+    control_stop();
 
     log_info("Initiating graceful shutdown...");
 

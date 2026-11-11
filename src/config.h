@@ -45,6 +45,7 @@
 
 #include "logger.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 /*
@@ -193,6 +194,42 @@ int config_reload_runtime(pipesix_config_t *config);
  *   0 on success, -1 on failure (no key and no file change)
  */
 int config_rotate_all_keys(pipesix_config_t *config);
+
+/*
+ * Add a client to a server configuration file.
+ *
+ * Generates a fresh 256-bit key, appends 'client = <id>: <key>' and,
+ * when prefix is not NULL, 'client_route = <id> <prefix>' to the file at
+ * config->config_path. The rewritten file is parsed and validated before
+ * it replaces the original, so a rejected route, a duplicate id or a
+ * duplicate prefix leaves the file exactly as it was. Comments, ordering
+ * and formatting of every other line are preserved.
+ *
+ * On success the generated key is copied to secret_out as a
+ * NUL-terminated hex string, for the caller to hand to the client.
+ *
+ * Returns:
+ *   0 on success, -1 on failure (the file is unchanged)
+ */
+int config_add_client(pipesix_config_t *config, const char *id,
+                      const char *prefix, char *secret_out,
+                      size_t secret_size);
+
+/*
+ * Remove a client and its 'client_route' line from a server
+ * configuration file.
+ *
+ * The client's 'client' and 'client_route' lines are dropped, everything
+ * else is copied through unchanged, and the result is parsed and
+ * validated before it replaces the original. Removing the last client is
+ * refused: a server needs at least one credential.
+ *
+ * The running server drops the removed client's session when it reloads.
+ *
+ * Returns:
+ *   0 on success, -1 on failure (the file is unchanged)
+ */
+int config_remove_client(pipesix_config_t *config, const char *id);
 
 /*
  * Find a client credential by id.

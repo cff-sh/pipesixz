@@ -29,6 +29,7 @@
  */
 
 #include "client.h"
+#include "control.h"
 #include "config.h"
 #include "crypto.h"
 #include "ipv6.h"
@@ -597,6 +598,102 @@ static int renegotiate(client_context_t *ctx)
     return 0;
 }
 
+/*
+ * Control channel handler: report the client's tunnel state.
+ */
+static int client_control_handler(const char *request, char *reply,
+                                  size_t reply_size, void *arg)
+{
+    client_context_t *ctx = (client_context_t *)arg;
+    char stats_line[512];
+    time_t now = time(NULL);
+    unsigned long uptime;
+
+    if (strcmp(request, "status json") == 0) {
+        char config_esc[1024];
+        char tun_name_esc[256];
+        char tun_addr_esc[256];
+        char remote_esc[512];
+        char stats_json[512];
+        int n;
+
+        if (control_json_escape(ctx->config->config_path, config_esc,
+                                sizeof(config_esc)) != 0 ||
+            control_json_escape(ctx->config->tun_name, tun_name_esc,
+                                sizeof(tun_name_esc)) != 0 ||
+            control_json_escape(ctx->config->tun_address, tun_addr_esc,
+                                sizeof(tun_addr_esc)) != 0 ||
+            control_json_escape(ctx->config->remote_address, remote_esc,
+                                sizeof(remote_esc)) != 0) {
+            snprintf(reply, reply_size,
+                     "ERR cannot encode the status as JSON\n");
+            return -1;
+        }
+
+        uptime = (now > ctx->stats.started)
+                     ? (unsigned long)(now - ctx->stats.started)
+                     : 0ul;
+
+        stats_format_json(&ctx->stats, "client", stats_json,
+                          sizeof(stats_json));
+
+        n = snprintf(reply, reply_size,
+                     "OK\n{\"mode\":\"client\",\"config\":\"%s\","
+                     "\"client_id\":\"%s\","
+                     "\"remote\":{\"address\":\"%s\",\"port\":%d},"
+                     "\"tun\":{\"name\":\"%s\",\"address\":\"%s\","
+                     "\"prefixlen\":%d},"
+                     "\"uptime_seconds\":%lu,\"session\":\"%s\","
+                     "\"stats\":%s}\n",
+                     config_esc, ctx->config->client_id, remote_esc,
+                     ctx->config->remote_port, tun_name_esc, tun_addr_esc,
+                     ctx->config->tun_prefixlen, uptime,
+                     ctx->udp_fd == PSIX_INVALID_SOCKET ? "closed" : "open",
+                     stats_json);
+
+        if (n < 0 || (size_t)n >= reply_size) {
+            snprintf(reply, reply_size,
+                     "ERR status is too large to report\n");
+            return -1;
+        }
+
+        return 0;
+    }
+
+    if (strcmp(request, "status") != 0 && strcmp(request, "stats") != 0) {
+        snprintf(reply, reply_size, "ERR unknown request '%s'\n", request);
+        return -1;
+    }
+
+    stats_format(&ctx->stats, "client", stats_line, sizeof(stats_line));
+
+    if (strcmp(request, "stats") == 0) {
+        snprintf(reply, reply_size, "OK\n%s\n", stats_line);
+        return 0;
+    }
+
+    uptime = (now > ctx->stats.started)
+                 ? (unsigned long)(now - ctx->stats.started)
+                 : 0ul;
+
+    snprintf(reply, reply_size,
+             "OK\n"
+             "mode: client\n"
+             "client_id: %s\n"
+             "remote: %s:%d\n"
+             "tun: %s %s/%d\n"
+             "uptime: %lus\n"
+             "session: %s\n"
+             "%s\n",
+             ctx->config->client_id, ctx->config->remote_address,
+             ctx->config->remote_port, ctx->config->tun_name,
+             ctx->config->tun_address, ctx->config->tun_prefixlen,
+             uptime,
+             ctx->udp_fd == PSIX_INVALID_SOCKET ? "closed" : "open",
+             stats_line);
+    return 0;
+}
+
 int client_start(pipesix_config_t *config)
 {
     tun_device_t tun;
@@ -655,6 +752,8 @@ int client_start(pipesix_config_t *config)
         return -1;
     }
     workers_running = 1;
+
+    control_set_handler(client_control_handler, &ctx);
 
     log_info("Client tunnel ready (crypto=chacha20-poly1305, client_id=%s, "
              "keepalive=%ds, peer_timeout=%ds)",
@@ -736,6 +835,7 @@ int client_start(pipesix_config_t *config)
 
                 if (start_workers(&ctx, &forward_thread, &reverse_thread)
                     != 0) {
+                    control_stop();
                     psix_close(ctx.udp_fd);
                     tun_close(&tun);
                     return -1;
@@ -769,6 +869,7 @@ int client_start(pipesix_config_t *config)
 
                 if (start_workers(&ctx, &forward_thread,
                                   &reverse_thread) != 0) {
+                    control_stop();
                     psix_close(ctx.udp_fd);
                     tun_close(&tun);
                     return -1;
@@ -801,6 +902,7 @@ int client_start(pipesix_config_t *config)
 
                 if (start_workers(&ctx, &forward_thread,
                                   &reverse_thread) != 0) {
+                    control_stop();
                     psix_close(ctx.udp_fd);
                     tun_close(&tun);
                     return -1;
@@ -812,6 +914,12 @@ int client_start(pipesix_config_t *config)
             }
         }
     }
+
+    /*
+     * Stops the control thread, so no handler runs while the state it
+     * reports on is torn down.
+     */
+    control_stop();
 
     log_info("Initiating graceful shutdown...");
 

@@ -13,6 +13,7 @@
 #include "ipv6.h"
 #include "logger.h"
 #include "proto.h"
+#include "stats.h"
 
 #include <arpa/inet.h>
 #include <stdint.h>
@@ -1372,6 +1373,112 @@ static void test_allow_client(void)
     unlink(path);
 }
 
+static void test_client_provisioning(void)
+{
+    static const char fixture[] =
+        "# provisioning fixture\n"
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_route = alice fd00::2/128\n"
+        "log_level = error\n";
+    pipesix_config_t config;
+    pipesix_config_t reloaded;
+    const pipesix_client_cred_t *cred;
+    char path[64];
+    char secret[PIPESIX_KEY_LEN * 2 + 1];
+    char contents[2048];
+    FILE *fp;
+    size_t len;
+
+    check(write_temp_file(fixture, path, sizeof(path)) == 0,
+          "write provisioning fixture");
+    check(config_load(path, &config) == 0, "load provisioning fixture");
+    check(config_validate(&config) == 0, "provisioning fixture validates");
+
+    check(config_add_client(&config, "bob", "fd00::3/128", secret,
+                            sizeof(secret)) == 0,
+          "add-client rewrites the configuration");
+    check(strlen(secret) == (size_t)PIPESIX_KEY_LEN * 2u,
+          "add-client prints a 256-bit key");
+
+    check(config_load(path, &reloaded) == 0, "reload provisioned file");
+    check(reloaded.client_count == 2, "provisioned client is in the file");
+    cred = config_find_client(&reloaded, "bob");
+    check(cred != NULL, "provisioned client is found by id");
+    check(cred != NULL && strcmp(cred->secret, secret) == 0,
+          "printed key is the key in the file");
+    check(cred != NULL && cred->prefix_len == 128,
+          "provisioned client got its route");
+
+    check(config_add_client(&reloaded, "bob", NULL, secret,
+                            sizeof(secret)) != 0,
+          "duplicate id is refused");
+    check(config_add_client(&reloaded, "carol", "fd00::3/128", secret,
+                            sizeof(secret)) != 0,
+          "duplicate route is refused");
+    check(config_add_client(&reloaded, "bad id", NULL, secret,
+                            sizeof(secret)) != 0,
+          "invalid client id is refused");
+
+    check(config_remove_client(&reloaded, "bob") == 0,
+          "remove-client rewrites the configuration");
+    check(config_load(path, &reloaded) == 0, "reload after removal");
+    check(reloaded.client_count == 1, "removed client is gone");
+    check(config_find_client(&reloaded, "bob") == NULL,
+          "removed client is no longer configured");
+    check(config_remove_client(&reloaded, "bob") != 0,
+          "removing an unknown client is refused");
+    check(config_remove_client(&reloaded, "alice") != 0,
+          "removing the last client is refused");
+
+    fp = fopen(path, "r");
+    len = (fp != NULL) ? fread(contents, 1, sizeof(contents) - 1, fp) : 0;
+    if (fp != NULL) {
+        fclose(fp);
+    }
+    contents[len] = '\0';
+    check(strstr(contents, "bob") == NULL, "removal left no line behind");
+    check(strstr(contents, "# provisioning fixture") != NULL,
+          "comments survive a rewrite");
+
+    unlink(path);
+}
+
+static void test_stats_json(void)
+{
+    pipesix_stats_t stats;
+    char json[512];
+
+    stats_init(&stats);
+    stats_add_tx(&stats, 300);
+    stats_add_rx(&stats, 120);
+    stats_add_dropped(&stats);
+    stats_add_invalid(&stats);
+    stats_add_auth_failure(&stats);
+    stats_add_replayed(&stats);
+    stats_add_error(&stats);
+
+    stats_format_json(&stats, "server", json, sizeof(json));
+
+    check(json[0] == '{' && json[strlen(json) - 1] == '}',
+          "stats JSON is an object");
+    check(strstr(json, "\"role\":\"server\"") != NULL,
+          "stats JSON carries the role");
+    check(strstr(json, "\"tx_packets\":1") != NULL,
+          "stats JSON counts transmitted packets");
+    check(strstr(json, "\"tx_bytes\":300") != NULL,
+          "stats JSON counts transmitted bytes");
+    check(strstr(json, "\"rx_bytes\":120") != NULL,
+          "stats JSON counts received bytes");
+    check(strstr(json, "\"dropped\":1") != NULL,
+          "stats JSON counts drops");
+    check(strstr(json, "\"auth_failures\":1") != NULL,
+          "stats JSON counts authentication failures");
+    check(strstr(json, "\"last_rx_unix\":") != NULL,
+          "stats JSON carries the receive timestamp");
+}
+
 int main(void)
 {
     logger_init(NULL);
@@ -1399,6 +1506,8 @@ int main(void)
     test_client_secret_rotation();
     test_rotate_all_keys();
     test_allow_client();
+    test_client_provisioning();
+    test_stats_json();
 
     printf("%d checks, %d failure(s)\n", g_checks, g_failures);
     return (g_failures == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

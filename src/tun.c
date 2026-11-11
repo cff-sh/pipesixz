@@ -173,17 +173,41 @@ int tun_open(tun_device_t *tun, const char *name,
     log_info("TUN device '%s' created (fd=%d)", tun->name, tun->fd);
 
     if (mtu > 0) {
-        memset(&ifr, 0, sizeof(ifr));
-        copy_name(ifr.ifr_name, sizeof(ifr.ifr_name), tun->name);
-        ifr.ifr_mtu = mtu;
+        char mtu_opt[16];
+        char *mtu_argv[8];
+        int n;
 
-        rc = ioctl(fd, SIOCSIFMTU, &ifr);
-        if (rc < 0) {
-            log_warn("Failed to set MTU to %d: %s", mtu, strerror(errno));
-        } else {
-            tun->mtu = mtu;
-            log_info("TUN device MTU set to %d", mtu);
+        n = snprintf(mtu_opt, sizeof(mtu_opt), "%d", mtu);
+        if (n < 0 || (size_t)n >= sizeof(mtu_opt)) {
+            log_error("MTU option too long");
+            tun_close(tun);
+            return -1;
         }
+
+        /*
+         * SIOCSIFMTU needs an AF_INET socket; sending it down the TUN fd
+         * returns EINVAL and leaves the interface at its default 1500
+         * without a usable diagnostic. That is not cosmetic: every packet
+         * larger than the real path MTU is then dropped silently, so a
+         * failure to apply the configured MTU stops the tunnel here.
+         */
+        mtu_argv[0] = "ip";
+        mtu_argv[1] = "link";
+        mtu_argv[2] = "set";
+        mtu_argv[3] = "dev";
+        mtu_argv[4] = tun->name;
+        mtu_argv[5] = "mtu";
+        mtu_argv[6] = mtu_opt;
+        mtu_argv[7] = NULL;
+
+        if (run_command(mtu_argv, 1) != 0) {
+            log_error("Failed to set MTU to %d on %s", mtu, tun->name);
+            tun_close(tun);
+            return -1;
+        }
+
+        tun->mtu = mtu;
+        log_info("TUN device MTU set to %d", mtu);
     }
 
     if (address != NULL && strlen(address) > 0) {

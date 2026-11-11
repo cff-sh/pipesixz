@@ -52,6 +52,25 @@ void stats_add_replayed(pipesix_stats_t *stats);
 void stats_add_error(pipesix_stats_t *stats);
 
 /*
+ * Format the one-line summary into out, NUL-terminated.
+ *
+ * Used by stats_dump() for the log and by the control channel, so a
+ * status report and a periodic log line never disagree.
+ */
+void stats_format(const pipesix_stats_t *stats, const char *role,
+                  char *out, size_t out_size);
+
+/*
+ * Format the same counters as a JSON object.
+ *
+ * The result is self-contained (role, uptime, every counter and
+ * last_rx_unix, which is 0 while nothing has been received), so it can be
+ * embedded as the value of "stats" in a larger report.
+ */
+void stats_format_json(const pipesix_stats_t *stats, const char *role,
+                       char *out, size_t out_size);
+
+/*
  * Log a one-line summary at INFO level.
  *
  * Parameters:

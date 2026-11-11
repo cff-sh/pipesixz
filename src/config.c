@@ -1099,3 +1099,359 @@ int config_rotate_all_keys(pipesix_config_t *config)
 
     return 0;
 }
+
+/*
+ * Does this configuration line define or route 'id'?
+ *
+ * Matches 'client = <id>: <secret>' and 'client_route = <id> <prefix>'.
+ * The same conservative parser as the rest of the file: the key token is
+ * read up to '=' or whitespace, and the id up to ':' or whitespace.
+ */
+static int line_belongs_to_client(const char *line, const char *id)
+{
+    const char *p = line;
+    const char *eq;
+    const char *start;
+    const char *end;
+    size_t key_len = 0;
+    size_t id_len = strlen(id);
+
+    while (isspace((unsigned char)*p)) {
+        p++;
+    }
+
+    if (*p == '\0' || *p == '#') {
+        return 0;
+    }
+
+    while (p[key_len] != '\0' && p[key_len] != '=' &&
+           !isspace((unsigned char)p[key_len])) {
+        key_len++;
+    }
+
+    if (!((key_len == 6u && memcmp(p, "client", 6) == 0) ||
+          (key_len == 12u && memcmp(p, "client_route", 12) == 0))) {
+        return 0;
+    }
+
+    eq = strchr(p, '=');
+    if (eq == NULL) {
+        return 0;
+    }
+
+    start = eq + 1;
+    while (isspace((unsigned char)*start)) {
+        start++;
+    }
+
+    end = start;
+    while (*end != '\0' && *end != ':' && !isspace((unsigned char)*end)) {
+        end++;
+    }
+
+    return (size_t)(end - start) == id_len &&
+           memcmp(start, id, id_len) == 0;
+}
+
+/*
+ * Open a temporary file next to path that will replace it.
+ *
+ * Returns the temp path and an open stream, or -1. Keeps the original
+ * file's permissions so a 0600 configuration stays 0600.
+ */
+static int open_replacement(const char *path, char *tmp_path,
+                            size_t tmp_size, FILE **out)
+{
+    struct stat st;
+    int fd;
+
+    if (strlen(path) + sizeof(".pipesix.XXXXXX") > tmp_size) {
+        return -1;
+    }
+
+    if (stat(path, &st) != 0) {
+        return -1;
+    }
+
+    snprintf(tmp_path, tmp_size, "%s.pipesix.XXXXXX", path);
+
+    fd = mkstemp(tmp_path);
+    if (fd < 0) {
+        return -1;
+    }
+
+    if (fchmod(fd, st.st_mode & (mode_t)07777) != 0) {
+        close(fd);
+        unlink(tmp_path);
+        return -1;
+    }
+
+    *out = fdopen(fd, "w");
+    if (*out == NULL) {
+        close(fd);
+        unlink(tmp_path);
+        return -1;
+    }
+
+    return 0;
+}
+
+int config_add_client(pipesix_config_t *config, const char *id,
+                      const char *prefix, char *secret_out,
+                      size_t secret_size)
+{
+    char key_hex[ROTATE_KEY_STRIDE];
+    char tmp_path[CONFIG_PATH_MAX + 32];
+    char line[CONFIG_MAX_CLIENT_ID + CONFIG_MAX_ADDRESS + 32];
+    char buf[4096];
+    uint8_t key[PIPESIX_KEY_LEN];
+    FILE *in = NULL;
+    FILE *out = NULL;
+    size_t nread;
+    int last = '\n';
+    int rc = -1;
+
+    if (config == NULL || id == NULL || config->config_path[0] == '\0') {
+        return -1;
+    }
+
+    if (strcmp(config->mode, "server") != 0) {
+        log_error("clients can only be added to a server configuration");
+        return -1;
+    }
+
+    if (!valid_client_id(id)) {
+        log_error("invalid client id '%s' (letters, digits, '.', '_' and "
+                  "'-' only, at most %d characters)",
+                  id, CONFIG_MAX_CLIENT_ID - 1);
+        return -1;
+    }
+
+    if (config_find_client(config, id) != NULL) {
+        log_error("client '%s' already exists in '%s'", id,
+                  config->config_path);
+        return -1;
+    }
+
+    if (config->client_count >= CONFIG_MAX_CLIENTS) {
+        log_error("the configuration already holds %d clients",
+                  CONFIG_MAX_CLIENTS);
+        return -1;
+    }
+
+    if (prefix != NULL && prefix[0] == '\0') {
+        prefix = NULL;
+    }
+
+    if (secret_out != NULL && secret_size > 0) {
+        secret_out[0] = '\0';
+    }
+
+    if (pipesix_random_bytes(key, sizeof(key)) != 0) {
+        log_error("cannot read random bytes: %s", strerror(errno));
+        return -1;
+    }
+    pipesix_hex_encode(key, sizeof(key), key_hex);
+    memset(key, 0, sizeof(key));
+
+    in = fopen(config->config_path, "r");
+    if (in == NULL) {
+        return -1;
+    }
+
+    if (open_replacement(config->config_path, tmp_path, sizeof(tmp_path),
+                         &out) != 0) {
+        fclose(in);
+        return -1;
+    }
+
+    while ((nread = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, nread, out) != nread) {
+            goto cleanup;
+        }
+        last = buf[nread - 1];
+    }
+
+    if (ferror(in)) {
+        goto cleanup;
+    }
+
+    /* Appending after the last line keeps 'client_route' after 'client'. */
+    if (last != '\n' && fputc('\n', out) == EOF) {
+        goto cleanup;
+    }
+
+    if (snprintf(line, sizeof(line), "client = %s: %s\n", id, key_hex) >=
+        (int)sizeof(line)) {
+        goto cleanup;
+    }
+    if (fputs(line, out) == EOF) {
+        goto cleanup;
+    }
+
+    if (prefix != NULL) {
+        if (snprintf(line, sizeof(line), "client_route = %s %s\n", id,
+                     prefix) >= (int)sizeof(line)) {
+            goto cleanup;
+        }
+        if (fputs(line, out) == EOF) {
+            goto cleanup;
+        }
+    }
+
+    if (fflush(out) != 0 || fsync(fileno(out)) != 0) {
+        goto cleanup;
+    }
+    if (fclose(out) != 0) {
+        out = NULL;
+        goto cleanup;
+    }
+    out = NULL;
+
+    /* Never let a rewrite replace a configuration that does not parse. */
+    {
+        pipesix_config_t check;
+        const pipesix_client_cred_t *cred;
+
+        if (config_load(tmp_path, &check) != 0 ||
+            config_validate(&check) != 0) {
+            log_error("the rewritten configuration is invalid; '%s' is "
+                      "unchanged", config->config_path);
+            goto cleanup;
+        }
+
+        cred = config_find_client(&check, id);
+        if (cred == NULL || strcmp(cred->secret, key_hex) != 0) {
+            log_error("the rewritten configuration does not hold client "
+                      "'%s'; '%s' is unchanged", id,
+                      config->config_path);
+            goto cleanup;
+        }
+        if (prefix != NULL && cred->prefix_len == 0) {
+            log_error("the route for client '%s' was not accepted; '%s' "
+                      "is unchanged", id, config->config_path);
+            goto cleanup;
+        }
+    }
+
+    if (rename(tmp_path, config->config_path) != 0) {
+        log_error("cannot replace '%s': %s", config->config_path,
+                  strerror(errno));
+        goto cleanup;
+    }
+
+    if (secret_out != NULL && secret_size > 0) {
+        snprintf(secret_out, secret_size, "%s", key_hex);
+    }
+
+    rc = 0;
+
+cleanup:
+    if (out != NULL) {
+        fclose(out);
+    }
+    fclose(in);
+
+    if (rc != 0) {
+        unlink(tmp_path);
+    }
+
+    return rc;
+}
+
+int config_remove_client(pipesix_config_t *config, const char *id)
+{
+    char tmp_path[CONFIG_PATH_MAX + 32];
+    char buf[4096];
+    FILE *in = NULL;
+    FILE *out = NULL;
+    int removed = 0;
+    int rc = -1;
+
+    if (config == NULL || id == NULL || config->config_path[0] == '\0') {
+        return -1;
+    }
+
+    if (strcmp(config->mode, "server") != 0) {
+        log_error("clients can only be removed from a server configuration");
+        return -1;
+    }
+
+    if (config_find_client(config, id) == NULL) {
+        log_error("client '%s' is not configured in '%s'", id,
+                  config->config_path);
+        return -1;
+    }
+
+    if (config->client_count <= 1) {
+        log_error("'%s' is the last client; a server needs at least one "
+                  "credential", id);
+        return -1;
+    }
+
+    in = fopen(config->config_path, "r");
+    if (in == NULL) {
+        return -1;
+    }
+
+    if (open_replacement(config->config_path, tmp_path, sizeof(tmp_path),
+                         &out) != 0) {
+        fclose(in);
+        return -1;
+    }
+
+    while (fgets(buf, sizeof(buf), in) != NULL) {
+        if (line_belongs_to_client(buf, id)) {
+            removed++;
+            continue;
+        }
+        if (fputs(buf, out) == EOF) {
+            goto cleanup;
+        }
+    }
+
+    if (ferror(in) || removed == 0) {
+        goto cleanup;
+    }
+
+    if (fflush(out) != 0 || fsync(fileno(out)) != 0) {
+        goto cleanup;
+    }
+    if (fclose(out) != 0) {
+        out = NULL;
+        goto cleanup;
+    }
+    out = NULL;
+
+    {
+        pipesix_config_t check;
+
+        if (config_load(tmp_path, &check) != 0 ||
+            config_validate(&check) != 0 ||
+            config_find_client(&check, id) != NULL) {
+            log_error("the rewritten configuration is invalid; '%s' is "
+                      "unchanged", config->config_path);
+            goto cleanup;
+        }
+    }
+
+    if (rename(tmp_path, config->config_path) != 0) {
+        log_error("cannot replace '%s': %s", config->config_path,
+                  strerror(errno));
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    if (out != NULL) {
+        fclose(out);
+    }
+    fclose(in);
+
+    if (rc != 0) {
+        unlink(tmp_path);
+    }
+
+    return rc;
+}

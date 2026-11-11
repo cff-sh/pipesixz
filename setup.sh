@@ -161,7 +161,11 @@ EOF
 #!/bin/bash
 # Default route through the tunnel: the gateway is the SERVER's tun address,
 # not this client's own address.
-ip -6 route replace default via ${PEER_ADDR} dev tun0
+#
+# The metric matters: a router-advertised default (metric 100) otherwise
+# wins over this one (default 1024) and traffic bypasses the tunnel while
+# still looking like it works.
+ip -6 route replace default via ${PEER_ADDR} dev tun0 metric 50
 EOF
     chmod +x /etc/pipesix/route-up.sh
 

@@ -27,6 +27,8 @@ Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] �
 - Server client allow-list (`allow_client`, up to 64 entries)
 - SIGHUP reload of log level, timing settings and keys on both ends, so a
   credential can be rotated without restarting a process
+- Runtime client provisioning: `--add-client` and `--remove-client` rewrite
+  the configuration atomically and make a running server reload it
 - Periodic statistics and on-demand dumps via SIGUSR1
 
 The wire protocol is version 5. It is not compatible with 1.x or 2.0 peers,
@@ -124,6 +126,7 @@ sudo systemctl enable --now pipesix
 
 | File | Purpose |
 |---|---|
+| `build.sh` | Multi-platform build and packaging (Linux binaries, Windows exe) |
 | `setup.sh` | Server/client setup (config + routes + NAT) |
 | `pipesix.service` | systemd unit for auto-start |
 | `wg-route64.sh` | Route64 WireGuard setup |
@@ -141,6 +144,84 @@ sudo pipesix --rotate-all         # new client keys, printed and reloaded
 `peer_timeout`, `session_timeout`, `stats_interval` and the credentials: the
 `client`/`client_route` table on a server, the `secret` and `client_id` on a
 client. Interface, endpoint, mode and allow-list changes require a restart.
+
+### Control channel
+
+While pipesix runs it also listens on a UNIX socket derived from the
+absolute path of its configuration file, with mode `0600`. The socket
+lives in `/run/pipesix/pipesix-<uid>-<hash>.sock`, or in `/tmp` when
+`/run` is not writable, and is removed when the process exits. Windows
+has no equivalent, so these commands are POSIX only.
+
+```bash
+sudo pipesix --status -c /etc/pipesix/pipesix.conf
+sudo pipesix --kick client1 -c /etc/pipesix/pipesix.conf
+```
+
+`--status` prints the mode, configuration path, uptime, the tun and
+listen addresses, one line per session (client id, peer, bytes in and
+out, frames, idle time, return route) and the traffic counters. On a
+client it reports the client id, remote endpoint and its own counters in
+the same shape, so one command works on both ends.
+
+`--kick <client-id>` drops that client's session and sends it a handshake
+hint. A client that still holds the configured key reconnects at once. A
+client whose key was removed from the configuration simply stops, so the
+command also works as a disconnect.
+
+The same replacement happens without the command: when a client
+re-handshakes, the newest authenticated handshake for that client id
+retires any session it left on an earlier address, so a restart or a NAT
+rebind does not leave a dead route behind for `session_timeout` seconds.
+
+```text
+$ sudo pipesix --status
+OK
+mode: server
+config: /etc/pipesix/pipesix.conf
+uptime: 532s
+tun: tun0 2a01:d0:a33f::1/64
+listen: 0.0.0.0:8899
+sessions: 1 of 64
+  client1 from 203.0.113.5:41622 rx=1841 B tx=96 B frames=7 idle=2s route=2a01:d0:a33f::2/128
+stats[server]: uptime=532s tx=7 pkts/336 B rx=9 pkts/672 B dropped=0 invalid=0 auth_fail=0 replayed=0 errors=0 last_rx=recent
+```
+
+Add `--json` to get the same report as one JSON object. The control
+channel's `OK` line is stripped, so stdout is valid JSON on its own and can
+be piped straight into an agent or `jq`:
+
+```bash
+sudo pipesix --status --json -c /etc/pipesix/pipesix.conf | jq .sessions.active
+```
+
+The server report carries `mode`, `config`, `uptime_seconds`, `tun`,
+`listen`, a `sessions` object (active count, capacity and one entry per
+client with `client_id`, `peer`, `rx_bytes`, `tx_bytes`, `frames`,
+`idle_seconds` and `route`) and `stats`. A client reports `client_id`,
+`remote`, `session` and the same `stats` object. `route` is `null` when the
+client has no `client_route`, and `--json` is only valid with `--status`.
+
+### Provisioning clients
+
+```bash
+sudo pipesix --add-client bob --route 2a01:d0:a33f::3/128 \
+    -c /etc/pipesix/pipesix.conf
+sudo pipesix --remove-client bob -c /etc/pipesix/pipesix.conf
+```
+
+`--add-client` generates a key, appends the `client` and `client_route`
+lines, re-parses the whole file and only then replaces it, so a rejected
+route, a duplicate id or a duplicate prefix leaves the file untouched. It
+prints the key once, for the client's `secret` line. A running server is
+asked to reload over the control channel, so the new client can connect
+immediately; without a running instance the change applies when it starts.
+`--remove-client` drops both lines and the running server disconnects the
+session on the same reload; removing the last client is refused, because a
+server needs at least one credential.
+
+Without `--route` the client is admitted but only receives return traffic
+while it is the single connected session.
 
 ### Rotating a key
 
@@ -253,6 +334,10 @@ Server side notes:
 - Up to 64 clients are tracked at once, each with its own keys and replay
   window. Sessions idle for longer than `session_timeout` are dropped, and
   the least recently used session is evicted when the table is full.
+- A session is bound to the client's current UDP endpoint. A valid
+  re-handshake for a client id retires the session that id held on another
+  endpoint, so a restarted or re-homed client cannot be shadowed by its
+  own stale entry.
 - Unknown client ids and bad handshake MACs are logged and counted as
   authentication failures.
 - Handshake-required hints are rate limited, so the server cannot be used as
@@ -313,6 +398,37 @@ pipesix.exe --stats  -c pipesix.conf    # instead of SIGUSR1
 Stop the tunnel with Ctrl+C. `setup.sh`, `pipesix.service` and the `ip`/`route`
 scripts are POSIX-only, but the configuration format and the wire protocol are
 shared, so a Windows client talks to an unchanged Linux server.
+
+## Release builds
+
+`build.sh` produces self-contained artifacts for the platforms pipesix runs
+on. It stages each target under `dist/`, writes `SHA256SUMS`, and skips a
+target whose toolchain is not installed (so `--all` works on a machine with
+only the native compiler):
+
+| Target | Toolchain | Artifacts |
+|---|---|---|
+| `linux-amd64` | `gcc` | `pipesix-<ver>-linux-amd64.tar.gz`, `pipesix_<ver>_amd64.deb` |
+| `linux-arm64` | `aarch64-linux-gnu-gcc` | `pipesix-<ver>-linux-arm64.tar.gz`, `pipesix_<ver>_arm64.deb` |
+| `windows-amd64` | `x86_64-w64-mingw32-gcc` | `pipesix-<ver>-windows-amd64.zip` (`pipesix.exe`) |
+
+```bash
+./build.sh                          # host platform
+./build.sh --all                    # every target whose toolchain exists
+./build.sh --target windows-amd64 --version 2.2.0
+make dist                           # same as ./build.sh --all
+```
+
+The tarball carries the binary, example configuration, systemd unit, setup
+scripts and documentation. The `.deb` installs the binary to
+`/usr/local/sbin`, the example config to `/etc/pipesix` and the unit to
+`/lib/systemd/system`. The Windows zip carries `pipesix.exe`; download
+`wintun.dll` separately from <https://www.wintun.net/> and place it next to
+the executable.
+
+`.github/workflows/ci.yml` builds and tests every push and pull request with
+gcc, clang and the address/UB sanitizers, cross-builds all three targets,
+and on a `v*` tag publishes the archives and checksums as a release.
 
 ## Testing
 

@@ -61,7 +61,13 @@ TEST_BIN     = tests/test_core
 TEST_SOURCES = tests/test_core.c
 TEST_OBJECTS = $(SRCDIR)/crypto.o $(SRCDIR)/proto.o \
                $(SRCDIR)/config.o $(SRCDIR)/logger.o \
-               $(SRCDIR)/ipv6.o
+               $(SRCDIR)/ipv6.o $(SRCDIR)/stats.o
+
+# The control channel test needs no root: it exercises the socket, not
+# the tunnel.
+TEST_CONTROL_BIN     = tests/test_control
+TEST_CONTROL_SOURCES = tests/test_control.c
+TEST_CONTROL_OBJECTS = $(SRCDIR)/control.o $(SRCDIR)/logger.o
 
 # Binary name
 TARGET       = pipesix
@@ -121,9 +127,19 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.c
 $(TEST_BIN): $(TEST_SOURCES) $(TEST_OBJECTS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+$(TEST_CONTROL_BIN): $(TEST_CONTROL_SOURCES) $(TEST_CONTROL_OBJECTS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
 .PHONY: check
-check: $(TEST_BIN)
+check: $(TEST_BIN) $(TEST_CONTROL_BIN)
 	@./$(TEST_BIN)
+	@./$(TEST_CONTROL_BIN)
+
+#
+# Build and package every platform the local toolchains support.
+#
+dist:
+	@./build.sh --all
 
 #
 # Install the binary and example configuration.
@@ -188,14 +204,15 @@ clean-windows:
 #
 .PHONY: clean
 clean:
-	rm -f $(OBJECTS) $(TARGET) $(TEST_BIN) $(WINDOWS_TARGET)
+	rm -f $(OBJECTS) $(TARGET) $(TEST_BIN) $(TEST_CONTROL_BIN) $(WINDOWS_TARGET)
 
 #
 # Clean build artifacts and dependency files.
 #
-.PHONY: distclean
+.PHONY: dist distclean
 distclean: clean
 	rm -f $(DEPENDS)
+	rm -rf dist
 
 #
 # Display build configuration.

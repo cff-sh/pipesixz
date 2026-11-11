@@ -11,6 +11,9 @@
  *   pipesix -t [-c <config>]      Validate the configuration and exit
  *   pipesix --genkey              Print a random 256-bit per-client key
  *   pipesix --rotate-all          Replace every client key and reload the server
+ *   pipesix --add-client <id> [--route <prefix>]
+ *                                 Add a client to the server configuration
+ *   pipesix --remove-client <id>  Remove a client from the configuration
  *   pipesix -V                    Show version information
  *
  * Command-Line Options:
@@ -20,6 +23,9 @@
  *   -g, --genkey            Generate a per-client pre-shared key
  *   -R, --rotate-all        Generate and apply a new key for every client,
  *                           then make the running server adopt it
+ *       --status            Report the running instance's state
+ *       --json              Print that status as one JSON object
+ *       --kick <client-id>  Drop that client's session
  *   -V, --version           Show version information
  *   -h, --help              Show help
  *
@@ -188,6 +194,8 @@ static void print_usage(const char *progname)
             "       %s -t [-c <config>]\n"
             "       %s --genkey\n"
             "       %s --rotate-all [-c <config>]\n"
+            "       %s --add-client <id> [--route <prefix>] [-c <config>]\n"
+            "       %s --remove-client <id> [-c <config>]\n"
             "\n"
             "pipesix %s - IPv6 over UDP Tunnel\n"
             "\n"
@@ -203,6 +211,16 @@ static void print_usage(const char *progname)
             "      --reload            Ask the running instance for this\n"
             "                          configuration to reload it\n"
             "      --stats             Ask it to dump statistics now\n"
+            "      --status            Report the running instance's state\n"
+            "      --json              Print --status as one JSON object\n"
+            "      --kick <client-id>  Drop that client's session; it\n"
+            "                          handshakes again immediately\n"
+            "      --add-client <id>   Generate a key, write a 'client' entry\n"
+            "                          and its route into the configuration\n"
+            "                          and reload the running server\n"
+            "      --remove-client <id>\n"
+            "                          Remove that client's entry and route\n"
+            "      --route <prefix>    Return route for --add-client\n"
             "  -V, --version           Show version information\n"
             "  -h, --help              Show this help message\n"
             "\n"
@@ -235,9 +253,11 @@ static void print_usage(const char *progname)
             "Signal SIGHUP reloads log_level, keepalive, peer_timeout,\n"
             "session_timeout, stats_interval and keys (server: client\n"
             "table, client: own secret) for live key rotation.\n"
-            "On Windows there are no signals: use --reload and --stats.\n",
-            progname, progname, progname, progname, PIPESIX_APP_VERSION,
-            DEFAULT_CONFIG_PATH);
+            "On Windows there are no signals: use --reload and --stats.\n"
+            "The control channel (--status, --kick) is a 0600 UNIX socket\n"
+            "and is available on POSIX only.\n",
+            progname, progname, progname, progname, progname, progname,
+            PIPESIX_APP_VERSION, DEFAULT_CONFIG_PATH);
 }
 
 static int generate_key(void)
@@ -473,6 +493,12 @@ int main(int argc, char *argv[])
         { "rotate-all", no_argument,      NULL, 'R' },
         { "reload",    no_argument,       NULL, 1000 },
         { "stats",     no_argument,       NULL, 1001 },
+        { "status",    no_argument,       NULL, 1002 },
+        { "json",      no_argument,       NULL, 1007 },
+        { "kick",      required_argument, NULL, 1003 },
+        { "add-client", required_argument, NULL, 1004 },
+        { "remove-client", required_argument, NULL, 1005 },
+        { "route",     required_argument, NULL, 1006 },
         { "version",   no_argument,       NULL, 'V' },
         { "help",      no_argument,       NULL, 'h' },
         { NULL,        0,                 NULL, 0   }
@@ -486,6 +512,12 @@ int main(int argc, char *argv[])
     int rotate_all = 0;
     int reload_only = 0;
     int stats_only = 0;
+    int status_only = 0;
+    int json_output = 0;
+    const char *kick_id = NULL;
+    const char *add_client = NULL;
+    const char *remove_client = NULL;
+    const char *add_route = NULL;
     int opt;
 
     while ((opt = getopt_long(argc, argv, "c:tl:gRVh", long_options, NULL)) != -1) {
@@ -514,6 +546,24 @@ int main(int argc, char *argv[])
             case 1001:
                 stats_only = 1;
                 break;
+            case 1002:
+                status_only = 1;
+                break;
+            case 1003:
+                kick_id = optarg;
+                break;
+            case 1007:
+                json_output = 1;
+                break;
+            case 1004:
+                add_client = optarg;
+                break;
+            case 1005:
+                remove_client = optarg;
+                break;
+            case 1006:
+                add_route = optarg;
+                break;
             case 'V':
                 printf("pipesix %s (protocol %d)\n",
                        PIPESIX_APP_VERSION, PIPESIX_VERSION);
@@ -537,6 +587,65 @@ int main(int argc, char *argv[])
         config_path = DEFAULT_CONFIG_PATH;
     }
 
+    if (add_client != NULL && remove_client != NULL) {
+        fprintf(stderr, "Error: --add-client and --remove-client are "
+                        "mutually exclusive\n");
+        return EXIT_FAILURE;
+    }
+
+    if (add_route != NULL && add_client == NULL) {
+        fprintf(stderr, "Error: --route is only valid with --add-client\n");
+        return EXIT_FAILURE;
+    }
+
+    if (json_output && !status_only) {
+        fprintf(stderr, "Error: --json requires --status\n");
+        return EXIT_FAILURE;
+    }
+
+    /*
+     * --status and --kick ask the running instance instead of starting a
+     * second one, so they are answered before the configuration is
+     * loaded (and before anything is logged to stderr).
+     */
+    if (status_only || kick_id != NULL) {
+        char reply[CONTROL_MAX_REPLY];
+        char request[CONFIG_MAX_CLIENT_ID + 16];
+
+        if (kick_id != NULL) {
+            if (strlen(kick_id) >= CONFIG_MAX_CLIENT_ID) {
+                fprintf(stderr, "Error: client id is too long\n");
+                return EXIT_FAILURE;
+            }
+            snprintf(request, sizeof(request), "kick %s", kick_id);
+        } else if (json_output) {
+            snprintf(request, sizeof(request), "status json");
+        } else {
+            snprintf(request, sizeof(request), "status");
+        }
+
+        if (control_request(config_path, request, reply, sizeof(reply)) != 0) {
+            fprintf(stderr,
+                    "Cannot reach a running pipesix for '%s': %s\n"
+                    "(the control socket exists only while pipesix runs)\n",
+                    config_path, strerror(errno));
+            return EXIT_FAILURE;
+        }
+
+        if (json_output) {
+            /* Strip the channel's OK line so stdout is pure JSON. */
+            if (strncmp(reply, "OK\n", 3) != 0) {
+                fputs(reply, stderr);
+                return EXIT_FAILURE;
+            }
+            fputs(reply + 3, stdout);
+            return EXIT_SUCCESS;
+        }
+
+        fputs(reply, stdout);
+        return (strncmp(reply, "OK", 2) == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
     logger_init(NULL);
     log_info("Loading configuration from '%s'", config_path);
 
@@ -553,6 +662,52 @@ int main(int argc, char *argv[])
     if (config_validate(&config) != 0) {
         log_error("Configuration validation failed");
         return EXIT_FAILURE;
+    }
+
+    if (add_client != NULL || remove_client != NULL) {
+        char reply[1024];
+        char secret[PIPESIX_KEY_LEN * 2 + 1];
+
+        if (add_client != NULL) {
+            if (config_add_client(&config, add_client, add_route, secret,
+                                  sizeof(secret)) != 0) {
+                fprintf(stderr, "Error: cannot add client '%s' to '%s'\n",
+                        add_client, config_path);
+                return EXIT_FAILURE;
+            }
+
+            printf("Added client '%s' to %s\n\n", add_client, config_path);
+            printf("  client_id = %s\n", add_client);
+            printf("  secret    = %s\n", secret);
+            if (add_route != NULL) {
+                printf("  client_route = %s %s\n", add_client, add_route);
+            }
+            printf("\nSet these on the client host and start it; the key is "
+                   "printed once\nand is not stored anywhere else.\n");
+        } else {
+            if (config_remove_client(&config, remove_client) != 0) {
+                fprintf(stderr,
+                        "Error: cannot remove client '%s' from '%s'\n",
+                        remove_client, config_path);
+                return EXIT_FAILURE;
+            }
+            printf("Removed client '%s' from %s\n", remove_client,
+                   config_path);
+        }
+
+        /*
+         * The file is authoritative, but a running server holds the
+         * credential table in memory: ask it to reload so the change takes
+         * effect without a restart (and a removal drops the session).
+         */
+        if (control_request(config_path, "reload", reply, sizeof(reply)) == 0) {
+            printf("Running server asked to reload.\n");
+        } else {
+            printf("No running server for this configuration; the change "
+                   "applies when it starts.\n");
+        }
+
+        return EXIT_SUCCESS;
     }
 
     config_dump(&config);

@@ -92,7 +92,8 @@ static void format_bytes(uint64_t bytes, char *out, size_t out_size)
     }
 }
 
-void stats_dump(const pipesix_stats_t *stats, const char *role)
+void stats_format(const pipesix_stats_t *stats, const char *role,
+                  char *out, size_t out_size)
 {
     char tx_str[32];
     char rx_str[32];
@@ -100,7 +101,7 @@ void stats_dump(const pipesix_stats_t *stats, const char *role)
     time_t now;
     unsigned long uptime;
 
-    if (stats == NULL) return;
+    if (stats == NULL || out == NULL || out_size == 0) return;
 
     format_bytes(atomic_load_explicit(&stats->tx_bytes, memory_order_relaxed),
                  tx_str, sizeof(tx_str));
@@ -111,7 +112,8 @@ void stats_dump(const pipesix_stats_t *stats, const char *role)
     uptime = (now > stats->started) ? (unsigned long)(now - stats->started) : 0u;
     last_rx = atomic_load_explicit(&stats->last_rx, memory_order_relaxed);
 
-    log_info("stats[%s]: uptime=%lus tx=%" PRIu64 " pkts/%s "
+    snprintf(out, out_size,
+             "stats[%s]: uptime=%lus tx=%" PRIu64 " pkts/%s "
              "rx=%" PRIu64 " pkts/%s dropped=%" PRIu64 " invalid=%" PRIu64
              " auth_fail=%" PRIu64 " replayed=%" PRIu64 " errors=%" PRIu64
              " last_rx=%s",
@@ -126,4 +128,46 @@ void stats_dump(const pipesix_stats_t *stats, const char *role)
              atomic_load_explicit(&stats->replayed, memory_order_relaxed),
              atomic_load_explicit(&stats->errors, memory_order_relaxed),
              (last_rx == 0) ? "never" : "recent");
+}
+
+void stats_format_json(const pipesix_stats_t *stats, const char *role,
+                       char *out, size_t out_size)
+{
+    uint64_t last_rx;
+    time_t now;
+    unsigned long uptime;
+
+    if (stats == NULL || out == NULL || out_size == 0) return;
+
+    now = time(NULL);
+    uptime = (now > stats->started) ? (unsigned long)(now - stats->started)
+                                    : 0ul;
+    last_rx = atomic_load_explicit(&stats->last_rx, memory_order_relaxed);
+
+    snprintf(out, out_size,
+             "{\"role\":\"%s\",\"uptime_seconds\":%lu,"
+             "\"tx_packets\":%" PRIu64 ",\"tx_bytes\":%" PRIu64 ","
+             "\"rx_packets\":%" PRIu64 ",\"rx_bytes\":%" PRIu64 ","
+             "\"dropped\":%" PRIu64 ",\"invalid\":%" PRIu64 ","
+             "\"auth_failures\":%" PRIu64 ",\"replayed\":%" PRIu64 ","
+             "\"errors\":%" PRIu64 ",\"last_rx_unix\":%" PRIu64 "}",
+             role, uptime,
+             atomic_load_explicit(&stats->tx_packets, memory_order_relaxed),
+             atomic_load_explicit(&stats->tx_bytes, memory_order_relaxed),
+             atomic_load_explicit(&stats->rx_packets, memory_order_relaxed),
+             atomic_load_explicit(&stats->rx_bytes, memory_order_relaxed),
+             atomic_load_explicit(&stats->dropped, memory_order_relaxed),
+             atomic_load_explicit(&stats->invalid, memory_order_relaxed),
+             atomic_load_explicit(&stats->auth_failures, memory_order_relaxed),
+             atomic_load_explicit(&stats->replayed, memory_order_relaxed),
+             atomic_load_explicit(&stats->errors, memory_order_relaxed),
+             last_rx);
+}
+
+void stats_dump(const pipesix_stats_t *stats, const char *role)
+{
+    char line[512];
+
+    stats_format(stats, role, line, sizeof(line));
+    log_info("%s", line);
 }
