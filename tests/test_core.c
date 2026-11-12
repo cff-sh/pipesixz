@@ -1704,14 +1704,24 @@ static void test_client_policy(void)
           "a slow bucket still passes one full packet");
 
     policy_quota_init(&quota, 1000u);
+    check(policy_quota_remaining(&quota, 100) == 1000u,
+          "an untouched quota is reported in full");
     check(policy_quota_charge(&quota, 600u, 100) == 1, "quota under limit");
+    check(policy_quota_remaining(&quota, 100) == 400u,
+          "quota remaining follows the charge");
     check(policy_quota_charge(&quota, 600u, 100) == 0, "quota over limit");
+    check(policy_quota_remaining(&quota, 100) == 0u,
+          "an exhausted quota reports nothing left");
+    check(policy_quota_remaining(&quota, 101) == 1000u,
+          "a new day is reported as a full quota");
     check(policy_quota_charge(&quota, 600u, 101) == 1,
           "quota resets on a new day");
 
     policy_quota_init(&quota, 0u);
     check(policy_quota_charge(&quota, 1u << 20, 100) == 1,
           "an unlimited quota always allows");
+    check(policy_quota_remaining(&quota, 100) == 0u,
+          "an unlimited quota reports no remaining budget");
 }
 
 int main(void)

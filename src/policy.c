@@ -112,6 +112,26 @@ int policy_quota_charge(pipesix_quota_t *quota, size_t bytes, int day)
     return used <= quota->limit;
 }
 
+uint64_t policy_quota_remaining(const pipesix_quota_t *quota, int day)
+{
+    uint64_t used;
+
+    if (quota == NULL || quota->limit == 0) {
+        return 0;
+    }
+
+    if (atomic_load_explicit(&quota->day, memory_order_relaxed) != day) {
+        return quota->limit;
+    }
+
+    used = atomic_load_explicit(&quota->used, memory_order_relaxed);
+    if (used >= quota->limit) {
+        return 0;
+    }
+
+    return quota->limit - used;
+}
+
 uint64_t policy_now_ms(void)
 {
     struct timespec ts;

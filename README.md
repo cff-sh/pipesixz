@@ -262,8 +262,13 @@ Both roles export the shared counters (`tx`/`rx` packets and bytes, `dropped`,
 `handshake_failures`, `rekeys`, `replayed`, `errors`, `uptime_seconds`,
 `last_rx_timestamp_seconds`, `last_handshake_timestamp_seconds`) with a `mode`
 label. A server adds `pipesix_sessions_active`, `pipesix_sessions_capacity`
-and per-client `pipesix_session_rx_bytes`, `_tx_bytes`, `_frames` and
-`_idle_seconds`; a client adds `pipesix_session_open`.
+and per-client `pipesix_session_rx_bytes`, `_tx_bytes`, `_frames`,
+`_idle_seconds` and `pipesix_session_throttled` (packets dropped by that
+client's limits since it connected). For a client with a `client_quota` the
+scrape also carries `pipesix_session_quota_limit_bytes` and
+`pipesix_session_quota_remaining_bytes`; both are gauges, and the remaining
+figure is the budget for the current UTC day. A client adds
+`pipesix_session_open`.
 
 `pipesix_handshakes_total` counts handshakes that produced a session,
 `pipesix_handshake_failures_total` the attempts that did not (bad key,

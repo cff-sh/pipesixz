@@ -79,6 +79,15 @@ void policy_quota_init(pipesix_quota_t *quota, uint64_t limit_bytes);
  */
 int policy_quota_charge(pipesix_quota_t *quota, size_t bytes, int day);
 
+/*
+ * Bytes still available in the quota for 'day'.
+ *
+ * Returns 0 when the client has no quota or has used it all. Read-only:
+ * a scrape must not reset the counter, so a new day is reported as a full
+ * budget without storing anything.
+ */
+uint64_t policy_quota_remaining(const pipesix_quota_t *quota, int day);
+
 /* Wall-clock time in milliseconds, for the token buckets. */
 uint64_t policy_now_ms(void);
 

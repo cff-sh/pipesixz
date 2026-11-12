@@ -81,6 +81,7 @@ typedef struct {
     uint64_t                frames;
     uint64_t                rx_bytes;
     uint64_t                tx_bytes;
+    uint64_t                throttled;
     /* Set once a packet's source fell outside the session's route. */
     int                     route_warned;
     /* Set once the client was told its packet exceeded the relay MTU. */
@@ -671,6 +672,7 @@ static void handle_handshake_init(server_context_t *ctx,
         ctx->sessions[slot].addr = *peer;
         ctx->sessions[slot].addr_len = peer_len;
         ctx->sessions[slot].frames = 0;
+        ctx->sessions[slot].throttled = 0;
         ctx->sessions[slot].route_warned = 0;
         ctx->sessions[slot].mtu_warned = 0;
         pipesix_replay_reset(&ctx->sessions[slot].replay);
@@ -1280,6 +1282,7 @@ static void *receiver_loop(void *arg)
                     }
                 }
 
+                session->throttled++;
                 pthread_mutex_unlock(&ctx->lock);
 
                 if (policy_warn) {
@@ -1487,6 +1490,7 @@ static void *sender_loop(void *arg)
 
             if (!allowed) {
                 denied = 1;
+                session->throttled++;
                 if (!session->policy_warned) {
                     session->policy_warned = 1;
                     denied_warn = 1;
@@ -1918,6 +1922,9 @@ static int server_metrics_body(char *out, size_t size, void *arg)
     uint64_t frames[SERVER_MAX_CLIENTS];
     uint64_t rx_bytes[SERVER_MAX_CLIENTS];
     uint64_t tx_bytes[SERVER_MAX_CLIENTS];
+    uint64_t throttled[SERVER_MAX_CLIENTS];
+    uint64_t quota_limit[SERVER_MAX_CLIENTS];
+    uint64_t quota_remaining[SERVER_MAX_CLIENTS];
     long idle[SERVER_MAX_CLIENTS];
     time_t now = time(NULL);
     size_t used;
@@ -1938,6 +1945,17 @@ static int server_metrics_body(char *out, size_t size, void *arg)
         frames[count] = session->frames;
         rx_bytes[count] = session->rx_bytes;
         tx_bytes[count] = session->tx_bytes;
+        throttled[count] = session->throttled;
+        quota_limit[count] = 0;
+        quota_remaining[count] = 0;
+
+        if (session->policy_index >= 0 &&
+            ctx->config->policies[session->policy_index].quota_mib > 0) {
+            quota_limit[count] = ctx->quotas[session->policy_index].limit;
+            quota_remaining[count] = policy_quota_remaining(
+                &ctx->quotas[session->policy_index], policy_day(now));
+        }
+
         idle[count] = (long)(now - session->last_seen);
         count++;
     }
@@ -1972,11 +1990,39 @@ static int server_metrics_body(char *out, size_t size, void *arg)
             "client.\n# TYPE pipesix_session_frames gauge\n"
             "# HELP pipesix_session_idle_seconds Seconds since the last "
             "frame from one client.\n"
-            "# TYPE pipesix_session_idle_seconds gauge\n") != 0) {
+            "# TYPE pipesix_session_idle_seconds gauge\n"
+            "# HELP pipesix_session_throttled Packets dropped by one "
+            "client's rate or quota limits since it connected.\n"
+            "# TYPE pipesix_session_throttled gauge\n"
+            "# HELP pipesix_session_quota_limit_bytes Bytes one client may "
+            "move per UTC day. Only exported for clients with a quota.\n"
+            "# TYPE pipesix_session_quota_limit_bytes gauge\n"
+            "# HELP pipesix_session_quota_remaining_bytes Bytes left in one "
+            "client's quota for the current UTC day. Only exported for "
+            "clients with a quota.\n"
+            "# TYPE pipesix_session_quota_remaining_bytes gauge\n") != 0) {
         return -1;
     }
 
     for (i = 0; i < count; i++) {
+        if (server_control_append(
+                out, size, &used,
+                "pipesix_session_throttled{client=\"%s\"} %llu\n",
+                ids[i], (unsigned long long)throttled[i]) != 0) {
+            return -1;
+        }
+
+        if (quota_limit[i] > 0 &&
+            server_control_append(
+                out, size, &used,
+                "pipesix_session_quota_limit_bytes{client=\"%s\"} %llu\n"
+                "pipesix_session_quota_remaining_bytes{client=\"%s\"} "
+                "%llu\n",
+                ids[i], (unsigned long long)quota_limit[i],
+                ids[i], (unsigned long long)quota_remaining[i]) != 0) {
+            return -1;
+        }
+
         if (server_control_append(
                 out, size, &used,
                 "pipesix_session_rx_bytes{client=\"%s\"} %llu\n"
