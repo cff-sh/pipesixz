@@ -82,6 +82,8 @@ typedef struct {
     uint64_t                tx_bytes;
     /* Set once a packet's source fell outside the session's route. */
     int                     route_warned;
+    /* Set once the client was told its packet exceeded the relay MTU. */
+    int                     mtu_warned;
 } server_session_t;
 
 typedef struct {
@@ -579,6 +581,7 @@ static void handle_handshake_init(server_context_t *ctx,
         ctx->sessions[slot].addr_len = peer_len;
         ctx->sessions[slot].frames = 0;
         ctx->sessions[slot].route_warned = 0;
+        ctx->sessions[slot].mtu_warned = 0;
         pipesix_replay_reset(&ctx->sessions[slot].replay);
     }
 
@@ -900,6 +903,100 @@ static void reload_config(server_context_t *ctx)
 }
 
 /*
+ * Tell a client that one of its packets is too large for the relay
+ * (ICMPv6 Packet Too Big, RFC 4443).
+ *
+ * Without this the relay's kernel drops the oversized packet on write and
+ * the client keeps retrying it: the classic PMTU black hole, which is what
+ * forces an operator to guess at tun_mtu. The message is sent inside the
+ * client's own session, quoted back from its packet, so its kernel lowers
+ * the path MTU for that destination and resends at a size that fits.
+ *
+ * The frame is addressed from the session table snapshot taken under the
+ * lock: the slot may be recycled by a re-handshake, and a frame built for
+ * the wrong session would only fail authentication at the client.
+ */
+static void send_packet_too_big(server_context_t *ctx, int slot,
+                                const struct sockaddr_storage *peer,
+                                socklen_t peer_len,
+                                const uint8_t *payload, size_t payload_len)
+{
+    char client_id[CONFIG_MAX_CLIENT_ID];
+    uint8_t src[16];
+    uint8_t key[PIPESIX_KEY_LEN];
+    uint8_t packet[1280];
+    uint8_t frame[PIPESIX_MAX_FRAME];
+    const pipesix_ipv6_header_t *inner = NULL;
+    size_t packet_len;
+    size_t frame_len;
+    uint32_t mtu;
+    int first = 0;
+
+    if (slot < 0 || ctx->config->tun_mtu <= 0) {
+        return;
+    }
+
+    if (inet_pton(AF_INET6, ctx->config->tun_address, src) != 1) {
+        return;
+    }
+
+    if (ipv6_parse_header(payload, payload_len, &inner) != 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&ctx->lock);
+
+    if (!ctx->sessions[slot].active || !ctx->sessions[slot].established ||
+        !sockaddr_equal(&ctx->sessions[slot].addr, peer)) {
+        pthread_mutex_unlock(&ctx->lock);
+        return;
+    }
+
+    memcpy(key, ctx->sessions[slot].tx_key, sizeof(key));
+    snprintf(client_id, sizeof(client_id), "%s",
+             ctx->sessions[slot].client_id);
+    if (!ctx->sessions[slot].mtu_warned) {
+        ctx->sessions[slot].mtu_warned = 1;
+        first = 1;
+    }
+
+    pthread_mutex_unlock(&ctx->lock);
+
+    mtu = (uint32_t)ctx->config->tun_mtu;
+
+    packet_len = ipv6_build_packet_too_big(packet, sizeof(packet), src,
+                                           inner->source_addr, mtu, payload,
+                                           payload_len);
+    if (packet_len == 0) {
+        memset(key, 0, sizeof(key));
+        return;
+    }
+
+    frame_len = pipesix_frame_build(frame, sizeof(frame), 0, ctx->salt,
+                                    next_seq(ctx), packet, packet_len, key);
+    memset(key, 0, sizeof(key));
+
+    if (frame_len == 0) {
+        return;
+    }
+
+    if (sendto(ctx->udp_fd, frame, frame_len, 0,
+               (const struct sockaddr *)peer, peer_len) !=
+        (ssize_t)frame_len) {
+        log_debug("Failed to send ICMPv6 Packet Too Big: %s",
+                  strerror(errno));
+        return;
+    }
+
+    if (first) {
+        log_warn("Client '%s' sent a %zu-byte packet but tun_mtu is %u; "
+                 "returned ICMPv6 Packet Too Big so its kernel lowers the "
+                 "path MTU",
+                 client_id, payload_len, (unsigned)mtu);
+    }
+}
+
+/*
  * Receiver loop (UDP -> TUN)
  */
 static void *receiver_loop(void *arg)
@@ -1089,13 +1186,32 @@ static void *receiver_loop(void *arg)
             continue;
         }
 
+        /*
+         * Checked before the write: a kernel may drop an oversized packet
+         * silently, or fail the write, and either way the client would keep
+         * retrying it without ever learning why.
+         */
+        if (ctx->config->tun_mtu > 0 &&
+            frame.payload_len > (size_t)ctx->config->tun_mtu) {
+            send_packet_too_big(ctx, slot, &peer, peer_len, frame.payload,
+                                frame.payload_len);
+            stats_add_dropped(&ctx->stats);
+            continue;
+        }
+
         {
             ssize_t nwritten = tun_write(ctx->tun, frame.payload,
                                          frame.payload_len);
 
             if (nwritten < 0) {
-                log_error("TUN write failed: %s", strerror(errno));
-                stats_add_error(&ctx->stats);
+                if (errno == EMSGSIZE) {
+                    send_packet_too_big(ctx, slot, &peer, peer_len,
+                                        frame.payload, frame.payload_len);
+                    stats_add_dropped(&ctx->stats);
+                } else {
+                    log_error("TUN write failed: %s", strerror(errno));
+                    stats_add_error(&ctx->stats);
+                }
                 continue;
             }
         }

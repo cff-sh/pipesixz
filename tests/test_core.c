@@ -1480,6 +1480,86 @@ static void test_stats_json(void)
 }
 
 /*
+ * One's-complement sum used to verify the ICMPv6 checksum independently
+ * of the builder: over the pseudo-header and the message, a correct
+ * checksum folds to 0xFFFF.
+ */
+static uint32_t sum_words(uint32_t sum, const uint8_t *data, size_t len)
+{
+    size_t i;
+
+    for (i = 0; i + 1 < len; i += 2) {
+        sum += ((uint32_t)data[i] << 8) | (uint32_t)data[i + 1];
+    }
+    if (i < len) {
+        sum += (uint32_t)data[i] << 8;
+    }
+
+    while ((sum >> 16) != 0) {
+        sum = (sum & 0xFFFFu) + (sum >> 16);
+    }
+
+    return sum;
+}
+
+static void test_packet_too_big(void)
+{
+    uint8_t src[16];
+    uint8_t dst[16];
+    uint8_t frame[1280];
+    uint8_t original[1500];
+    uint8_t pseudo[40];
+    uint32_t mtu_field;
+    size_t total;
+    uint32_t sum;
+
+    memset(original, 0, sizeof(original));
+    original[0] = 0x60;
+    original[4] = 0x05;
+    original[5] = 0xB4;
+
+    check(parse_ipv6("2a01:d0:a33f::1", src) == 0, "parse PTB source");
+    check(parse_ipv6("2a01:d0:a33f::3", dst) == 0, "parse PTB destination");
+
+    total = ipv6_build_packet_too_big(frame, sizeof(frame), src, dst, 1400,
+                                      original, sizeof(original));
+    check(total == 1280, "PTB is capped at the minimum IPv6 MTU");
+    check(frame[0] == 0x60, "PTB carries an IPv6 header");
+    check(frame[6] == IPV6_NEXT_ICMPV6, "PTB next header is ICMPv6");
+    check(frame[40] == ICMPV6_TYPE_PACKET_TOO_BIG, "PTB type is 2");
+    check(frame[41] == 0, "PTB code is 0");
+
+    memcpy(&mtu_field, &frame[44], sizeof(mtu_field));
+    check(ntohl(mtu_field) == 1400, "PTB carries the relay MTU");
+
+    check(memcmp(&frame[48], original, 1280 - 48) == 0,
+          "PTB quotes the offending packet");
+
+    /* Verify the checksum the way a receiver would. */
+    memcpy(pseudo, src, 16);
+    memcpy(pseudo + 16, dst, 16);
+    pseudo[32] = 0;
+    pseudo[33] = 0;
+    pseudo[34] = (uint8_t)((total - IPV6_HEADER_LEN) >> 8);
+    pseudo[35] = (uint8_t)((total - IPV6_HEADER_LEN) & 0xFFu);
+    pseudo[36] = 0;
+    pseudo[37] = 0;
+    pseudo[38] = 0;
+    pseudo[39] = IPV6_NEXT_ICMPV6;
+    sum = sum_words(0, pseudo, sizeof(pseudo));
+    sum = sum_words(sum, frame + IPV6_HEADER_LEN, total - IPV6_HEADER_LEN);
+    check(sum == 0xFFFFu, "PTB checksum verifies");
+
+    total = ipv6_build_packet_too_big(frame, sizeof(frame), src, dst, 1400,
+                                      original, 100);
+    check(total == 40 + 8 + 100, "PTB quotes a short packet whole");
+
+    check(ipv6_build_packet_too_big(frame, 64, src, dst, 1400, original,
+                                    sizeof(original)) == 0,
+          "PTB refuses a buffer that is too small");
+}
+
+/*
  * The Prometheus body is what a scraper parses, so check the wire shape
  * rather than the exact formatting: a TYPE line per metric, the mode
  * label, and values that match the counters.
@@ -1547,6 +1627,7 @@ int main(void)
     test_client_provisioning();
     test_stats_json();
     test_stats_prometheus();
+    test_packet_too_big();
 
     printf("%d checks, %d failure(s)\n", g_checks, g_failures);
     return (g_failures == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

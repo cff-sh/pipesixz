@@ -29,7 +29,11 @@ Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] �
   credential can be rotated without restarting a process
 - Runtime client provisioning: `--add-client` and `--remove-client` rewrite
   the configuration atomically and make a running server reload it
-- Periodic statistics and on-demand dumps via SIGUSR1
+- Periodic statistics and on-demand dumps via SIGUSR1, plus Prometheus
+  metrics over HTTP (`metrics_address`) or `--metrics`
+- Path-MTU feedback: a packet larger than the relay's `tun_mtu` is answered
+  with an ICMPv6 Packet Too Big instead of being dropped silently, so the
+  client lowers its MTU and the retransmission fits
 
 The wire protocol is version 5. It is not compatible with 1.x or 2.0 peers,
 and there is no plaintext mode: a client cannot join without a valid
@@ -323,6 +327,26 @@ without restarting the relay:
 [INFO]   client 'alice' from 203.0.113.5:41622: 1841 frame(s), idle 2s
 [INFO]   client 'bob' from [2001:db8::7]:51820: 97 frame(s), idle 41s
 ```
+
+### MTU and Packet Too Big
+
+`tun_mtu` is the largest packet the relay's TUN device can carry upstream.
+When a client sends something larger, the relay does not drop it silently: it
+returns an ICMPv6 Packet Too Big (RFC 4443) that quotes the packet and carries
+the relay's MTU, so the client's kernel lowers the path MTU for that
+destination and resends at a size that fits.
+
+The reply is sent inside the client's own session and logged once per session:
+
+```text
+[WARN] Client 'mac1' sent a 1500-byte packet but tun_mtu is 1400; returned
+ICMPv6 Packet Too Big so its kernel lowers the path MTU
+```
+
+That is why a client with `tun_mtu = 1500` in front of a 1400-byte relay path
+degrades (`dropped` grows, the transfer slows down) instead of black-holing.
+Setting the client's `tun_mtu` to the path MTU still avoids the extra round
+trip; the feedback only guarantees the tunnel recovers on its own.
 
 ## Security
 

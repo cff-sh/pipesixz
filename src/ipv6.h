@@ -45,6 +45,10 @@
 #define IPV6_NEXT_UDP           17   /* UDP */
 #define IPV6_NEXT_ICMPV6        58   /* ICMPv6 */
 
+/* ICMPv6 message type for path-MTU feedback (RFC 4443, section 3.2) */
+#define ICMPV6_TYPE_PACKET_TOO_BIG  2
+#define ICMPV6_PTB_HEADER_LEN       8
+
 /*
  * pipesix_ipv6_header_t
  *
@@ -104,6 +108,35 @@ int ipv6_parse_header(const uint8_t *data, size_t length,
  *   0 if the packet is well formed, -1 otherwise
  */
 int ipv6_validate_packet(const uint8_t *data, size_t length);
+
+/*
+ * Build an ICMPv6 "Packet Too Big" message for a packet that cannot be
+ * relayed because it exceeds mtu.
+ *
+ * The result is a complete IPv6 packet (header, ICMPv6 header with the
+ * MTU and checksum, and as much of the original packet as fits in the
+ * 1280-byte minimum MTU). A relay that silently dropped an oversized
+ * packet would leave the sender retrying it forever; returning this
+ * message lets the sender's kernel lower its path MTU for the
+ * destination.
+ *
+ * Parameters:
+ *   buf        - Output buffer
+ *   bufsize    - Size of the output buffer
+ *   src        - 16-byte source address (the relay's tunnel address)
+ *   dst        - 16-byte destination address (the sender's inner address)
+ *   mtu        - Largest packet the relay can relay
+ *   packet     - The packet that was too big, quoted back
+ *   packet_len - Length of that packet
+ *
+ * Returns:
+ *   Total packet length on success, 0 when the arguments are invalid or
+ *   the buffer is too small.
+ */
+size_t ipv6_build_packet_too_big(uint8_t *buf, size_t bufsize,
+                                 const uint8_t src[16], const uint8_t dst[16],
+                                 uint32_t mtu,
+                                 const uint8_t *packet, size_t packet_len);
 
 /*
  * Test whether an address falls inside a prefix.
