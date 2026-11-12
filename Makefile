@@ -39,7 +39,7 @@ LDFLAGS  ?=
 # 'make VERSION=...', so a release build carries the tag it was cut from
 # instead of whatever number the source happened to have last year.
 #
-VERSION  ?= 2.3.0
+VERSION  ?= 2.2.5
 
 # Installation paths
 PREFIX      ?= /usr/local
