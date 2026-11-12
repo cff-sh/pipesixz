@@ -1686,9 +1686,13 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
     char ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
     char peers[SERVER_MAX_CLIENTS][96];
     char routes[SERVER_MAX_CLIENTS][INET6_ADDRSTRLEN + 8];
+    char limits[SERVER_MAX_CLIENTS][160];
     uint64_t frames[SERVER_MAX_CLIENTS];
     uint64_t rx_bytes[SERVER_MAX_CLIENTS];
     uint64_t tx_bytes[SERVER_MAX_CLIENTS];
+    uint64_t rate_kbps[SERVER_MAX_CLIENTS];
+    uint64_t quota_mib[SERVER_MAX_CLIENTS];
+    uint64_t quota_remaining[SERVER_MAX_CLIENTS];
     long idle[SERVER_MAX_CLIENTS];
     time_t now = time(NULL);
     time_t started = ctx->stats.started;
@@ -1729,6 +1733,31 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
         frames[count] = session->frames;
         rx_bytes[count] = session->rx_bytes;
         tx_bytes[count] = session->tx_bytes;
+        rate_kbps[count] = 0;
+        quota_mib[count] = 0;
+        quota_remaining[count] = 0;
+        snprintf(limits[count], sizeof(limits[count]), "null");
+
+        if (session->policy_index >= 0) {
+            const pipesix_client_policy_t *policy =
+                &ctx->config->policies[session->policy_index];
+
+            rate_kbps[count] = policy->rate_kbps;
+            quota_mib[count] = policy->quota_mib;
+
+            if (policy->quota_mib > 0) {
+                quota_remaining[count] = policy_quota_remaining(
+                    &ctx->quotas[session->policy_index], policy_day(now));
+            }
+
+            snprintf(limits[count], sizeof(limits[count]),
+                     "{\"rate_kbps\":%llu,\"quota_mib\":%llu,"
+                     "\"quota_remaining_bytes\":%llu}",
+                     (unsigned long long)rate_kbps[count],
+                     (unsigned long long)quota_mib[count],
+                     (unsigned long long)quota_remaining[count]);
+        }
+
         idle[count] = (long)(now - session->last_seen);
         count++;
     }
@@ -1758,12 +1787,30 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
     for (i = 0; i < count; i++) {
         if (server_control_append(reply, size, &used,
                                   "  %s from %s rx=%llu B tx=%llu B "
-                                  "frames=%llu idle=%lds route=%s\n",
+                                  "frames=%llu idle=%lds route=%s",
                                   ids[i], peers[i],
                                   (unsigned long long)rx_bytes[i],
                                   (unsigned long long)tx_bytes[i],
                                   (unsigned long long)frames[i],
                                   idle[i], routes[i]) != 0) {
+            return -1;
+        }
+
+        if (rate_kbps[i] > 0 &&
+            server_control_append(reply, size, &used, " rate=%llu kbit/s",
+                                  (unsigned long long)rate_kbps[i]) != 0) {
+            return -1;
+        }
+
+        if (quota_mib[i] > 0 &&
+            server_control_append(reply, size, &used,
+                                  " quota=%llu MiB/day left=%llu B",
+                                  (unsigned long long)quota_mib[i],
+                                  (unsigned long long)quota_remaining[i]) != 0) {
+            return -1;
+        }
+
+        if (server_control_append(reply, size, &used, "\n") != 0) {
             return -1;
         }
     }
@@ -1795,9 +1842,13 @@ static int server_status_json(server_context_t *ctx, char *reply, size_t size)
     char ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
     char peers[SERVER_MAX_CLIENTS][96];
     char routes[SERVER_MAX_CLIENTS][INET6_ADDRSTRLEN + 12];
+    char limits[SERVER_MAX_CLIENTS][160];
     uint64_t frames[SERVER_MAX_CLIENTS];
     uint64_t rx_bytes[SERVER_MAX_CLIENTS];
     uint64_t tx_bytes[SERVER_MAX_CLIENTS];
+    uint64_t rate_kbps[SERVER_MAX_CLIENTS];
+    uint64_t quota_mib[SERVER_MAX_CLIENTS];
+    uint64_t quota_remaining[SERVER_MAX_CLIENTS];
     long idle[SERVER_MAX_CLIENTS];
     char config_esc[1024];
     char tun_name_esc[256];
@@ -1843,6 +1894,31 @@ static int server_status_json(server_context_t *ctx, char *reply, size_t size)
         frames[count] = session->frames;
         rx_bytes[count] = session->rx_bytes;
         tx_bytes[count] = session->tx_bytes;
+        rate_kbps[count] = 0;
+        quota_mib[count] = 0;
+        quota_remaining[count] = 0;
+        snprintf(limits[count], sizeof(limits[count]), "null");
+
+        if (session->policy_index >= 0) {
+            const pipesix_client_policy_t *policy =
+                &ctx->config->policies[session->policy_index];
+
+            rate_kbps[count] = policy->rate_kbps;
+            quota_mib[count] = policy->quota_mib;
+
+            if (policy->quota_mib > 0) {
+                quota_remaining[count] = policy_quota_remaining(
+                    &ctx->quotas[session->policy_index], policy_day(now));
+            }
+
+            snprintf(limits[count], sizeof(limits[count]),
+                     "{\"rate_kbps\":%llu,\"quota_mib\":%llu,"
+                     "\"quota_remaining_bytes\":%llu}",
+                     (unsigned long long)rate_kbps[count],
+                     (unsigned long long)quota_mib[count],
+                     (unsigned long long)quota_remaining[count]);
+        }
+
         idle[count] = (long)(now - session->last_seen);
         count++;
     }
@@ -1883,11 +1959,12 @@ static int server_status_json(server_context_t *ctx, char *reply, size_t size)
                 reply, size, &used,
                 "%s{\"client_id\":\"%s\",\"peer\":\"%s\","
                 "\"rx_bytes\":%llu,\"tx_bytes\":%llu,\"frames\":%llu,"
-                "\"idle_seconds\":%ld,\"route\":%s}",
+                "\"idle_seconds\":%ld,\"route\":%s,\"limits\":%s}",
                 i > 0 ? "," : "", ids[i], peers[i],
                 (unsigned long long)rx_bytes[i],
                 (unsigned long long)tx_bytes[i],
-                (unsigned long long)frames[i], idle[i], routes[i]) != 0) {
+                (unsigned long long)frames[i], idle[i], routes[i],
+                limits[i]) != 0) {
             goto too_large;
         }
     }

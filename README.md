@@ -168,7 +168,9 @@ sudo pipesix --kick client1 -c /etc/pipesix/pipesix.conf
 
 `--status` prints the mode, configuration path, uptime, the tun and
 listen addresses, one line per session (client id, peer, bytes in and
-out, frames, idle time, return route) and the traffic counters. On a
+out, frames, idle time, return route, and — when the client has them —
+its rate limit and daily quota with the bytes left today) and the
+traffic counters. On a
 client it reports the client id, remote endpoint and its own counters in
 the same shape, so one command works on both ends.
 
@@ -206,9 +208,13 @@ sudo pipesix --status --json -c /etc/pipesix/pipesix.conf | jq .sessions.active
 The server report carries `mode`, `config`, `uptime_seconds`, `tun`,
 `listen`, a `sessions` object (active count, capacity and one entry per
 client with `client_id`, `peer`, `rx_bytes`, `tx_bytes`, `frames`,
-`idle_seconds` and `route`) and `stats`. A client reports `client_id`,
-`remote`, `session` and the same `stats` object. `route` is `null` when the
-client has no `client_route`, and `--json` is only valid with `--status`.
+`idle_seconds`, `route` and `limits`) and `stats`. A client reports
+`client_id`, `remote`, `session` and the same `stats` object. `route` is
+`null` when the client has no `client_route`, and `limits` is `null` unless
+the client has a `client_rate_limit` or `client_quota`; otherwise it is an
+object with `rate_kbps`, `quota_mib` and `quota_remaining_bytes` (the last
+is the budget left for the current UTC day, or `0` without a quota).
+`--json` is only valid with `--status`.
 
 ### Prometheus metrics
 
