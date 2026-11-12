@@ -112,12 +112,16 @@ stats_interval  = 60
 #                  'pipesix --metrics' prints the same body over its UNIX
 #                  socket, so no port is needed for a one-off look.
 # metrics_port:    port for the metrics endpoint (default: 9100)
+# metrics_token:   bearer token required by GET /metrics. Empty (default)
+#                  leaves the endpoint open. GET /healthz never needs it,
+#                  so a probe can stay secret-free.
 #
-# The endpoint has no authentication and exposes client ids and traffic
-# counters, so keep it on localhost or a private interface.
+# The endpoint exposes client ids and traffic counters, so keep it on
+# localhost or a private interface unless metrics_token is set.
 #
 #metrics_address = 127.0.0.1
 #metrics_port    = 9100
+#metrics_token   = <a long random string>
 
 # ---------------------------------------------------------------------------
 # Logging Configuration

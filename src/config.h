@@ -34,6 +34,8 @@
  *   metrics_address  - Address for the Prometheus metrics endpoint
  *                      (empty disables it)
  *   metrics_port     - Port for the Prometheus metrics endpoint
+ *   metrics_token    - Bearer token required by GET /metrics
+ *                      (empty leaves the endpoint open)
  *   log_level        - debug, info, warn, error, fatal
  *
  * SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout,
@@ -144,9 +146,15 @@ typedef struct {
      * Prometheus endpoint. An empty metrics_address disables it; the
      * port is only used when an address is configured. Like bind_address
      * it is applied at startup, so changing it needs a restart.
+     *
+     * metrics_token holds a bearer token: when set, GET /metrics requires
+     * 'Authorization: Bearer <token>'. GET /healthz never does, so a
+     * probe needs no secret. The token is printable ASCII without
+     * whitespace, since it travels in an HTTP header.
      */
     char metrics_address[CONFIG_MAX_ADDRESS];
     int  metrics_port;
+    char metrics_token[CONFIG_MAX_SECRET];
 
     /* Source path, used by the SIGHUP reload */
     char config_path[CONFIG_PATH_MAX];

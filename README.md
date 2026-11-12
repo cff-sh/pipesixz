@@ -220,8 +220,25 @@ metrics_port    = 9100
 ```
 
 The endpoint is off by default and, unlike the control socket, needs a port of
-its own, so bind it to localhost or a private interface: it has no
-authentication and exposes client ids and counters.
+its own. It exposes client ids and traffic counters, so bind it to localhost or
+a private interface, or set `metrics_token` and scrape with a bearer token:
+
+```ini
+metrics_token = <a long random string>
+```
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9100/metrics
+```
+
+Without the header, or with the wrong token, the scrape gets
+`401 Unauthorized` (the same answer for both, so a probe cannot tell a missing
+header from a bad one). `GET /healthz` answers `200 ok` without a token, so a
+load balancer or systemd probe never has to hold the scrape secret:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9100/healthz
+```
 
 ```bash
 curl -s http://127.0.0.1:9100/metrics | grep pipesix_
@@ -262,8 +279,8 @@ control channel, without a listening port:
 sudo pipesix --metrics -c /etc/pipesix/pipesix.conf | grep pipesix_sessions
 ```
 
-Changing `metrics_address` or `metrics_port` needs a restart, like
-`bind_address`; the rest of the settings keep reloading over SIGHUP.
+Changing `metrics_address`, `metrics_port` or `metrics_token` needs a restart,
+like `bind_address`; the rest of the settings keep reloading over SIGHUP.
 
 ### Provisioning clients
 

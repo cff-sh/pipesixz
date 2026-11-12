@@ -254,6 +254,7 @@ static void print_usage(const char *progname)
             "  stats_interval  Stats log interval seconds (default: 60, 0 = off)\n"
             "  metrics_address Metrics endpoint address (empty = disabled)\n"
             "  metrics_port    Metrics endpoint port (default: 9100)\n"
+            "  metrics_token   Bearer token for /metrics (empty = open)\n"
             "  log_level       debug | info | warn | error | fatal\n"
             "\n"
             "Examples:\n"

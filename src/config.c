@@ -465,6 +465,9 @@ static int config_set_value(pipesix_config_t *config, const char *key,
     if (strcmp(key, "metrics_port") == 0) {
         return set_int_range(&config->metrics_port, value, 1, 65535);
     }
+    if (strcmp(key, "metrics_token") == 0) {
+        return copy_string(config->metrics_token, CONFIG_MAX_SECRET, value);
+    }
     if (strcmp(key, "client_id") == 0) {
         if (!valid_client_id(value)) {
             return -1;
@@ -576,6 +579,28 @@ int config_load(const char *path, pipesix_config_t *config)
     return 0;
 }
 
+/*
+ * A bearer token travels in an HTTP header, so it must be printable ASCII
+ * without whitespace: anything else could never match a request and would
+ * silently leave the endpoint open.
+ */
+static int valid_metrics_token(const char *token)
+{
+    const unsigned char *p = (const unsigned char *)token;
+
+    if (token[0] == '\0') {
+        return 1;
+    }
+
+    for (; *p != '\0'; p++) {
+        if (*p <= 0x20 || *p >= 0x7f) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
 int config_validate(const pipesix_config_t *config)
 {
     struct in6_addr parsed_addr;
@@ -630,6 +655,12 @@ int config_validate(const pipesix_config_t *config)
         (config->metrics_port < 1 || config->metrics_port > 65535)) {
         log_error("Configuration validation failed: 'metrics_port' must be 1-65535 (got %d)",
                   config->metrics_port);
+        return -1;
+    }
+
+    if (!valid_metrics_token(config->metrics_token)) {
+        log_error("Configuration validation failed: 'metrics_token' must be "
+                  "printable ASCII without spaces");
         return -1;
     }
 
@@ -806,8 +837,10 @@ void config_dump(const pipesix_config_t *config)
     log_info("  session_timeout = %d s", config->session_timeout);
     log_info("  stats_interval  = %d s", config->stats_interval);
     if (config->metrics_address[0] != '\0') {
-        log_info("  metrics         = %s:%d", config->metrics_address,
-                 config->metrics_port);
+        log_info("  metrics         = %s:%d (%s)", config->metrics_address,
+                 config->metrics_port,
+                 config->metrics_token[0] != '\0' ? "token required"
+                                                  : "no authentication");
     } else {
         log_info("  metrics         = disabled");
     }

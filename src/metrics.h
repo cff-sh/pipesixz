@@ -6,6 +6,10 @@
  * GET /metrics on the TCP address from 'metrics_address' /
  * 'metrics_port'. The endpoint is read-only and disabled by default.
  *
+ * GET /healthz answers '200 ok' whenever the endpoint is listening, which
+ * is the probe a load balancer or systemd wants; it never requires the
+ * 'metrics_token' that GET /metrics can demand.
+ *
  * The body is produced by a callback the client or server registers, so
  * this module owns the HTTP handling and the role owns the numbers: the
  * same counters and session table that --status reports.
@@ -36,7 +40,8 @@ typedef int (*metrics_body_fn)(char *out, size_t out_size, void *arg);
  * Does nothing when 'metrics_address' is empty or the endpoint is
  * already running. A bind or thread failure is logged and reported, but
  * never stops the tunnel: an operator asking for metrics should not lose
- * the tunnel because the port is taken.
+ * the tunnel because the port is taken. The token is copied here, so a
+ * later configuration reload cannot change it mid-flight.
  *
  * Returns:
  *   0  the endpoint is running or deliberately disabled
