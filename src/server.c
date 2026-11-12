@@ -418,6 +418,63 @@ static void send_need_handshake(server_context_t *ctx,
 }
 
 /*
+ * Tell every connected client that the relay is going away.
+ *
+ * Without this a client only notices silence, after peer_timeout (two
+ * minutes by default), so a 'systemctl restart' would black-hole the
+ * tunnel for that long. The frame carries the session's own
+ * server-to-client key, so a spoofed datagram cannot tear a session down
+ * the way a plaintext hint could; it goes out after the worker threads
+ * have stopped, so no data frame can overtake it.
+ */
+static void send_closing_to_sessions(server_context_t *ctx)
+{
+    struct sockaddr_storage addr[SERVER_MAX_CLIENTS];
+    socklen_t addr_len[SERVER_MAX_CLIENTS];
+    uint8_t keys[SERVER_MAX_CLIENTS][PIPESIX_KEY_LEN];
+    int count = 0;
+    int i;
+
+    pthread_mutex_lock(&ctx->lock);
+    for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+        if (!ctx->sessions[i].active || !ctx->sessions[i].established) {
+            continue;
+        }
+        addr[count] = ctx->sessions[i].addr;
+        addr_len[count] = ctx->sessions[i].addr_len;
+        memcpy(keys[count], ctx->sessions[i].tx_key, PIPESIX_KEY_LEN);
+        count++;
+    }
+    pthread_mutex_unlock(&ctx->lock);
+
+    for (i = 0; i < count; i++) {
+        uint8_t frame[PIPESIX_HEADER_SIZE + PIPESIX_AUTH_TAG_SIZE];
+        size_t frame_len;
+
+        frame_len = pipesix_frame_build(frame, sizeof(frame),
+                                        PIPESIX_FLAG_SERVER_CLOSING, ctx->salt,
+                                        next_seq(ctx), NULL, 0, keys[i]);
+        memset(keys[i], 0, PIPESIX_KEY_LEN);
+
+        if (frame_len == 0) {
+            continue;
+        }
+
+        if (sendto(ctx->udp_fd, frame, frame_len, 0,
+                   (const struct sockaddr *)&addr[i], addr_len[i]) !=
+            (ssize_t)frame_len) {
+            log_debug("Failed to send the shutdown notice: %s",
+                      strerror(errno));
+        }
+    }
+
+    if (count > 0) {
+        log_info("Told %d connected client(s) the server is shutting down",
+                 count);
+    }
+}
+
+/*
  * Echo a keepalive back to the client that sent one.
  */
 static void send_keepalive(server_context_t *ctx,
@@ -2026,6 +2083,13 @@ int server_start(pipesix_config_t *config)
 
     pthread_join(sender_thread, NULL);
     log_info("Sender thread joined");
+
+    /*
+     * The session table and the socket are still intact, and no worker can
+     * race a data frame in front of it: tell the clients now, not after
+     * peer_timeout.
+     */
+    send_closing_to_sessions(&ctx);
 
     {
         int i;

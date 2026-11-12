@@ -450,6 +450,21 @@ static void test_frames(void)
                               PIPESIX_FLAG_HANDSHAKE_NEEDED, salt, 12,
                               payload, 1, NULL) == 0,
           "handshake-needed frame must be empty");
+
+    /* The shutdown notice is sealed like a data frame and carries nothing. */
+    frame_len = pipesix_frame_build(frame, sizeof(frame),
+                                    PIPESIX_FLAG_SERVER_CLOSING, salt, 13,
+                                    NULL, 0, key);
+    check(frame_len == PIPESIX_HEADER_SIZE + PIPESIX_AUTH_TAG_SIZE,
+          "server-closing frame is sealed and empty");
+    check(pipesix_frame_parse(frame, frame_len, &parsed, key) == PIPESIX_OK &&
+              (parsed.flags & PIPESIX_FLAG_SERVER_CLOSING) != 0 &&
+              parsed.payload_len == 0,
+          "server-closing frame parsed");
+    check(pipesix_frame_build(frame, sizeof(frame),
+                              PIPESIX_FLAG_SERVER_CLOSING, salt, 14,
+                              payload, 1, key) == 0,
+          "server-closing frame must be empty");
 }
 
 /*

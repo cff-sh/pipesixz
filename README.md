@@ -20,7 +20,9 @@ Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] �
   (`client_route`), longest match first
 - Client keepalives, echoed by the server for liveness
 - Automatic client reconnect with DNS re-resolution and backoff when the
-  peer goes silent (`peer_timeout`)
+  peer goes silent (`peer_timeout`). A relay that shuts down tells each
+  client so in its own session, so a restart on the server reconnects in
+  seconds instead of waiting out the timeout
 - Automatic session renegotiation: a client re-handshakes when the server asks
   it to or after reconnecting, so a restart on either side never leaves a
   stale session blocking the tunnel

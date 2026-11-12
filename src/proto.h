@@ -33,6 +33,9 @@
  *   PIPESIX_FLAG_HANDSHAKE_RESP    - server handshake response
  *   PIPESIX_FLAG_HANDSHAKE_NEEDED  - server asks the client to handshake,
  *                                    payload length must be 0
+ *   PIPESIX_FLAG_SERVER_CLOSING    - server is shutting down and the
+ *                                    client should reconnect at once,
+ *                                    payload length must be 0
  *
  * Handshake
  * ---------
@@ -85,10 +88,12 @@
 #define PIPESIX_FLAG_HANDSHAKE_INIT  0x0004u
 #define PIPESIX_FLAG_HANDSHAKE_RESP  0x0008u
 #define PIPESIX_FLAG_HANDSHAKE_NEEDED 0x0010u
+#define PIPESIX_FLAG_SERVER_CLOSING  0x0020u
 #define PIPESIX_FLAG_KNOWN          (PIPESIX_FLAG_AUTH | PIPESIX_FLAG_KEEPALIVE | \
                                      PIPESIX_FLAG_HANDSHAKE_INIT | \
                                      PIPESIX_FLAG_HANDSHAKE_RESP | \
-                                     PIPESIX_FLAG_HANDSHAKE_NEEDED)
+                                     PIPESIX_FLAG_HANDSHAKE_NEEDED | \
+                                     PIPESIX_FLAG_SERVER_CLOSING)
 
 /* Fixed header size on the wire */
 #define PIPESIX_HEADER_SIZE         24

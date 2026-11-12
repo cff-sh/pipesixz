@@ -72,6 +72,7 @@ typedef struct {
     _Atomic int        keepalive;
     _Atomic int        stop_workers;
     _Atomic int        handshake_needed;
+    _Atomic int        server_closing;
     pipesix_replay_t   replay;
     pipesix_stats_t    stats;
 } client_context_t;
@@ -430,6 +431,12 @@ static void *reverse_loop(void *arg)
             continue;
         }
 
+        if ((frame.flags & PIPESIX_FLAG_SERVER_CLOSING) != 0) {
+            log_info("Server is shutting down; reconnecting");
+            atomic_store(&ctx->server_closing, 1);
+            continue;
+        }
+
         if (ipv6_validate_packet(frame.payload, frame.payload_len) != 0) {
             log_debug("Dropping frame with invalid IPv6 payload");
             stats_add_invalid(&ctx->stats);
@@ -773,6 +780,7 @@ int client_start(pipesix_config_t *config)
     atomic_init(&ctx.keepalive, config->keepalive);
     atomic_init(&ctx.stop_workers, 0);
     atomic_init(&ctx.handshake_needed, 0);
+    atomic_init(&ctx.server_closing, 0);
     pipesix_replay_reset(&ctx.replay);
     stats_init(&ctx.stats);
 
@@ -925,6 +933,44 @@ int client_start(pipesix_config_t *config)
                 workers_running = 1;
                 last_report = now;
                 continue;
+            }
+
+            /*
+             * The server announced its own shutdown. Its port is about to
+             * stop answering, so waiting out peer_timeout would only keep
+             * the tunnel dead for minutes: reconnect right away, with the
+             * usual backoff if the relay is not back yet.
+             */
+            if (atomic_exchange_explicit(&ctx.server_closing, 0,
+                                         memory_order_relaxed) != 0) {
+                log_info("Server closed the session; reconnecting");
+
+                stop_workers(&ctx, &forward_thread, &reverse_thread);
+                workers_running = 0;
+
+                psix_close(ctx.udp_fd);
+                ctx.udp_fd = PSIX_INVALID_SOCKET;
+
+                if (reconnect_peer(&ctx) != 0) {
+                    break;
+                }
+
+                if (renegotiate(&ctx) != 0) {
+                    break;
+                }
+
+                if (start_workers(&ctx, &forward_thread,
+                                  &reverse_thread) != 0) {
+                    metrics_stop();
+                    control_stop();
+                    psix_close(ctx.udp_fd);
+                    tun_close(&tun);
+                    return -1;
+                }
+                workers_running = 1;
+                last_report = now;
+
+                log_info("Client reconnected");
             }
 
             keepalive = atomic_load(&ctx.keepalive);
