@@ -134,6 +134,7 @@ static void config_set_defaults(pipesix_config_t *config)
     config->session_timeout = CONFIG_DEFAULT_SESSION_TIMEOUT;
     config->peer_timeout   = CONFIG_DEFAULT_PEER_TIMEOUT;
     config->stats_interval = CONFIG_DEFAULT_STATS_INTERVAL;
+    config->metrics_port   = CONFIG_DEFAULT_METRICS_PORT;
     config->log_level      = CONFIG_DEFAULT_LOG_LEVEL;
 }
 
@@ -457,6 +458,13 @@ static int config_set_value(pipesix_config_t *config, const char *key,
     if (strcmp(key, "stats_interval") == 0) {
         return set_int_range(&config->stats_interval, value, 0, 86400);
     }
+    if (strcmp(key, "metrics_address") == 0) {
+        return copy_string(config->metrics_address, CONFIG_MAX_ADDRESS,
+                           value);
+    }
+    if (strcmp(key, "metrics_port") == 0) {
+        return set_int_range(&config->metrics_port, value, 1, 65535);
+    }
     if (strcmp(key, "client_id") == 0) {
         if (!valid_client_id(value)) {
             return -1;
@@ -615,6 +623,13 @@ int config_validate(const pipesix_config_t *config)
     if (config->peer_timeout < 0 || config->peer_timeout > 86400) {
         log_error("Configuration validation failed: 'peer_timeout' must be 0-86400 (got %d)",
                   config->peer_timeout);
+        return -1;
+    }
+
+    if (config->metrics_address[0] != '\0' &&
+        (config->metrics_port < 1 || config->metrics_port > 65535)) {
+        log_error("Configuration validation failed: 'metrics_port' must be 1-65535 (got %d)",
+                  config->metrics_port);
         return -1;
     }
 
@@ -790,6 +805,12 @@ void config_dump(const pipesix_config_t *config)
     log_info("  peer_timeout    = %d s", config->peer_timeout);
     log_info("  session_timeout = %d s", config->session_timeout);
     log_info("  stats_interval  = %d s", config->stats_interval);
+    if (config->metrics_address[0] != '\0') {
+        log_info("  metrics         = %s:%d", config->metrics_address,
+                 config->metrics_port);
+    } else {
+        log_info("  metrics         = disabled");
+    }
     log_info("  log_level       = %s", level_str);
 }
 

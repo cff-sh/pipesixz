@@ -6,6 +6,7 @@
 #include "logger.h"
 
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 
@@ -163,6 +164,151 @@ void stats_format_json(const pipesix_stats_t *stats, const char *role,
              atomic_load_explicit(&stats->errors, memory_order_relaxed),
              last_rx);
 }
+
+/*
+ * Append one line to a Prometheus body.
+ *
+ * The format attribute makes every call site compile-checked; the pragma
+ * covers the vsnprintf() inside, which necessarily receives the format as
+ * a parameter.
+ */
+static int prometheus_append(char *out, size_t out_size, size_t *used,
+                             const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+
+static int prometheus_append(char *out, size_t out_size, size_t *used,
+                             const char *fmt, ...)
+{
+    va_list args;
+    int n;
+
+    if (*used >= out_size) {
+        return -1;
+    }
+
+    va_start(args, fmt);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+    n = vsnprintf(out + *used, out_size - *used, fmt, args);
+#pragma GCC diagnostic pop
+    va_end(args);
+
+    if (n < 0 || (size_t)n >= out_size - *used) {
+        return -1;
+    }
+
+    *used += (size_t)n;
+    return 0;
+}
+
+#define PROM_APPEND(...)                                                      \
+    do {                                                                      \
+        if (prometheus_append(out, out_size, &used, __VA_ARGS__) != 0) {      \
+            return -1;                                                        \
+        }                                                                     \
+    } while (0)
+
+int stats_format_prometheus(const pipesix_stats_t *stats, const char *role,
+                            char *out, size_t out_size)
+{
+    const char *mode = (role != NULL) ? role : "unknown";
+    time_t now;
+    unsigned long uptime;
+    size_t used = 0;
+
+    if (stats == NULL || out == NULL || out_size == 0) {
+        return -1;
+    }
+
+    out[0] = '\0';
+
+    now = time(NULL);
+    uptime = (now > stats->started) ? (unsigned long)(now - stats->started)
+                                    : 0ul;
+
+    PROM_APPEND("# HELP pipesix_uptime_seconds Seconds since this instance "
+                 "started.\n# TYPE pipesix_uptime_seconds gauge\n"
+                 "pipesix_uptime_seconds{mode=\"%s\"} %lu\n",
+                 mode, uptime);
+
+    PROM_APPEND("# HELP pipesix_tx_packets_total Packets sent toward the "
+                 "peer.\n# TYPE pipesix_tx_packets_total counter\n"
+                 "pipesix_tx_packets_total{mode=\"%s\"} %" PRIu64 "\n",
+                 mode,
+                 atomic_load_explicit(&stats->tx_packets,
+                                      memory_order_relaxed));
+
+    PROM_APPEND("# HELP pipesix_tx_bytes_total Bytes sent toward the peer.\n"
+                 "# TYPE pipesix_tx_bytes_total counter\n"
+                 "pipesix_tx_bytes_total{mode=\"%s\"} %" PRIu64 "\n",
+                 mode,
+                 atomic_load_explicit(&stats->tx_bytes,
+                                      memory_order_relaxed));
+
+    PROM_APPEND("# HELP pipesix_rx_packets_total Packets accepted from the "
+                 "peer.\n# TYPE pipesix_rx_packets_total counter\n"
+                 "pipesix_rx_packets_total{mode=\"%s\"} %" PRIu64 "\n",
+                 mode,
+                 atomic_load_explicit(&stats->rx_packets,
+                                      memory_order_relaxed));
+
+    PROM_APPEND("# HELP pipesix_rx_bytes_total Bytes accepted from the "
+                 "peer.\n# TYPE pipesix_rx_bytes_total counter\n"
+                 "pipesix_rx_bytes_total{mode=\"%s\"} %" PRIu64 "\n",
+                 mode,
+                 atomic_load_explicit(&stats->rx_bytes,
+                                      memory_order_relaxed));
+
+    PROM_APPEND("# HELP pipesix_dropped_total Packets dropped for lack of a "
+                 "route or session.\n# TYPE pipesix_dropped_total counter\n"
+                 "pipesix_dropped_total{mode=\"%s\"} %" PRIu64 "\n",
+                 mode,
+                 atomic_load_explicit(&stats->dropped,
+                                      memory_order_relaxed));
+
+    PROM_APPEND("# HELP pipesix_invalid_total Rejected datagrams: bad "
+                 "header, length, flags or payload.\n"
+                 "# TYPE pipesix_invalid_total counter\n"
+                 "pipesix_invalid_total{mode=\"%s\"} %" PRIu64 "\n",
+                 mode,
+                 atomic_load_explicit(&stats->invalid,
+                                      memory_order_relaxed));
+
+    PROM_APPEND("# HELP pipesix_auth_failures_total Handshakes and frames "
+                 "that failed authentication.\n"
+                 "# TYPE pipesix_auth_failures_total counter\n"
+                 "pipesix_auth_failures_total{mode=\"%s\"} %" PRIu64 "\n",
+                 mode,
+                 atomic_load_explicit(&stats->auth_failures,
+                                      memory_order_relaxed));
+
+    PROM_APPEND("# HELP pipesix_replayed_total Frames rejected by the "
+                 "anti-replay window.\n# TYPE pipesix_replayed_total counter\n"
+                 "pipesix_replayed_total{mode=\"%s\"} %" PRIu64 "\n",
+                 mode,
+                 atomic_load_explicit(&stats->replayed,
+                                      memory_order_relaxed));
+
+    PROM_APPEND("# HELP pipesix_errors_total Local socket, TUN and thread "
+                 "errors.\n# TYPE pipesix_errors_total counter\n"
+                 "pipesix_errors_total{mode=\"%s\"} %" PRIu64 "\n",
+                 mode,
+                 atomic_load_explicit(&stats->errors,
+                                      memory_order_relaxed));
+
+    PROM_APPEND("# HELP pipesix_last_rx_timestamp_seconds Unix time of the "
+                 "last accepted packet, 0 while nothing has been "
+                 "received.\n# TYPE pipesix_last_rx_timestamp_seconds gauge\n"
+                 "pipesix_last_rx_timestamp_seconds{mode=\"%s\"} %" PRIu64
+                 "\n",
+                 mode,
+                 atomic_load_explicit(&stats->last_rx,
+                                      memory_order_relaxed));
+
+    return 0;
+}
+
+#undef PROM_APPEND
 
 void stats_dump(const pipesix_stats_t *stats, const char *role)
 {

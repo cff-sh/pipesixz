@@ -31,6 +31,9 @@
  *   peer_timeout     - Client dead-peer timeout in seconds (0 disables)
  *   allow_client     - Server allow-list of client IPs (comma separated)
  *   stats_interval   - Periodic stats log interval in seconds (0 disables)
+ *   metrics_address  - Address for the Prometheus metrics endpoint
+ *                      (empty disables it)
+ *   metrics_port     - Port for the Prometheus metrics endpoint
  *   log_level        - debug, info, warn, error, fatal
  *
  * SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout,
@@ -75,6 +78,7 @@
 #define CONFIG_DEFAULT_SESSION_TIMEOUT   120
 #define CONFIG_DEFAULT_STATS_INTERVAL    60
 #define CONFIG_DEFAULT_PEER_TIMEOUT      120
+#define CONFIG_DEFAULT_METRICS_PORT      9100
 
 /*
  * Per-client credential: a stable identity, its own pre-shared key, and
@@ -135,6 +139,14 @@ typedef struct {
     /* Observability */
     int  stats_interval;                     /* Periodic stats interval */
     log_level_t log_level;                   /* Minimum log level */
+
+    /*
+     * Prometheus endpoint. An empty metrics_address disables it; the
+     * port is only used when an address is configured. Like bind_address
+     * it is applied at startup, so changing it needs a restart.
+     */
+    char metrics_address[CONFIG_MAX_ADDRESS];
+    int  metrics_port;
 
     /* Source path, used by the SIGHUP reload */
     char config_path[CONFIG_PATH_MAX];

@@ -1479,6 +1479,44 @@ static void test_stats_json(void)
           "stats JSON carries the receive timestamp");
 }
 
+/*
+ * The Prometheus body is what a scraper parses, so check the wire shape
+ * rather than the exact formatting: a TYPE line per metric, the mode
+ * label, and values that match the counters.
+ */
+static void test_stats_prometheus(void)
+{
+    pipesix_stats_t stats;
+    char body[4096];
+
+    stats_init(&stats);
+    stats_add_tx(&stats, 100);
+    stats_add_rx(&stats, 40);
+    stats_add_dropped(&stats);
+
+    check(stats_format_prometheus(&stats, "server", body, sizeof(body)) == 0,
+          "prometheus body formats");
+    check(strstr(body, "# TYPE pipesix_tx_packets_total counter") != NULL,
+          "prometheus metrics carry TYPE lines");
+    check(strstr(body, "pipesix_tx_packets_total{mode=\"server\"} 1") != NULL,
+          "prometheus reports one transmitted packet");
+    check(strstr(body, "pipesix_tx_bytes_total{mode=\"server\"} 100") != NULL,
+          "prometheus reports transmitted bytes");
+    check(strstr(body, "pipesix_rx_bytes_total{mode=\"server\"} 40") != NULL,
+          "prometheus reports received bytes");
+    check(strstr(body, "pipesix_dropped_total{mode=\"server\"} 1") != NULL,
+          "prometheus reports dropped packets");
+    check(strstr(body,
+                 "pipesix_last_rx_timestamp_seconds{mode=\"server\"} ") !=
+              NULL,
+          "prometheus reports last_rx as a timestamp");
+    check(body[0] != '\0' && body[strlen(body) - 1] == '\n',
+          "prometheus body ends with a newline");
+
+    check(stats_format_prometheus(&stats, "client", body, 16) != 0,
+          "prometheus formatting reports a buffer that is too small");
+}
+
 int main(void)
 {
     logger_init(NULL);
@@ -1508,6 +1546,7 @@ int main(void)
     test_allow_client();
     test_client_provisioning();
     test_stats_json();
+    test_stats_prometheus();
 
     printf("%d checks, %d failure(s)\n", g_checks, g_failures);
     return (g_failures == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

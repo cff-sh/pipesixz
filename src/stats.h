@@ -71,6 +71,19 @@ void stats_format_json(const pipesix_stats_t *stats, const char *role,
                        char *out, size_t out_size);
 
 /*
+ * Format the same counters as a Prometheus text body.
+ *
+ * Every metric carries a mode="client" or mode="server" label, so one
+ * scrape config can tell the two roles apart. last_rx is exported as a
+ * Unix timestamp that stays 0 until something is received.
+ *
+ * Returns:
+ *   0 on success, -1 when the body does not fit (out is then partial)
+ */
+int stats_format_prometheus(const pipesix_stats_t *stats, const char *role,
+                            char *out, size_t out_size);
+
+/*
  * Log a one-line summary at INFO level.
  *
  * Parameters:
