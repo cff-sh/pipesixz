@@ -136,6 +136,7 @@ static void config_set_defaults(pipesix_config_t *config)
     config->stats_interval = CONFIG_DEFAULT_STATS_INTERVAL;
     config->metrics_port   = CONFIG_DEFAULT_METRICS_PORT;
     config->log_level      = CONFIG_DEFAULT_LOG_LEVEL;
+    config->policy_count   = 0;
 }
 
 int config_parse_log_level(const char *str, log_level_t *level)
@@ -406,6 +407,115 @@ const pipesix_client_cred_t *config_find_client(const pipesix_config_t *config,
 }
 
 /*
+ * Find or create the policy entry for a client id.
+ *
+ * Returns NULL when the table is full.
+ */
+static pipesix_client_policy_t *policy_entry(pipesix_config_t *config,
+                                             const char *id)
+{
+    int i;
+
+    for (i = 0; i < config->policy_count; i++) {
+        if (strcmp(config->policies[i].id, id) == 0) {
+            return &config->policies[i];
+        }
+    }
+
+    if (config->policy_count >= CONFIG_MAX_CLIENTS) {
+        log_error("At most %d clients can have per-client limits",
+                  CONFIG_MAX_CLIENTS);
+        return NULL;
+    }
+
+    i = config->policy_count++;
+    memset(&config->policies[i], 0, sizeof(config->policies[i]));
+    snprintf(config->policies[i].id, sizeof(config->policies[i].id), "%s",
+             id);
+
+    return &config->policies[i];
+}
+
+/*
+ * Parse "client_rate_limit = <id> <kbit/s>" or
+ * "client_quota = <id> <MiB per UTC day>".
+ *
+ * The 'client' line must come first, like 'client_route', so a typo in the
+ * id is an error instead of a limit that silently never applies.
+ */
+static int set_client_policy(pipesix_config_t *config, const char *value,
+                             int quota)
+{
+    pipesix_client_policy_t *policy;
+    char work[CONFIG_MAX_CLIENT_ID + 32];
+    char *id;
+    char *number;
+    size_t len;
+    int parsed;
+
+    if (value == NULL) return -1;
+
+    len = strlen(value);
+    if (len == 0 || len >= sizeof(work)) return -1;
+    memcpy(work, value, len + 1);
+
+    id = work;
+    while (isspace((unsigned char)*id)) id++;
+
+    number = id;
+    while (*number != '\0' && !isspace((unsigned char)*number)) number++;
+    if (*number == '\0') return -1; /* Missing value. */
+    *number = '\0';
+    number++;
+    while (isspace((unsigned char)*number)) number++;
+
+    len = strlen(number);
+    while (len > 0 && isspace((unsigned char)number[len - 1])) {
+        number[--len] = '\0';
+    }
+
+    if (!valid_client_id(id)) return -1;
+    if (parse_int(number, &parsed) != 0 || parsed < 0) return -1;
+
+    if (quota) {
+        if (parsed > 1048576) {         /* 1 TiB per day */
+            log_error("client_quota: '%d' MiB is too large", parsed);
+            return -1;
+        }
+    } else if (parsed > 100000000) {    /* 100 Gbit/s */
+        log_error("client_rate_limit: '%d' kbit/s is too large", parsed);
+        return -1;
+    }
+
+    if (config_find_client(config, id) == NULL) {
+        log_error("%s: unknown client '%s' (the 'client' line must come "
+                  "before its limits)",
+                  quota ? "client_quota" : "client_rate_limit", id);
+        return -1;
+    }
+
+    policy = policy_entry(config, id);
+    if (policy == NULL) return -1;
+
+    if (quota) {
+        if (policy->quota_mib != 0) {
+            log_error("client_quota: client '%s' already has a quota", id);
+            return -1;
+        }
+        policy->quota_mib = (uint64_t)parsed;
+    } else {
+        if (policy->rate_kbps != 0) {
+            log_error("client_rate_limit: client '%s' already has a rate",
+                      id);
+            return -1;
+        }
+        policy->rate_kbps = (uint64_t)parsed;
+    }
+
+    return 0;
+}
+
+/*
  * Process a single key=value line and update the configuration.
  *
  * Returns 0 on success, -1 if the value is invalid or too long.
@@ -480,6 +590,12 @@ static int config_set_value(pipesix_config_t *config, const char *key,
     }
     if (strcmp(key, "client_route") == 0) {
         return set_client_route(config, value);
+    }
+    if (strcmp(key, "client_rate_limit") == 0) {
+        return set_client_policy(config, value, 0);
+    }
+    if (strcmp(key, "client_quota") == 0) {
+        return set_client_policy(config, value, 1);
     }
     if (strcmp(key, "log_level") == 0) {
         log_level_t level;
@@ -831,6 +947,13 @@ void config_dump(const pipesix_config_t *config)
             log_info("    client: %s route %s/%d", config->clients[i].id,
                      prefix_str, config->clients[i].prefix_len);
         }
+
+        for (i = 0; i < config->policy_count; i++) {
+            log_info("    limits: %s rate %llu kbit/s, quota %llu MiB/day",
+                     config->policies[i].id,
+                     (unsigned long long)config->policies[i].rate_kbps,
+                     (unsigned long long)config->policies[i].quota_mib);
+        }
     }
     log_info("  keepalive       = %d s", config->keepalive);
     log_info("  peer_timeout    = %d s", config->peer_timeout);
@@ -1179,9 +1302,10 @@ int config_rotate_all_keys(pipesix_config_t *config)
 }
 
 /*
- * Does this configuration line define or route 'id'?
+ * Does this configuration line define, route or limit 'id'?
  *
- * Matches 'client = <id>: <secret>' and 'client_route = <id> <prefix>'.
+ * Matches 'client = <id>: <secret>', 'client_route = <id> <prefix>',
+ * 'client_rate_limit = <id> <kbit/s>' and 'client_quota = <id> <MiB>'.
  * The same conservative parser as the rest of the file: the key token is
  * read up to '=' or whitespace, and the id up to ':' or whitespace.
  */
@@ -1208,7 +1332,9 @@ static int line_belongs_to_client(const char *line, const char *id)
     }
 
     if (!((key_len == 6u && memcmp(p, "client", 6) == 0) ||
-          (key_len == 12u && memcmp(p, "client_route", 12) == 0))) {
+          (key_len == 12u && memcmp(p, "client_route", 12) == 0) ||
+          (key_len == 12u && memcmp(p, "client_quota", 12) == 0) ||
+          (key_len == 17u && memcmp(p, "client_rate_limit", 17) == 0))) {
         return 0;
     }
 

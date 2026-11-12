@@ -87,6 +87,16 @@ secret    = replace-this-with-pipesix-genkey-output
 #
 #client_route = client1 2001:db8:1::2/128  # keep it inside tun_address' prefix
 #client_route = client2 2001:db8:1:2::/64
+#
+# Per-client limits (server mode, optional). Both apply in both
+# directions, are read at startup only, and take the client id first.
+# 0 means unlimited and the default is no entry at all.
+#
+#   client_rate_limit = <id> <kbit/s>    e.g. 50000 = 50 Mbit/s
+#   client_quota      = <id> <MiB/day>   e.g. 10240 = 10 GiB per day
+#
+#client_rate_limit = client1 50000
+#client_quota      = client1 10240
 
 # ---------------------------------------------------------------------------
 # Reliability

@@ -37,6 +37,7 @@
 #include "ipv6.h"
 #include "logger.h"
 #include "metrics.h"
+#include "policy.h"
 #include "proto.h"
 #include "runtime.h"
 #include "stats.h"
@@ -84,6 +85,11 @@ typedef struct {
     int                     route_warned;
     /* Set once the client was told its packet exceeded the relay MTU. */
     int                     mtu_warned;
+    /* Per-client limits, resolved from the configuration at handshake. */
+    int                     policy_index;   /* -1 = no limits configured */
+    int                     policy_warned;  /* logged once per session */
+    pipesix_bucket_t        rx_bucket;
+    pipesix_bucket_t        tx_bucket;
 } server_session_t;
 
 typedef struct {
@@ -99,11 +105,30 @@ typedef struct {
     int                hint_count;
     pthread_mutex_t    lock;
     pipesix_stats_t    stats;
+    /* One quota per configured policy, indexed by session->policy_index. */
+    pipesix_quota_t    quotas[CONFIG_MAX_CLIENTS];
 } server_context_t;
 
 static uint64_t next_seq(server_context_t *ctx)
 {
     return atomic_fetch_add_explicit(&ctx->seq, 1, memory_order_relaxed);
+}
+
+/*
+ * Resolve a client id to its configured policy entry, or -1 when it has
+ * none. The quota table in the context is indexed the same way.
+ */
+static int policy_lookup(const pipesix_config_t *config, const char *id)
+{
+    int i;
+
+    for (i = 0; i < config->policy_count; i++) {
+        if (strcmp(config->policies[i].id, id) == 0) {
+            return i;
+        }
+    }
+
+    return -1;
 }
 
 static int sockaddr_equal(const struct sockaddr_storage *a,
@@ -649,6 +674,23 @@ static void handle_handshake_init(server_context_t *ctx,
         ctx->sessions[slot].route_warned = 0;
         ctx->sessions[slot].mtu_warned = 0;
         pipesix_replay_reset(&ctx->sessions[slot].replay);
+
+        {
+            int policy = policy_lookup(ctx->config, id);
+            uint64_t rate_bps = 0;
+
+            ctx->sessions[slot].policy_index = policy;
+            ctx->sessions[slot].policy_warned = 0;
+
+            if (policy >= 0) {
+                rate_bps = ctx->config->policies[policy].rate_kbps * 125u;
+            }
+
+            policy_bucket_init(&ctx->sessions[slot].rx_bucket, rate_bps,
+                               policy_now_ms());
+            policy_bucket_init(&ctx->sessions[slot].tx_bucket, rate_bps,
+                               policy_now_ms());
+        }
     }
 
     memcpy(ctx->sessions[slot].prefix, cred_copy.prefix,
@@ -1101,6 +1143,10 @@ static void *receiver_loop(void *arg)
         uint8_t mismatch_prefix[16];
         int mismatch_prefix_len = 0;
         int mismatch = 0;
+        char policy_id[CONFIG_MAX_CLIENT_ID];
+        uint64_t policy_rate = 0;
+        uint64_t policy_quota = 0;
+        int policy_warn = 0;
 
         ready = poll(&pfd, 1, POLL_INTERVAL_MS);
         if (ready < 0) {
@@ -1196,6 +1242,57 @@ static void *receiver_loop(void *arg)
         ctx->sessions[slot].last_seen = now;
         ctx->sessions[slot].frames++;
         ctx->sessions[slot].rx_bytes += (uint64_t)frame.payload_len;
+
+        /*
+         * Per-client limits are applied to forwarded data only, and before
+         * the TUN write so a throttled client never reaches the upstream.
+         * The bucket belongs to this session and this thread; the daily
+         * quota is shared with the sender, which is why it is atomic.
+         */
+        if ((frame.flags & PIPESIX_FLAG_KEEPALIVE) == 0 &&
+            frame.payload_len > 0) {
+            server_session_t *session = &ctx->sessions[slot];
+            int allowed;
+
+            allowed = policy_bucket_allow(&session->rx_bucket,
+                                          frame.payload_len,
+                                          policy_now_ms());
+
+            if (allowed && session->policy_index >= 0 &&
+                !policy_quota_charge(&ctx->quotas[session->policy_index],
+                                     frame.payload_len, policy_day(now))) {
+                allowed = 0;
+            }
+
+            if (!allowed) {
+                if (!session->policy_warned) {
+                    session->policy_warned = 1;
+                    policy_warn = 1;
+                    snprintf(policy_id, sizeof(policy_id), "%s",
+                             session->client_id);
+                    if (session->policy_index >= 0) {
+                        policy_rate =
+                            ctx->config->policies[session->policy_index]
+                                .rate_kbps;
+                        policy_quota =
+                            ctx->config->policies[session->policy_index]
+                                .quota_mib;
+                    }
+                }
+
+                pthread_mutex_unlock(&ctx->lock);
+
+                if (policy_warn) {
+                    log_warn("Client '%s' exceeded its per-client limits; "
+                             "dropping traffic (rate %llu kbit/s, quota "
+                             "%llu MiB/day)",
+                             policy_id, (unsigned long long)policy_rate,
+                             (unsigned long long)policy_quota);
+                }
+                stats_add_throttled(&ctx->stats);
+                continue;
+            }
+        }
 
         /*
          * A client whose inner source address falls outside the route it
@@ -1324,6 +1421,11 @@ static void *sender_loop(void *arg)
         int slot;
         uint64_t seq;
         size_t frame_len;
+        char denied_id[CONFIG_MAX_CLIENT_ID];
+        uint64_t policy_rate = 0;
+        uint64_t policy_quota = 0;
+        int denied = 0;
+        int denied_warn = 0;
 
         ready = poll(&pfd, 1, POLL_INTERVAL_MS);
         if (ready < 0) {
@@ -1365,18 +1467,66 @@ static void *sender_loop(void *arg)
             slot = sole_session(ctx);
         }
 
+        /*
+         * Egress policy: the client pays for return traffic too. Checked
+         * before the key is copied, so a throttled packet never touches
+         * the crypto path.
+         */
         if (slot >= 0) {
-            dest = ctx->sessions[slot].addr;
-            dest_len = ctx->sessions[slot].addr_len;
-            memcpy(key, ctx->sessions[slot].tx_key, sizeof(key));
-            /*
-             * Counted when the packet is handed to sendto(); attributing
-             * a rare send failure would need a second pass over the lock.
-             */
-            ctx->sessions[slot].tx_bytes += (uint64_t)nread;
+            server_session_t *session = &ctx->sessions[slot];
+            int allowed;
+
+            allowed = policy_bucket_allow(&session->tx_bucket,
+                                          (size_t)nread, policy_now_ms());
+
+            if (allowed && session->policy_index >= 0 &&
+                !policy_quota_charge(&ctx->quotas[session->policy_index],
+                                     (size_t)nread, policy_day(time(NULL)))) {
+                allowed = 0;
+            }
+
+            if (!allowed) {
+                denied = 1;
+                if (!session->policy_warned) {
+                    session->policy_warned = 1;
+                    denied_warn = 1;
+                    snprintf(denied_id, sizeof(denied_id), "%s",
+                             session->client_id);
+                    if (session->policy_index >= 0) {
+                        policy_rate =
+                            ctx->config->policies[session->policy_index]
+                                .rate_kbps;
+                        policy_quota =
+                            ctx->config->policies[session->policy_index]
+                                .quota_mib;
+                    }
+                }
+            } else {
+                dest = session->addr;
+                dest_len = session->addr_len;
+                memcpy(key, session->tx_key, sizeof(key));
+                /*
+                 * Counted when the packet is handed to sendto();
+                 * attributing a rare send failure would need a second pass
+                 * over the lock.
+                 */
+                session->tx_bytes += (uint64_t)nread;
+            }
         }
 
         pthread_mutex_unlock(&ctx->lock);
+
+        if (denied) {
+            if (denied_warn) {
+                log_warn("Client '%s' exceeded its per-client limits; "
+                         "dropping traffic (rate %llu kbit/s, quota "
+                         "%llu MiB/day)",
+                         denied_id, (unsigned long long)policy_rate,
+                         (unsigned long long)policy_quota);
+            }
+            stats_add_throttled(&ctx->stats);
+            continue;
+        }
 
         if (slot < 0) {
             stats_add_dropped(&ctx->stats);
@@ -2003,6 +2153,17 @@ int server_start(pipesix_config_t *config)
     ctx.salt = salt;
     stats_init(&ctx.stats);
 
+    {
+        int i;
+
+        /* One accounting entry per policy, indexed like config->policies. */
+        for (i = 0; i < config->policy_count; i++) {
+            uint64_t limit = config->policies[i].quota_mib * 1048576u;
+
+            policy_quota_init(&ctx.quotas[i], limit);
+        }
+    }
+
     rc = pthread_mutex_init(&ctx.lock, NULL);
     if (rc != 0) {
         log_error("Failed to initialize session mutex: %s", strerror(rc));
@@ -2046,9 +2207,10 @@ int server_start(pipesix_config_t *config)
 
         log_info("Server tunnel ready (crypto=chacha20-poly1305, "
                  "clients=%d, routed=%d, max_clients=%d, "
-                 "session_timeout=%ds, allow_client=%d)",
+                 "session_timeout=%ds, allow_client=%d, policies=%d)",
                  config->client_count, routed, SERVER_MAX_CLIENTS,
-                 config->session_timeout, config->allow_client_count);
+                 config->session_timeout, config->allow_client_count,
+                 config->policy_count);
     }
     log_info("Server is running. Send SIGINT/SIGTERM to stop, "
              "SIGUSR1 for stats, SIGHUP to reload.");

@@ -26,6 +26,8 @@
  *   client           - <id>: <secret> credential (server mode, repeatable)
  *   client_route     - <id> <ipv6[/len]> inner prefix for return traffic
  *                      (server mode, repeatable, follows its client line)
+ *   client_rate_limit - <id> <kbit/s> bandwidth cap (server, repeatable)
+ *   client_quota     - <id> <MiB> bytes per UTC day (server, repeatable)
  *   keepalive        - Client keepalive interval in seconds (0 disables)
  *   session_timeout  - Server session idle timeout in seconds (0 disables)
  *   peer_timeout     - Client dead-peer timeout in seconds (0 disables)
@@ -41,8 +43,8 @@
  * SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout,
  * stats_interval and the credentials from the original configuration
  * file: the client table in server mode, this client's own client_id and
- * secret in client mode. Changes to the interface, endpoints, mode or
- * allow_client require a restart.
+ * secret in client mode. Changes to the interface, endpoints, mode,
+ * allow_client or the per-client limits require a restart.
  */
 
 #ifndef PIPESIX_CONFIG_H
@@ -96,6 +98,17 @@ typedef struct {
 } pipesix_client_cred_t;
 
 /*
+ * Optional per-client limits, applied by the server in both directions.
+ * rate_kbps caps bandwidth in kilobits per second and quota_mib caps the
+ * bytes moved per UTC day; 0 means unlimited for either.
+ */
+typedef struct {
+    char     id[CONFIG_MAX_CLIENT_ID];
+    uint64_t rate_kbps;
+    uint64_t quota_mib;
+} pipesix_client_policy_t;
+
+/*
  * pipesix_config_t
  *
  * Complete configuration state for the pipesix application.
@@ -137,6 +150,10 @@ typedef struct {
     char client_id[CONFIG_MAX_CLIENT_ID];
     pipesix_client_cred_t clients[CONFIG_MAX_CLIENTS];
     int  client_count;
+
+    /* Per-client limits, at most one entry per client id. */
+    pipesix_client_policy_t policies[CONFIG_MAX_CLIENTS];
+    int  policy_count;
 
     /* Observability */
     int  stats_interval;                     /* Periodic stats interval */

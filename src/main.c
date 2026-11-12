@@ -247,6 +247,8 @@ static void print_usage(const char *progname)
             "  secret          This client's pre-shared key (client mode)\n"
             "  client_id       This client's identity (client mode)\n"
             "  client          <id>: <secret> entry (server mode, repeatable)\n"
+            "  client_rate_limit <id> <kbit/s> (server, repeatable)\n"
+            "  client_quota    <id> <MiB/day> (server, repeatable)\n"
             "  keepalive       Client keepalive seconds (default: 20, 0 = off)\n"
             "  session_timeout Server idle timeout seconds (default: 120)\n"
             "  peer_timeout    Client reconnect timeout seconds (default: 120, 0 = off)\n"

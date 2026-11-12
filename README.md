@@ -150,7 +150,8 @@ sudo pipesix --rotate-all         # new client keys, printed and reloaded
 `systemctl reload` sends SIGHUP. It applies `log_level`, `keepalive`,
 `peer_timeout`, `session_timeout`, `stats_interval` and the credentials: the
 `client`/`client_route` table on a server, the `secret` and `client_id` on a
-client. Interface, endpoint, mode and allow-list changes require a restart.
+client. Interface, endpoint, mode, allow-list and per-client limit changes
+require a restart.
 
 ### Control channel
 
@@ -191,7 +192,7 @@ tun: tun0 2a01:d0:a33f::1/64
 listen: 0.0.0.0:8899
 sessions: 1 of 64
   client1 from 203.0.113.5:41622 rx=1841 B tx=96 B frames=7 idle=2s route=2a01:d0:a33f::2/128
-stats[server]: uptime=532s tx=7 pkts/336 B rx=9 pkts/672 B dropped=0 invalid=0 auth_fail=0 handshakes=1 handshake_fail=0 rekeys=0 replayed=0 errors=0 last_rx=recent
+stats[server]: uptime=532s tx=7 pkts/336 B rx=9 pkts/672 B dropped=0 throttled=0 invalid=0 auth_fail=0 handshakes=1 handshake_fail=0 rekeys=0 replayed=0 errors=0 last_rx=recent
 ```
 
 Add `--json` to get the same report as one JSON object. The control
@@ -257,7 +258,7 @@ pipesix_session_rx_bytes{client="mac1"} 35651
 ```
 
 Both roles export the shared counters (`tx`/`rx` packets and bytes, `dropped`,
-`invalid`, `auth_failures`, `handshakes`,
+`throttled`, `invalid`, `auth_failures`, `handshakes`,
 `handshake_failures`, `rekeys`, `replayed`, `errors`, `uptime_seconds`,
 `last_rx_timestamp_seconds`, `last_handshake_timestamp_seconds`) with a `mode`
 label. A server adds `pipesix_sessions_active`, `pipesix_sessions_capacity`
@@ -281,6 +282,33 @@ sudo pipesix --metrics -c /etc/pipesix/pipesix.conf | grep pipesix_sessions
 
 Changing `metrics_address`, `metrics_port` or `metrics_token` needs a restart,
 like `bind_address`; the rest of the settings keep reloading over SIGHUP.
+
+### Per-client limits
+
+A server can cap what one client may use without touching the others. Both
+limits are optional, apply in both directions, and are read at startup, so
+changing them needs a restart:
+
+```ini
+client_rate_limit = mac1 50000   # 50 Mbit/s
+client_quota      = mac1 10240   # 10 GiB per UTC day
+```
+
+`client_rate_limit` is in **kilobits per second**, enforced with a token
+bucket that allows a one-second burst (or one full packet, when the cap is
+slower than that). `client_quota` is in **MiB per UTC day** and counts the
+bytes the client sent and received. The quota is tracked per client id, so a
+reconnect or a key rotation does not clear it, while a restart of the server
+does. `0` means unlimited in both keys, and a client without either line is
+unlimited.
+
+Over-limit traffic is dropped and counted as `throttled` in `--status` and
+`pipesix_throttled_total` in the metrics. The first drop in a session is
+logged with the configured numbers, so a client that suddenly stops passing
+traffic explains itself. Keepalives bypass the limits.
+
+Limits follow the `client` line that names them, like `client_route`, and
+`--remove-client` removes them along with the client.
 
 ### Provisioning clients
 

@@ -9,6 +9,7 @@
  */
 
 #include "config.h"
+#include "policy.h"
 #include "crypto.h"
 #include "ipv6.h"
 #include "logger.h"
@@ -1588,6 +1589,7 @@ static void test_stats_prometheus(void)
     stats_add_tx(&stats, 100);
     stats_add_rx(&stats, 40);
     stats_add_dropped(&stats);
+    stats_add_throttled(&stats);
     stats_add_handshake(&stats);
     stats_add_handshake_failure(&stats);
     stats_add_rekey(&stats);
@@ -1604,6 +1606,9 @@ static void test_stats_prometheus(void)
           "prometheus reports received bytes");
     check(strstr(body, "pipesix_dropped_total{mode=\"server\"} 1") != NULL,
           "prometheus reports dropped packets");
+    check(strstr(body, "pipesix_throttled_total{mode=\"server\"} 1") !=
+              NULL,
+          "prometheus reports throttled packets");
     check(strstr(body, "pipesix_handshakes_total{mode=\"server\"} 1") != NULL,
           "prometheus reports completed handshakes");
     check(strstr(body,
@@ -1629,6 +1634,86 @@ static void test_stats_prometheus(void)
           "prometheus formatting reports a buffer that is too small");
 }
 
+/*
+ * Per-client limits: the configuration parser, the token bucket and the
+ * daily quota. The data path needs a TUN device and root, so the maths is
+ * tested here at the same layer the server calls.
+ */
+static void test_client_policy(void)
+{
+    static const char server_config[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client = bob: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+        "client_rate_limit = alice 50000\n"
+        "client_quota = alice 10240\n";
+    static const char unknown_client[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_rate_limit = carol 1000\n";
+    static const char oversized_quota[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_quota = alice 99999999\n";
+    pipesix_config_t config;
+    pipesix_bucket_t bucket;
+    pipesix_quota_t quota;
+    char path[64];
+
+    check(write_temp_file(server_config, path, sizeof(path)) == 0,
+          "write per-client policy fixture");
+    check(config_load(path, &config) == 0, "load per-client policy fixture");
+    unlink(path);
+    check(config.policy_count == 1,
+          "rate and quota share one policy entry");
+    check(config.policies[0].rate_kbps == 50000, "rate limit parsed");
+    check(config.policies[0].quota_mib == 10240, "quota parsed");
+
+    check(write_temp_file(unknown_client, path, sizeof(path)) == 0,
+          "write unknown-client policy fixture");
+    check(config_load(path, &config) != 0,
+          "a limit for an unknown client is rejected");
+    unlink(path);
+
+    check(write_temp_file(oversized_quota, path, sizeof(path)) == 0,
+          "write oversized-quota fixture");
+    check(config_load(path, &config) != 0, "an oversized quota is rejected");
+    unlink(path);
+
+    /* A 1 MB/s bucket starts full, then only refills with time. */
+    policy_bucket_init(&bucket, 1000000u, 1000u);
+    check(policy_bucket_allow(&bucket, 1500u, 1000u) == 1,
+          "bucket allows a packet from the initial burst");
+    check(policy_bucket_allow(&bucket, 1000000u, 1000u) == 0,
+          "bucket refuses more than it holds");
+    check(policy_bucket_allow(&bucket, 1000000u, 1100u) == 1,
+          "bucket refills after a second");
+    check(policy_bucket_allow(&bucket, 1000000u, 1150u) == 0,
+          "bucket refuses what the refill does not cover");
+
+    policy_bucket_init(&bucket, 0u, 0u);
+    check(policy_bucket_allow(&bucket, 65535u, 0u) == 1,
+          "an unlimited bucket always allows");
+
+    /* A very low rate keeps a one-packet burst. */
+    policy_bucket_init(&bucket, 100u, 0u);
+    check(policy_bucket_allow(&bucket, 1500u, 0u) == 1,
+          "a slow bucket still passes one full packet");
+
+    policy_quota_init(&quota, 1000u);
+    check(policy_quota_charge(&quota, 600u, 100) == 1, "quota under limit");
+    check(policy_quota_charge(&quota, 600u, 100) == 0, "quota over limit");
+    check(policy_quota_charge(&quota, 600u, 101) == 1,
+          "quota resets on a new day");
+
+    policy_quota_init(&quota, 0u);
+    check(policy_quota_charge(&quota, 1u << 20, 100) == 1,
+          "an unlimited quota always allows");
+}
+
 int main(void)
 {
     logger_init(NULL);
@@ -1651,6 +1736,7 @@ int main(void)
     test_config();
     test_config_credentials();
     test_client_routes();
+    test_client_policy();
     test_config_reload();
     test_credential_rotation();
     test_client_secret_rotation();

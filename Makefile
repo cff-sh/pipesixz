@@ -53,6 +53,7 @@ SOURCES      = $(SRCDIR)/main.c \
                $(SRCDIR)/config.c \
                $(SRCDIR)/crypto.c \
                $(SRCDIR)/proto.c \
+               $(SRCDIR)/policy.c \
                $(SRCDIR)/runtime.c \
                $(SRCDIR)/stats.c \
                $(SRCDIR)/tun.c \
@@ -69,7 +70,7 @@ DEPENDS      = $(SOURCES:.c=.d)
 TEST_BIN     = tests/test_core
 TEST_SOURCES = tests/test_core.c
 TEST_OBJECTS = $(SRCDIR)/crypto.o $(SRCDIR)/proto.o \
-               $(SRCDIR)/config.o $(SRCDIR)/logger.o \
+               $(SRCDIR)/policy.o $(SRCDIR)/config.o $(SRCDIR)/logger.o \
                $(SRCDIR)/ipv6.o $(SRCDIR)/stats.o
 
 # The control channel test needs no root: it exercises the socket, not
