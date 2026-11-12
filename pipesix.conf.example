@@ -104,6 +104,22 @@ session_timeout = 120
 stats_interval  = 60
 
 # ---------------------------------------------------------------------------
+# Prometheus Metrics
+# ---------------------------------------------------------------------------
+# metrics_address: address the metrics endpoint listens on, or empty to
+#                  disable it (default). It serves GET /metrics over HTTP in
+#                  the Prometheus text format. The control channel's
+#                  'pipesix --metrics' prints the same body over its UNIX
+#                  socket, so no port is needed for a one-off look.
+# metrics_port:    port for the metrics endpoint (default: 9100)
+#
+# The endpoint has no authentication and exposes client ids and traffic
+# counters, so keep it on localhost or a private interface.
+#
+#metrics_address = 127.0.0.1
+#metrics_port    = 9100
+
+# ---------------------------------------------------------------------------
 # Logging Configuration
 # ---------------------------------------------------------------------------
 # log_level: Controls verbosity. Options: debug, info, warn, error, fatal

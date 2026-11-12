@@ -213,6 +213,8 @@ static void print_usage(const char *progname)
             "      --stats             Ask it to dump statistics now\n"
             "      --status            Report the running instance's state\n"
             "      --json              Print --status as one JSON object\n"
+            "      --metrics           Print the running instance's Prometheus\n"
+            "                          metrics\n"
             "      --kick <client-id>  Drop that client's session; it\n"
             "                          handshakes again immediately\n"
             "      --add-client <id>   Generate a key, write a 'client' entry\n"
@@ -242,6 +244,8 @@ static void print_usage(const char *progname)
             "  peer_timeout    Client reconnect timeout seconds (default: 120, 0 = off)\n"
             "  allow_client    Server allow-list of client IPs (comma separated)\n"
             "  stats_interval  Stats log interval seconds (default: 60, 0 = off)\n"
+            "  metrics_address Metrics endpoint address (empty = disabled)\n"
+            "  metrics_port    Metrics endpoint port (default: 9100)\n"
             "  log_level       debug | info | warn | error | fatal\n"
             "\n"
             "Examples:\n"
@@ -495,6 +499,7 @@ int main(int argc, char *argv[])
         { "stats",     no_argument,       NULL, 1001 },
         { "status",    no_argument,       NULL, 1002 },
         { "json",      no_argument,       NULL, 1007 },
+        { "metrics",   no_argument,       NULL, 1008 },
         { "kick",      required_argument, NULL, 1003 },
         { "add-client", required_argument, NULL, 1004 },
         { "remove-client", required_argument, NULL, 1005 },
@@ -514,6 +519,7 @@ int main(int argc, char *argv[])
     int stats_only = 0;
     int status_only = 0;
     int json_output = 0;
+    int metrics_only = 0;
     const char *kick_id = NULL;
     const char *add_client = NULL;
     const char *remove_client = NULL;
@@ -554,6 +560,9 @@ int main(int argc, char *argv[])
                 break;
             case 1007:
                 json_output = 1;
+                break;
+            case 1008:
+                metrics_only = 1;
                 break;
             case 1004:
                 add_client = optarg;
@@ -604,11 +613,11 @@ int main(int argc, char *argv[])
     }
 
     /*
-     * --status and --kick ask the running instance instead of starting a
-     * second one, so they are answered before the configuration is
-     * loaded (and before anything is logged to stderr).
+     * --status, --metrics and --kick ask the running instance instead of
+     * starting a second one, so they are answered before the
+     * configuration is loaded (and before anything is logged to stderr).
      */
-    if (status_only || kick_id != NULL) {
+    if (status_only || kick_id != NULL || metrics_only) {
         char reply[CONTROL_MAX_REPLY];
         char request[CONFIG_MAX_CLIENT_ID + 16];
 
@@ -618,6 +627,8 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
             snprintf(request, sizeof(request), "kick %s", kick_id);
+        } else if (metrics_only) {
+            snprintf(request, sizeof(request), "metrics");
         } else if (json_output) {
             snprintf(request, sizeof(request), "status json");
         } else {
@@ -632,8 +643,11 @@ int main(int argc, char *argv[])
             return EXIT_FAILURE;
         }
 
-        if (json_output) {
-            /* Strip the channel's OK line so stdout is pure JSON. */
+        if (json_output || metrics_only) {
+            /*
+             * Strip the channel's OK line so stdout is the JSON object or
+             * the metrics body itself, ready to pipe into jq or a scraper.
+             */
             if (strncmp(reply, "OK\n", 3) != 0) {
                 fputs(reply, stderr);
                 return EXIT_FAILURE;

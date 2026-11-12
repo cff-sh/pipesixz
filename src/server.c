@@ -36,6 +36,7 @@
 #include "crypto.h"
 #include "ipv6.h"
 #include "logger.h"
+#include "metrics.h"
 #include "proto.h"
 #include "runtime.h"
 #include "stats.h"
@@ -1563,6 +1564,97 @@ too_large:
 }
 
 /*
+ * Render the Prometheus body for the metrics endpoint.
+ *
+ * Same rule as --status: the session table is copied under the lock and
+ * formatted afterwards, so a scrape never stalls the data path behind a
+ * full table. Client ids are validated at configuration time, so they
+ * need no label escaping.
+ */
+static int server_metrics_body(char *out, size_t size, void *arg)
+{
+    server_context_t *ctx = (server_context_t *)arg;
+    char ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
+    uint64_t frames[SERVER_MAX_CLIENTS];
+    uint64_t rx_bytes[SERVER_MAX_CLIENTS];
+    uint64_t tx_bytes[SERVER_MAX_CLIENTS];
+    long idle[SERVER_MAX_CLIENTS];
+    time_t now = time(NULL);
+    size_t used;
+    int count = 0;
+    int i;
+
+    pthread_mutex_lock(&ctx->lock);
+
+    for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+        server_session_t *session = &ctx->sessions[i];
+
+        if (!session->active) {
+            continue;
+        }
+
+        snprintf(ids[count], sizeof(ids[count]), "%s",
+                 session->client_id[0] != '\0' ? session->client_id : "?");
+        frames[count] = session->frames;
+        rx_bytes[count] = session->rx_bytes;
+        tx_bytes[count] = session->tx_bytes;
+        idle[count] = (long)(now - session->last_seen);
+        count++;
+    }
+
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (stats_format_prometheus(&ctx->stats, "server", out, size) != 0) {
+        return -1;
+    }
+
+    used = strlen(out);
+
+    if (server_control_append(
+            out, size, &used,
+            "# HELP pipesix_sessions_active Authenticated sessions in the "
+            "table.\n# TYPE pipesix_sessions_active gauge\n"
+            "pipesix_sessions_active %d\n"
+            "# HELP pipesix_sessions_capacity Session table capacity.\n"
+            "# TYPE pipesix_sessions_capacity gauge\n"
+            "pipesix_sessions_capacity %d\n",
+            count, SERVER_MAX_CLIENTS) != 0) {
+        return -1;
+    }
+
+    if (server_control_append(
+            out, size, &used,
+            "# HELP pipesix_session_rx_bytes Bytes one client has sent "
+            "since it connected.\n# TYPE pipesix_session_rx_bytes gauge\n"
+            "# HELP pipesix_session_tx_bytes Bytes sent to one client since "
+            "it connected.\n# TYPE pipesix_session_tx_bytes gauge\n"
+            "# HELP pipesix_session_frames Frames accepted from one "
+            "client.\n# TYPE pipesix_session_frames gauge\n"
+            "# HELP pipesix_session_idle_seconds Seconds since the last "
+            "frame from one client.\n"
+            "# TYPE pipesix_session_idle_seconds gauge\n") != 0) {
+        return -1;
+    }
+
+    for (i = 0; i < count; i++) {
+        if (server_control_append(
+                out, size, &used,
+                "pipesix_session_rx_bytes{client=\"%s\"} %llu\n"
+                "pipesix_session_tx_bytes{client=\"%s\"} %llu\n"
+                "pipesix_session_frames{client=\"%s\"} %llu\n"
+                "pipesix_session_idle_seconds{client=\"%s\"} %ld\n",
+                ids[i], (unsigned long long)rx_bytes[i],
+                ids[i], (unsigned long long)tx_bytes[i],
+                ids[i], (unsigned long long)frames[i],
+                ids[i], idle[i]) != 0) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/*
  * Drop every session that belongs to a client id.
  *
  * The client is sent a handshake hint afterwards, so a peer that still
@@ -1642,6 +1734,19 @@ static int server_control_handler(const char *request, char *reply,
         }
         stats_format(&ctx->stats, "server", reply + used, size - used);
         return 0;
+    }
+
+    if (strcmp(request, "metrics") == 0) {
+        /*
+         * The control channel prefixes every reply with OK so the CLI can
+         * tell a handled request from a rejected one; --metrics strips it
+         * and prints the body, which is what Prometheus would scrape.
+         */
+        if (size < 4) {
+            return -1;
+        }
+        snprintf(reply, size, "OK\n");
+        return server_metrics_body(reply + 3, size - 3, ctx);
     }
 
     if (strcmp(request, "reload") == 0) {
@@ -1737,6 +1842,7 @@ int server_start(pipesix_config_t *config)
     }
 
     control_set_handler(server_control_handler, &ctx);
+    metrics_start(config, server_metrics_body, &ctx);
 
     {
         int i;
@@ -1791,8 +1897,10 @@ int server_start(pipesix_config_t *config)
 
     /*
      * Stops the control thread, so no handler runs while the state it
-     * reports on is torn down.
+     * reports on is torn down. The metrics endpoint reads the same state
+     * and goes first.
      */
+    metrics_stop();
     control_stop();
 
     log_info("Initiating graceful shutdown...");

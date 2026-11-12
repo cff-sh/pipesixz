@@ -203,6 +203,51 @@ client with `client_id`, `peer`, `rx_bytes`, `tx_bytes`, `frames`,
 `remote`, `session` and the same `stats` object. `route` is `null` when the
 client has no `client_route`, and `--json` is only valid with `--status`.
 
+### Prometheus metrics
+
+Set `metrics_address` (and optionally `metrics_port`, default 9100) to serve
+`GET /metrics` over HTTP, in the Prometheus text format:
+
+```ini
+metrics_address = 127.0.0.1
+metrics_port    = 9100
+```
+
+The endpoint is off by default and, unlike the control socket, needs a port of
+its own, so bind it to localhost or a private interface: it has no
+authentication and exposes client ids and counters.
+
+```bash
+curl -s http://127.0.0.1:9100/metrics | grep pipesix_
+```
+
+```text
+pipesix_uptime_seconds{mode="server"} 532
+pipesix_tx_packets_total{mode="server"} 7
+pipesix_rx_bytes_total{mode="server"} 672
+pipesix_last_rx_timestamp_seconds{mode="server"} 1762600000
+pipesix_sessions_active 1
+pipesix_sessions_capacity 64
+pipesix_session_rx_bytes{client="mac1"} 35651
+```
+
+Both roles export the shared counters (`tx`/`rx` packets and bytes, `dropped`,
+`invalid`, `auth_failures`, `replayed`, `errors`, `uptime_seconds`,
+`last_rx_timestamp_seconds`) with a `mode` label. A server adds
+`pipesix_sessions_active`, `pipesix_sessions_capacity` and per-client
+`pipesix_session_rx_bytes`, `_tx_bytes`, `_frames` and `_idle_seconds`; a client
+adds `pipesix_session_open`.
+
+`pipesix --metrics -c /etc/pipesix/pipesix.conf` prints the same body over the
+control channel, without a listening port:
+
+```bash
+sudo pipesix --metrics -c /etc/pipesix/pipesix.conf | grep pipesix_sessions
+```
+
+Changing `metrics_address` or `metrics_port` needs a restart, like
+`bind_address`; the rest of the settings keep reloading over SIGHUP.
+
 ### Provisioning clients
 
 ```bash

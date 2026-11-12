@@ -50,6 +50,7 @@ SOURCES      = $(SRCDIR)/main.c \
                $(SRCDIR)/tun.c \
                $(SRCDIR)/ipv6.c \
                $(SRCDIR)/control.c \
+               $(SRCDIR)/metrics.c \
                $(SRCDIR)/client.c \
                $(SRCDIR)/server.c
 

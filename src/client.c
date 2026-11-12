@@ -34,6 +34,7 @@
 #include "crypto.h"
 #include "ipv6.h"
 #include "logger.h"
+#include "metrics.h"
 #include "proto.h"
 #include "runtime.h"
 #include "stats.h"
@@ -601,6 +602,40 @@ static int renegotiate(client_context_t *ctx)
 }
 
 /*
+ * Render the Prometheus body for the metrics endpoint.
+ *
+ * The counters are shared with --status; the extra gauge tells a scraper
+ * whether this client currently holds a session, which is what an alert
+ * on "tunnel down" actually wants.
+ */
+static int client_metrics_body(char *out, size_t size, void *arg)
+{
+    client_context_t *ctx = (client_context_t *)arg;
+    size_t used;
+    int n;
+
+    if (stats_format_prometheus(&ctx->stats, "client", out, size) != 0) {
+        return -1;
+    }
+
+    used = strlen(out);
+
+    n = snprintf(out + used, size - used,
+                 "# HELP pipesix_session_open Whether this client holds a "
+                 "UDP session to the server.\n"
+                 "# TYPE pipesix_session_open gauge\n"
+                 "pipesix_session_open{client_id=\"%s\"} %d\n",
+                 ctx->config->client_id,
+                 ctx->udp_fd == PSIX_INVALID_SOCKET ? 0 : 1);
+
+    if (n < 0 || (size_t)n >= size - used) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
  * Control channel handler: report the client's tunnel state.
  */
 static int client_control_handler(const char *request, char *reply,
@@ -660,6 +695,14 @@ static int client_control_handler(const char *request, char *reply,
         }
 
         return 0;
+    }
+
+    if (strcmp(request, "metrics") == 0) {
+        if (reply_size < 4) {
+            return -1;
+        }
+        snprintf(reply, reply_size, "OK\n");
+        return client_metrics_body(reply + 3, reply_size - 3, ctx);
     }
 
     if (strcmp(request, "status") != 0 && strcmp(request, "stats") != 0) {
@@ -756,6 +799,7 @@ int client_start(pipesix_config_t *config)
     workers_running = 1;
 
     control_set_handler(client_control_handler, &ctx);
+    metrics_start(config, client_metrics_body, &ctx);
 
     log_info("Client tunnel ready (crypto=chacha20-poly1305, client_id=%s, "
              "keepalive=%ds, peer_timeout=%ds)",
@@ -837,6 +881,7 @@ int client_start(pipesix_config_t *config)
 
                 if (start_workers(&ctx, &forward_thread, &reverse_thread)
                     != 0) {
+                    metrics_stop();
                     control_stop();
                     psix_close(ctx.udp_fd);
                     tun_close(&tun);
@@ -871,6 +916,7 @@ int client_start(pipesix_config_t *config)
 
                 if (start_workers(&ctx, &forward_thread,
                                   &reverse_thread) != 0) {
+                    metrics_stop();
                     control_stop();
                     psix_close(ctx.udp_fd);
                     tun_close(&tun);
@@ -904,6 +950,7 @@ int client_start(pipesix_config_t *config)
 
                 if (start_workers(&ctx, &forward_thread,
                                   &reverse_thread) != 0) {
+                    metrics_stop();
                     control_stop();
                     psix_close(ctx.udp_fd);
                     tun_close(&tun);
@@ -919,8 +966,10 @@ int client_start(pipesix_config_t *config)
 
     /*
      * Stops the control thread, so no handler runs while the state it
-     * reports on is torn down.
+     * reports on is torn down. The metrics endpoint reads the same state
+     * and goes first.
      */
+    metrics_stop();
     control_stop();
 
     log_info("Initiating graceful shutdown...");
