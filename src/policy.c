@@ -1,7 +1,7 @@
 /*
  * policy.c - Per-client Rate and Quota Enforcement
  *
- * The bucket refills from a wall-clock timestamp instead of a timer
+ * The bucket refills from a monotonic timestamp instead of a timer
  * thread: one subtraction per packet is cheaper than waking up every
  * client's bucket on a schedule, and it needs no state outside the
  * session. A clock that jumps backwards simply refills nothing until it
@@ -14,9 +14,14 @@
 
 #include "policy.h"
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <time.h>
+#endif
+
 #include <stdatomic.h>
 #include <stdint.h>
-#include <time.h>
 
 void policy_bucket_init(pipesix_bucket_t *bucket, uint64_t rate_bps,
                         uint64_t now_ms)
@@ -134,14 +139,19 @@ uint64_t policy_quota_remaining(const pipesix_quota_t *quota, int day)
 
 uint64_t policy_now_ms(void)
 {
+#if defined(_WIN32)
+    /* Server mode is not built for Windows, but the module still links. */
+    return (uint64_t)GetTickCount64();
+#else
     struct timespec ts;
 
-    if (timespec_get(&ts, TIME_UTC) != TIME_UTC) {
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
         return (uint64_t)time(NULL) * 1000u;
     }
 
     return (uint64_t)ts.tv_sec * 1000u +
            ((uint64_t)ts.tv_nsec / 1000000u);
+#endif
 }
 
 int policy_day(time_t now)

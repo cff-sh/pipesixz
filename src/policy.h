@@ -88,7 +88,11 @@ int policy_quota_charge(pipesix_quota_t *quota, size_t bytes, int day);
  */
 uint64_t policy_quota_remaining(const pipesix_quota_t *quota, int day);
 
-/* Wall-clock time in milliseconds, for the token buckets. */
+/*
+ * Monotonic milliseconds, for the token buckets. Monotonic matters: a
+ * wall-clock step must not freeze a bucket or hand a client a burst it
+ * did not earn.
+ */
 uint64_t policy_now_ms(void);
 
 /* UTC day number (days since the epoch) for a Unix timestamp. */
