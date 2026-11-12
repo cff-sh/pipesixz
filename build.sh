@@ -79,8 +79,8 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$VERSION" ]; then
-    VERSION=$(sed -n 's/^#define PIPESIX_APP_VERSION "\(.*\)"/\1/p' \
-                  "$ROOT/src/main.c" | head -n 1)
+    # The Makefile holds the default; --version overrules it for a release.
+    VERSION=$(sed -n 's/^VERSION *?= *//p' "$ROOT/Makefile" | head -n 1)
     VERSION=${VERSION:-0.0.0}
 fi
 
@@ -174,7 +174,7 @@ build_linux() {
 
     echo "==> $target ($cc)"
     make -C "$ROOT" clean >/dev/null
-    make -C "$ROOT" CC="$cc"
+    make -C "$ROOT" CC="$cc" VERSION="$VERSION"
 
     stage=$(stage_linux "$target")
     tar -C "$DIST" -czf "$DIST/pipesix-$VERSION-$target.tar.gz" \
@@ -194,7 +194,7 @@ build_windows() {
 
     echo "==> windows-amd64 ($cc)"
     make -C "$ROOT" clean >/dev/null
-    make -C "$ROOT" windows WINDOWS_CC="$cc"
+    make -C "$ROOT" windows WINDOWS_CC="$cc" VERSION="$VERSION"
 
     rm -rf "$stage"
     mkdir -p "$stage"

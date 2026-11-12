@@ -33,6 +33,14 @@ endif
 CFLAGS   ?= -O2 -g
 LDFLAGS  ?=
 
+#
+# Version reported by 'pipesix -V', in the archive names and in the .deb.
+# This is the only place it is defined: build.sh passes --version down as
+# 'make VERSION=...', so a release build carries the tag it was cut from
+# instead of whatever number the source happened to have last year.
+#
+VERSION  ?= 2.3.0
+
 # Installation paths
 PREFIX      ?= /usr/local
 BINDIR       = $(PREFIX)/sbin
@@ -87,7 +95,8 @@ TARGET       = pipesix
                     -Wcast-align \
                     -Wformat=2 \
                     -Wno-unused-parameter \
-                    -I$(SRCDIR)
+                    -I$(SRCDIR) \
+                    -DPIPESIX_APP_VERSION='"$(VERSION)"'
 
 # Platform-specific feature macros
 ifeq ($(UNAME_S),Darwin)
@@ -198,7 +207,9 @@ WINDOWS_SOURCES  = $(filter-out $(SRCDIR)/tun.c $(SRCDIR)/server.c,$(SOURCES)) \
 windows: $(WINDOWS_TARGET)
 
 $(WINDOWS_TARGET): $(WINDOWS_SOURCES) $(SRCDIR)/platform.h $(SRCDIR)/control.h
-	$(WINDOWS_CC) $(WINDOWS_CFLAGS) -o $@ $(WINDOWS_SOURCES) $(WINDOWS_LDLIBS)
+	$(WINDOWS_CC) $(WINDOWS_CFLAGS) \
+	    -DPIPESIX_APP_VERSION='"$(VERSION)"' \
+	    -o $@ $(WINDOWS_SOURCES) $(WINDOWS_LDLIBS)
 	@echo "Build complete: $(WINDOWS_TARGET)"
 
 clean-windows:
@@ -228,6 +239,7 @@ info:
 	@echo "  CC:        $(CC)"
 	@echo "  CFLAGS:    $(CFLAGS)"
 	@echo "  LDFLAGS:   $(LDFLAGS)"
+	@echo "  VERSION:   $(VERSION)"
 	@echo "  PREFIX:    $(PREFIX)"
 	@echo "  BINDIR:    $(BINDIR)"
 	@echo "  CONFIG:    $(CONFIG_DIR)/pipesix.conf"

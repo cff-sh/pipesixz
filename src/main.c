@@ -63,7 +63,15 @@
 #include <time.h>
 #include <unistd.h>
 
-#define PIPESIX_APP_VERSION "2.1.0"
+/*
+ * The Makefile owns the version and passes it as -DPIPESIX_APP_VERSION,
+ * so 'pipesix -V' matches the release archive and .deb it came from. A
+ * build that bypasses the Makefile says 'dev' instead of an old number
+ * that was true at some point.
+ */
+#ifndef PIPESIX_APP_VERSION
+#define PIPESIX_APP_VERSION "dev"
+#endif
 
 /*
  * Windows has no /etc, so the default is the current directory: a Windows
