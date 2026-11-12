@@ -21,9 +21,13 @@ typedef struct {
     _Atomic uint64_t dropped;
     _Atomic uint64_t invalid;
     _Atomic uint64_t auth_failures;
+    _Atomic uint64_t handshakes;
+    _Atomic uint64_t handshake_failures;
+    _Atomic uint64_t rekeys;
     _Atomic uint64_t replayed;
     _Atomic uint64_t errors;
     _Atomic uint64_t last_rx;
+    _Atomic uint64_t last_handshake;
     time_t           started;
 } pipesix_stats_t;
 
@@ -44,6 +48,18 @@ void stats_add_invalid(pipesix_stats_t *stats);
 
 /* Record one authentication failure. */
 void stats_add_auth_failure(pipesix_stats_t *stats);
+
+/* Record one completed handshake and the time it completed. */
+void stats_add_handshake(pipesix_stats_t *stats);
+
+/* Record one handshake attempt that produced no session. */
+void stats_add_handshake_failure(pipesix_stats_t *stats);
+
+/*
+ * Record one handshake that replaced a session that already existed:
+ * a renegotiation, a reconnect, or a restart from a new endpoint.
+ */
+void stats_add_rekey(pipesix_stats_t *stats);
 
 /* Record one replayed or out-of-window frame. */
 void stats_add_replayed(pipesix_stats_t *stats);

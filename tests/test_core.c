@@ -1588,6 +1588,9 @@ static void test_stats_prometheus(void)
     stats_add_tx(&stats, 100);
     stats_add_rx(&stats, 40);
     stats_add_dropped(&stats);
+    stats_add_handshake(&stats);
+    stats_add_handshake_failure(&stats);
+    stats_add_rekey(&stats);
 
     check(stats_format_prometheus(&stats, "server", body, sizeof(body)) == 0,
           "prometheus body formats");
@@ -1601,6 +1604,20 @@ static void test_stats_prometheus(void)
           "prometheus reports received bytes");
     check(strstr(body, "pipesix_dropped_total{mode=\"server\"} 1") != NULL,
           "prometheus reports dropped packets");
+    check(strstr(body, "pipesix_handshakes_total{mode=\"server\"} 1") != NULL,
+          "prometheus reports completed handshakes");
+    check(strstr(body,
+                 "pipesix_handshake_failures_total{mode=\"server\"} 1") !=
+              NULL,
+          "prometheus reports failed handshakes");
+    check(strstr(body, "pipesix_rekeys_total{mode=\"server\"} 1") != NULL,
+          "prometheus reports rekeys");
+    check(strstr(body, "pipesix_last_handshake_timestamp_seconds{mode=\""
+                       "server\"} ") != NULL,
+          "prometheus reports the last handshake as a timestamp");
+    check(strstr(body, "pipesix_last_handshake_timestamp_seconds{mode=\""
+                       "server\"} 0\n") == NULL,
+          "a completed handshake gives a non-zero timestamp");
     check(strstr(body,
                  "pipesix_last_rx_timestamp_seconds{mode=\"server\"} ") !=
               NULL,

@@ -191,7 +191,7 @@ tun: tun0 2a01:d0:a33f::1/64
 listen: 0.0.0.0:8899
 sessions: 1 of 64
   client1 from 203.0.113.5:41622 rx=1841 B tx=96 B frames=7 idle=2s route=2a01:d0:a33f::2/128
-stats[server]: uptime=532s tx=7 pkts/336 B rx=9 pkts/672 B dropped=0 invalid=0 auth_fail=0 replayed=0 errors=0 last_rx=recent
+stats[server]: uptime=532s tx=7 pkts/336 B rx=9 pkts/672 B dropped=0 invalid=0 auth_fail=0 handshakes=1 handshake_fail=0 rekeys=0 replayed=0 errors=0 last_rx=recent
 ```
 
 Add `--json` to get the same report as one JSON object. The control
@@ -231,6 +231,8 @@ curl -s http://127.0.0.1:9100/metrics | grep pipesix_
 pipesix_uptime_seconds{mode="server"} 532
 pipesix_tx_packets_total{mode="server"} 7
 pipesix_rx_bytes_total{mode="server"} 672
+pipesix_handshakes_total{mode="server"} 3
+pipesix_last_handshake_timestamp_seconds{mode="server"} 1762600012
 pipesix_last_rx_timestamp_seconds{mode="server"} 1762600000
 pipesix_sessions_active 1
 pipesix_sessions_capacity 64
@@ -238,11 +240,20 @@ pipesix_session_rx_bytes{client="mac1"} 35651
 ```
 
 Both roles export the shared counters (`tx`/`rx` packets and bytes, `dropped`,
-`invalid`, `auth_failures`, `replayed`, `errors`, `uptime_seconds`,
-`last_rx_timestamp_seconds`) with a `mode` label. A server adds
-`pipesix_sessions_active`, `pipesix_sessions_capacity` and per-client
-`pipesix_session_rx_bytes`, `_tx_bytes`, `_frames` and `_idle_seconds`; a client
-adds `pipesix_session_open`.
+`invalid`, `auth_failures`, `handshakes`,
+`handshake_failures`, `rekeys`, `replayed`, `errors`, `uptime_seconds`,
+`last_rx_timestamp_seconds`, `last_handshake_timestamp_seconds`) with a `mode`
+label. A server adds `pipesix_sessions_active`, `pipesix_sessions_capacity`
+and per-client `pipesix_session_rx_bytes`, `_tx_bytes`, `_frames` and
+`_idle_seconds`; a client adds `pipesix_session_open`.
+
+`pipesix_handshakes_total` counts handshakes that produced a session,
+`pipesix_handshake_failures_total` the attempts that did not (bad key,
+unknown client, malformed request, no answer), and `pipesix_rekeys_total` the
+successful handshakes that replaced a session that already existed — a
+renegotiation, a reconnect, or a restart from a new address. A relay restart
+therefore shows up as a rekey, while a client that never gets in only moves
+`handshake_failures_total`.
 
 `pipesix --metrics -c /etc/pipesix/pipesix.conf` prints the same body over the
 control channel, without a listening port:

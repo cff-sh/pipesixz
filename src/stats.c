@@ -21,9 +21,13 @@ void stats_init(pipesix_stats_t *stats)
     atomic_store(&stats->dropped, 0);
     atomic_store(&stats->invalid, 0);
     atomic_store(&stats->auth_failures, 0);
+    atomic_store(&stats->handshakes, 0);
+    atomic_store(&stats->handshake_failures, 0);
+    atomic_store(&stats->rekeys, 0);
     atomic_store(&stats->replayed, 0);
     atomic_store(&stats->errors, 0);
     atomic_store(&stats->last_rx, 0);
+    atomic_store(&stats->last_handshake, 0);
     stats->started = time(NULL);
 }
 
@@ -61,6 +65,27 @@ void stats_add_auth_failure(pipesix_stats_t *stats)
 {
     if (stats == NULL) return;
     atomic_fetch_add_explicit(&stats->auth_failures, 1, memory_order_relaxed);
+}
+
+void stats_add_handshake(pipesix_stats_t *stats)
+{
+    if (stats == NULL) return;
+    atomic_fetch_add_explicit(&stats->handshakes, 1, memory_order_relaxed);
+    atomic_store_explicit(&stats->last_handshake, (uint64_t)time(NULL),
+                          memory_order_relaxed);
+}
+
+void stats_add_handshake_failure(pipesix_stats_t *stats)
+{
+    if (stats == NULL) return;
+    atomic_fetch_add_explicit(&stats->handshake_failures, 1,
+                              memory_order_relaxed);
+}
+
+void stats_add_rekey(pipesix_stats_t *stats)
+{
+    if (stats == NULL) return;
+    atomic_fetch_add_explicit(&stats->rekeys, 1, memory_order_relaxed);
 }
 
 void stats_add_replayed(pipesix_stats_t *stats)
@@ -116,7 +141,9 @@ void stats_format(const pipesix_stats_t *stats, const char *role,
     snprintf(out, out_size,
              "stats[%s]: uptime=%lus tx=%" PRIu64 " pkts/%s "
              "rx=%" PRIu64 " pkts/%s dropped=%" PRIu64 " invalid=%" PRIu64
-             " auth_fail=%" PRIu64 " replayed=%" PRIu64 " errors=%" PRIu64
+             " auth_fail=%" PRIu64 " handshakes=%" PRIu64
+             " handshake_fail=%" PRIu64 " rekeys=%" PRIu64
+             " replayed=%" PRIu64 " errors=%" PRIu64
              " last_rx=%s",
              role, uptime,
              atomic_load_explicit(&stats->tx_packets, memory_order_relaxed),
@@ -126,6 +153,10 @@ void stats_format(const pipesix_stats_t *stats, const char *role,
              atomic_load_explicit(&stats->dropped, memory_order_relaxed),
              atomic_load_explicit(&stats->invalid, memory_order_relaxed),
              atomic_load_explicit(&stats->auth_failures, memory_order_relaxed),
+             atomic_load_explicit(&stats->handshakes, memory_order_relaxed),
+             atomic_load_explicit(&stats->handshake_failures,
+                                  memory_order_relaxed),
+             atomic_load_explicit(&stats->rekeys, memory_order_relaxed),
              atomic_load_explicit(&stats->replayed, memory_order_relaxed),
              atomic_load_explicit(&stats->errors, memory_order_relaxed),
              (last_rx == 0) ? "never" : "recent");
@@ -150,8 +181,11 @@ void stats_format_json(const pipesix_stats_t *stats, const char *role,
              "\"tx_packets\":%" PRIu64 ",\"tx_bytes\":%" PRIu64 ","
              "\"rx_packets\":%" PRIu64 ",\"rx_bytes\":%" PRIu64 ","
              "\"dropped\":%" PRIu64 ",\"invalid\":%" PRIu64 ","
-             "\"auth_failures\":%" PRIu64 ",\"replayed\":%" PRIu64 ","
-             "\"errors\":%" PRIu64 ",\"last_rx_unix\":%" PRIu64 "}",
+             "\"auth_failures\":%" PRIu64 ",\"handshakes\":%" PRIu64 ","
+             "\"handshake_failures\":%" PRIu64 ",\"rekeys\":%" PRIu64 ","
+             "\"replayed\":%" PRIu64 ","
+             "\"errors\":%" PRIu64 ",\"last_rx_unix\":%" PRIu64 ","
+             "\"last_handshake_unix\":%" PRIu64 "}",
              role, uptime,
              atomic_load_explicit(&stats->tx_packets, memory_order_relaxed),
              atomic_load_explicit(&stats->tx_bytes, memory_order_relaxed),
@@ -160,9 +194,15 @@ void stats_format_json(const pipesix_stats_t *stats, const char *role,
              atomic_load_explicit(&stats->dropped, memory_order_relaxed),
              atomic_load_explicit(&stats->invalid, memory_order_relaxed),
              atomic_load_explicit(&stats->auth_failures, memory_order_relaxed),
+             atomic_load_explicit(&stats->handshakes, memory_order_relaxed),
+             atomic_load_explicit(&stats->handshake_failures,
+                                  memory_order_relaxed),
+             atomic_load_explicit(&stats->rekeys, memory_order_relaxed),
              atomic_load_explicit(&stats->replayed, memory_order_relaxed),
              atomic_load_explicit(&stats->errors, memory_order_relaxed),
-             last_rx);
+             last_rx,
+             atomic_load_explicit(&stats->last_handshake,
+                                  memory_order_relaxed));
 }
 
 /*
@@ -280,6 +320,41 @@ int stats_format_prometheus(const pipesix_stats_t *stats, const char *role,
                  "pipesix_auth_failures_total{mode=\"%s\"} %" PRIu64 "\n",
                  mode,
                  atomic_load_explicit(&stats->auth_failures,
+                                      memory_order_relaxed));
+
+    PROM_APPEND("# HELP pipesix_handshakes_total Completed handshakes.\n"
+                 "# TYPE pipesix_handshakes_total counter\n"
+                 "pipesix_handshakes_total{mode=\"%s\"} %" PRIu64 "\n",
+                 mode,
+                 atomic_load_explicit(&stats->handshakes,
+                                      memory_order_relaxed));
+
+    PROM_APPEND("# HELP pipesix_handshake_failures_total Handshake "
+                 "attempts that produced no session: malformed request, "
+                 "unknown client, bad MAC or an unreachable peer.\n"
+                 "# TYPE pipesix_handshake_failures_total counter\n"
+                 "pipesix_handshake_failures_total{mode=\"%s\"} %" PRIu64
+                 "\n",
+                 mode,
+                 atomic_load_explicit(&stats->handshake_failures,
+                                      memory_order_relaxed));
+
+    PROM_APPEND("# HELP pipesix_rekeys_total Handshakes that replaced an "
+                 "existing session: renegotiation, reconnect or a restart "
+                 "from a new endpoint.\n"
+                 "# TYPE pipesix_rekeys_total counter\n"
+                 "pipesix_rekeys_total{mode=\"%s\"} %" PRIu64 "\n",
+                 mode,
+                 atomic_load_explicit(&stats->rekeys, memory_order_relaxed));
+
+    PROM_APPEND("# HELP pipesix_last_handshake_timestamp_seconds Unix time "
+                 "of the last completed handshake, 0 while none has "
+                 "completed.\n"
+                 "# TYPE pipesix_last_handshake_timestamp_seconds gauge\n"
+                 "pipesix_last_handshake_timestamp_seconds{mode=\"%s\"} "
+                 "%" PRIu64 "\n",
+                 mode,
+                 atomic_load_explicit(&stats->last_handshake,
                                       memory_order_relaxed));
 
     PROM_APPEND("# HELP pipesix_replayed_total Frames rejected by the "

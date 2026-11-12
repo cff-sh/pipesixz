@@ -543,11 +543,13 @@ static void handle_handshake_init(server_context_t *ctx,
     int retransmit = 0;
     int evicted = 0;
     int superseded = 0;
+    int had_session = 0;
     int session_count;
 
     if (pipesix_handshake_init_peek(payload, payload_len, id, sizeof(id),
                                     cnonce) != PIPESIX_OK) {
         stats_add_invalid(&ctx->stats);
+        stats_add_handshake_failure(&ctx->stats);
         return;
     }
 
@@ -569,11 +571,13 @@ static void handle_handshake_init(server_context_t *ctx,
         log_warn("Handshake from %s for unknown client '%s'",
                  peer_str, id);
         stats_add_auth_failure(&ctx->stats);
+        stats_add_handshake_failure(&ctx->stats);
         return;
     }
 
     if (pipesix_key_from_string(cred_copy.secret, psk) != 0) {
         log_error("Cannot derive a key for client '%s'", id);
+        stats_add_handshake_failure(&ctx->stats);
         return;
     }
 
@@ -584,6 +588,7 @@ static void handle_handshake_init(server_context_t *ctx,
         log_warn("Handshake from %s failed authentication for client '%s'",
                  peer_str, id);
         stats_add_auth_failure(&ctx->stats);
+        stats_add_handshake_failure(&ctx->stats);
         memset(psk, 0, sizeof(psk));
         return;
     }
@@ -601,6 +606,9 @@ static void handle_handshake_init(server_context_t *ctx,
     if (slot < 0) {
         slot = session_alloc(ctx, peer, peer_len, &evicted);
     }
+
+    /* Whether this handshake replaces a session that already existed. */
+    had_session = ctx->sessions[slot].established;
 
     if (ctx->sessions[slot].established &&
         strcmp(ctx->sessions[slot].client_id, id) == 0 &&
@@ -620,6 +628,7 @@ static void handle_handshake_init(server_context_t *ctx,
             memset(psk, 0, sizeof(psk));
             log_error("Cannot generate a handshake nonce: %s",
                       strerror(errno));
+            stats_add_handshake_failure(&ctx->stats);
             return;
         }
 
@@ -668,6 +677,7 @@ static void handle_handshake_init(server_context_t *ctx,
 
     if (resp_len == 0) {
         log_error("Cannot build the handshake response");
+        stats_add_handshake_failure(&ctx->stats);
         return;
     }
 
@@ -676,6 +686,7 @@ static void handle_handshake_init(server_context_t *ctx,
                                     resp, resp_len, NULL);
     if (frame_len == 0) {
         log_error("Cannot build the handshake response frame");
+        stats_add_handshake_failure(&ctx->stats);
         return;
     }
 
@@ -684,12 +695,18 @@ static void handle_handshake_init(server_context_t *ctx,
         (ssize_t)frame_len) {
         log_warn("Failed to send the handshake response: %s",
                  strerror(errno));
+        stats_add_handshake_failure(&ctx->stats);
         return;
     }
 
     if (retransmit) {
         log_debug("Resent handshake response to client '%s'", id);
         return;
+    }
+
+    stats_add_handshake(&ctx->stats);
+    if (had_session || superseded > 0) {
+        stats_add_rekey(&ctx->stats);
     }
 
     format_peer((const struct sockaddr *)peer, peer_len,
@@ -1632,7 +1649,7 @@ static int server_status_json(server_context_t *ctx, char *reply, size_t size)
     char tun_name_esc[256];
     char tun_addr_esc[256];
     char bind_esc[256];
-    char stats_json[512];
+    char stats_json[768];
     time_t now = time(NULL);
     time_t started = ctx->stats.started;
     unsigned long uptime;

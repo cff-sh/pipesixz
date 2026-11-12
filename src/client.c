@@ -165,6 +165,7 @@ static int handshake_once(client_context_t *ctx, int timeout_ms)
 
     if (pipesix_random_bytes(cnonce, sizeof(cnonce)) != 0) {
         log_error("Cannot generate a handshake nonce: %s", strerror(errno));
+        stats_add_handshake_failure(&ctx->stats);
         return -1;
     }
 
@@ -173,6 +174,7 @@ static int handshake_once(client_context_t *ctx, int timeout_ms)
                                             ctx->psk);
     if (body_len == 0) {
         log_error("Cannot build the handshake request (check 'client_id')");
+        stats_add_handshake_failure(&ctx->stats);
         return -1;
     }
 
@@ -181,11 +183,13 @@ static int handshake_once(client_context_t *ctx, int timeout_ms)
                                     init_body, body_len, NULL);
     if (frame_len == 0) {
         log_error("Cannot build the handshake frame");
+        stats_add_handshake_failure(&ctx->stats);
         return -1;
     }
 
     if (psix_send(ctx->udp_fd, frame, frame_len, 0) != (ssize_t)frame_len) {
         log_warn("Failed to send the handshake request: %s", strerror(errno));
+        stats_add_handshake_failure(&ctx->stats);
         return -1;
     }
 
@@ -201,6 +205,7 @@ static int handshake_once(client_context_t *ctx, int timeout_ms)
         if (ready < 0) {
             if (errno == EINTR) continue;
             log_warn("poll() during handshake failed: %s", strerror(errno));
+            stats_add_handshake_failure(&ctx->stats);
             return -1;
         }
         if (ready == 0) {
@@ -211,6 +216,7 @@ static int handshake_once(client_context_t *ctx, int timeout_ms)
         if (nread < 0) {
             if (errno == EINTR) continue;
             log_warn("Handshake receive failed: %s", strerror(errno));
+            stats_add_handshake_failure(&ctx->stats);
             return -1;
         }
 
@@ -231,6 +237,7 @@ static int handshake_once(client_context_t *ctx, int timeout_ms)
             PIPESIX_OK) {
             log_warn("Handshake response from the server failed verification");
             stats_add_auth_failure(&ctx->stats);
+            stats_add_handshake_failure(&ctx->stats);
             return -1;
         }
 
@@ -244,11 +251,16 @@ static int handshake_once(client_context_t *ctx, int timeout_ms)
         pipesix_session_keys(ctx->psk, cnonce, snonce,
                              ctx->tx_key, ctx->rx_key);
 
+        stats_add_handshake(&ctx->stats);
         log_info("Handshake completed as client '%s'",
                  ctx->config->client_id);
         return 0;
     }
 
+    /* The attempt ran out of time without a response. */
+    if (!runtime_should_stop()) {
+        stats_add_handshake_failure(&ctx->stats);
+    }
     return -1;
 }
 
@@ -604,6 +616,7 @@ static int renegotiate(client_context_t *ctx)
 
     reset_session(ctx);
     atomic_store(&ctx->last_rx, time(NULL));
+    stats_add_rekey(&ctx->stats);
 
     return 0;
 }
@@ -658,7 +671,7 @@ static int client_control_handler(const char *request, char *reply,
         char tun_name_esc[256];
         char tun_addr_esc[256];
         char remote_esc[512];
-        char stats_json[512];
+        char stats_json[768];
         int n;
 
         if (control_json_escape(ctx->config->config_path, config_esc,
