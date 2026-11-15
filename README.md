@@ -714,7 +714,7 @@ only the native compiler):
 ```bash
 ./build.sh                          # host platform
 ./build.sh --all                    # every target whose toolchain exists
-./build.sh --target windows-amd64 --version 2.2.0
+./build.sh --target windows-amd64 --version 2.3.0
 make dist                           # same as ./build.sh --all
 ```
 
