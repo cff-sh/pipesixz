@@ -119,6 +119,15 @@ secret    = replace-this-with-pipesix-genkey-output
 # the process. The directory must exist and be writable by the server.
 #
 #quota_state = /var/lib/pipesix/quota.state
+#
+# usage_history: append-only CSV of completed quota periods (server mode,
+# optional). One row per client is written when a day or month ends, and
+# at startup when the relay was down across a boundary. Query it with
+# 'pipesix --usage --history' (add --json or --csv). The directory must
+# exist and be writable; the file is created with mode 0600. Changing the
+# path needs a restart.
+#
+#usage_history = /var/lib/pipesix/usage.csv
 
 # ---------------------------------------------------------------------------
 # Reliability

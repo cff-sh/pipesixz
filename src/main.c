@@ -41,6 +41,7 @@
 #include "crypto.h"
 #include "logger.h"
 #include "platform.h"
+#include "policy.h"
 #include "proto.h"
 #include "runtime.h"
 #include "server.h"
@@ -208,7 +209,7 @@ static void print_usage(const char *progname)
             "       %s --set-limit <id> [--rate <kbps>] [--quota <MiB>]\n"
             "                          [--quota-warn <percent>] [-c <config>]\n"
             "       %s --clear-limit <id> [-c <config>]\n"
-            "       %s --usage [--json|--csv] [-c <config>]\n"
+            "       %s --usage [--history] [--json|--csv] [-c <config>]\n"
             "\n"
             "pipesix %s - IPv6 over UDP Tunnel\n"
             "\n"
@@ -233,6 +234,8 @@ static void print_usage(const char *progname)
             "      --json              Print --status or --usage as one\n"
             "                          JSON object\n"
             "      --usage             Report per-client usage and limits\n"
+            "      --history           With --usage, print completed periods\n"
+            "                          from the usage_history file\n"
             "      --csv               Print --usage as one CSV table\n"
             "      --metrics           Print the running instance's Prometheus\n"
             "                          metrics\n"
@@ -277,7 +280,8 @@ static void print_usage(const char *progname)
             "  client_quota    <id> <MiB> per period (server, repeatable)\n"
             "  client_quota_warn <id> <percent> (server, repeatable)\n"
             "  quota_period    daily | monthly (default: daily)\n"
-            "  quota_state     File for quota usage (server, empty = off)\n");
+            "  quota_state     File for quota usage (server, empty = off)\n"
+            "  usage_history   Completed periods as CSV (server, empty = off)\n");
 
     fprintf(stderr,
             "  keepalive       Client keepalive seconds (default: 20, 0 = off)\n"
@@ -561,6 +565,7 @@ int main(int argc, char *argv[])
         { "metrics",   no_argument,       NULL, 1008 },
         { "usage",     no_argument,       NULL, 1010 },
         { "csv",       no_argument,       NULL, 1011 },
+        { "history",   no_argument,       NULL, 1018 },
         { "set-limit", required_argument, NULL, 1012 },
         { "clear-limit", required_argument, NULL, 1013 },
         { "rate",      required_argument, NULL, 1014 },
@@ -589,6 +594,7 @@ int main(int argc, char *argv[])
     int metrics_only = 0;
     int usage_only = 0;
     int csv_output = 0;
+    int history_only = 0;
     const char *set_limit = NULL;
     const char *clear_limit = NULL;
     const char *rate_arg = NULL;
@@ -650,6 +656,9 @@ int main(int argc, char *argv[])
                 break;
             case 1011:
                 csv_output = 1;
+                break;
+            case 1018:
+                history_only = 1;
                 break;
             case 1012:
                 set_limit = optarg;
@@ -787,9 +796,134 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    if (history_only && !usage_only) {
+        fprintf(stderr, "Error: --history requires --usage\n");
+        return EXIT_FAILURE;
+    }
+
     if (json_output && csv_output) {
         fprintf(stderr, "Error: --json and --csv are mutually exclusive\n");
         return EXIT_FAILURE;
+    }
+
+    /*
+     * The history is an append-only file, so this query reads it directly
+     * and works without a running server (and on a copy of the machine).
+     */
+    if (history_only) {
+        policy_history_t *rows;
+        int count = 0;
+        int total = 0;
+        int i;
+
+        logger_init(NULL);
+        logger_set_level(LOG_ERROR);
+
+        if (config_load(config_path, &config) != 0 ||
+            config_validate(&config) != 0) {
+            return EXIT_FAILURE;
+        }
+
+        if (config.usage_history[0] == '\0') {
+            fprintf(stderr,
+                    "Error: no 'usage_history' configured in '%s'\n",
+                    config_path);
+            return EXIT_FAILURE;
+        }
+
+        rows = calloc(POLICY_HISTORY_MAX, sizeof(*rows));
+        if (rows == NULL) {
+            fprintf(stderr, "Error: out of memory\n");
+            return EXIT_FAILURE;
+        }
+
+        if (policy_history_load(config.usage_history, rows,
+                                POLICY_HISTORY_MAX, &count, &total) != 0) {
+            fprintf(stderr,
+                    "Error: cannot read the usage history '%s': %s\n",
+                    config.usage_history, strerror(errno));
+            free(rows);
+            return EXIT_FAILURE;
+        }
+
+        if (csv_output) {
+            printf("client_id,period_start,period_end,period,used_bytes\n");
+            for (i = 0; i < count; i++) {
+                char start[16] = "?";
+                char end[16] = "?";
+
+                (void)policy_format_date((time_t)rows[i].start_unix, start,
+                                         sizeof(start));
+                (void)policy_format_date((time_t)rows[i].end_unix, end,
+                                         sizeof(end));
+                printf("%s,%s,%s,%s,%llu\n", rows[i].id, start, end,
+                       rows[i].monthly ? "monthly" : "daily",
+                       (unsigned long long)rows[i].used);
+            }
+            free(rows);
+            return EXIT_SUCCESS;
+        }
+
+        if (json_output) {
+            char config_esc[1024];
+
+            if (control_json_escape(config.config_path, config_esc,
+                                    sizeof(config_esc)) != 0) {
+                fprintf(stderr,
+                        "Error: cannot encode the history as JSON\n");
+                free(rows);
+                return EXIT_FAILURE;
+            }
+
+            printf("{\"mode\":\"server\",\"config\":\"%s\","
+                   "\"history\":[", config_esc);
+            for (i = 0; i < count; i++) {
+                char id_esc[128];
+
+                if (control_json_escape(rows[i].id, id_esc,
+                                        sizeof(id_esc)) != 0) {
+                    fprintf(stderr,
+                            "Error: cannot encode the history as JSON\n");
+                    free(rows);
+                    return EXIT_FAILURE;
+                }
+
+                printf("%s{\"client_id\":\"%s\","
+                       "\"period_start_unix\":%lld,"
+                       "\"period_end_unix\":%lld,\"period\":\"%s\","
+                       "\"used_bytes\":%llu}",
+                       i > 0 ? "," : "", id_esc,
+                       (long long)rows[i].start_unix,
+                       (long long)rows[i].end_unix,
+                       rows[i].monthly ? "monthly" : "daily",
+                       (unsigned long long)rows[i].used);
+            }
+            printf("]}\n");
+            free(rows);
+            return EXIT_SUCCESS;
+        }
+
+        printf("mode: server\n");
+        printf("config: %s\n", config.config_path);
+        printf("history: %s (%d record(s))\n", config.usage_history, total);
+        for (i = 0; i < count; i++) {
+            char start[16] = "?";
+            char end[16] = "?";
+
+            (void)policy_format_date((time_t)rows[i].start_unix, start,
+                                     sizeof(start));
+            (void)policy_format_date((time_t)rows[i].end_unix, end,
+                                     sizeof(end));
+            printf("  %s %s..%s (%s) used=%llu B\n", rows[i].id, start,
+                   end, rows[i].monthly ? "monthly" : "daily",
+                   (unsigned long long)rows[i].used);
+        }
+        if (total > count) {
+            printf("  ... %d older record(s) not shown\n", total - count);
+        }
+
+        free(rows);
+        return EXIT_SUCCESS;
     }
 
     /*

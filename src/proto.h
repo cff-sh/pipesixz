@@ -41,6 +41,11 @@
  *   PIPESIX_FLAG_QUOTA_EXHAUSTED   - server has started dropping the
  *                                    client's traffic because its quota
  *                                    for this period is used up
+ *   PIPESIX_FLAG_QUOTA_REQUEST     - client asks for its quota state,
+ *                                    payload length must be 0
+ *   PIPESIX_FLAG_QUOTA_STATE       - server reports quota bytes, used
+ *                                    bytes and the period bounds in a
+ *                                    fixed 32-byte authenticated payload
  *
  * The two quota notices are sent inside the session, authenticated with
  * the server-to-client key, so a spoofed datagram cannot fake them.
@@ -99,13 +104,17 @@
 #define PIPESIX_FLAG_SERVER_CLOSING  0x0020u
 #define PIPESIX_FLAG_QUOTA_WARNING   0x0040u
 #define PIPESIX_FLAG_QUOTA_EXHAUSTED 0x0080u
+#define PIPESIX_FLAG_QUOTA_REQUEST   0x0100u
+#define PIPESIX_FLAG_QUOTA_STATE     0x0200u
 #define PIPESIX_FLAG_KNOWN          (PIPESIX_FLAG_AUTH | PIPESIX_FLAG_KEEPALIVE | \
                                      PIPESIX_FLAG_HANDSHAKE_INIT | \
                                      PIPESIX_FLAG_HANDSHAKE_RESP | \
                                      PIPESIX_FLAG_HANDSHAKE_NEEDED | \
                                      PIPESIX_FLAG_SERVER_CLOSING | \
                                      PIPESIX_FLAG_QUOTA_WARNING | \
-                                     PIPESIX_FLAG_QUOTA_EXHAUSTED)
+                                     PIPESIX_FLAG_QUOTA_EXHAUSTED | \
+                                     PIPESIX_FLAG_QUOTA_REQUEST | \
+                                     PIPESIX_FLAG_QUOTA_STATE)
 
 /* Fixed header size on the wire */
 #define PIPESIX_HEADER_SIZE         24
@@ -145,6 +154,16 @@
  * Decoded frame view. Pointers reference the caller's receive buffer
  * and remain valid until that buffer is reused.
  */
+/* Fixed payload of PIPESIX_FLAG_QUOTA_STATE. */
+#define PIPESIX_QUOTA_STATE_LEN     32u
+
+typedef struct {
+    uint64_t limit_bytes;   /* 0 = unlimited */
+    uint64_t used_bytes;    /* charged in the current period */
+    int64_t  period_start;  /* Unix seconds, inclusive */
+    int64_t  period_end;    /* Unix seconds, exclusive */
+} pipesix_quota_state_t;
+
 typedef struct {
     uint16_t       flags;         /* Frame flags (host byte order) */
     uint32_t       salt;          /* Nonce salt (host byte order) */
@@ -217,6 +236,18 @@ int pipesix_frame_peek(const uint8_t *buf, size_t len, uint16_t *flags);
  */
 int pipesix_frame_parse(uint8_t *buf, size_t len, pipesix_frame_t *out,
                         const uint8_t *key);
+
+/*
+ * Encode/decode the 32-byte PIPESIX_FLAG_QUOTA_STATE payload.
+ *
+ * The encode returns 0 when the buffer is too small; the decode returns
+ * PIPESIX_ERR_LENGTH unless len is exactly PIPESIX_QUOTA_STATE_LEN.
+ */
+size_t pipesix_quota_state_encode(uint8_t *buf, size_t bufsize,
+                                  const pipesix_quota_state_t *state);
+
+int pipesix_quota_state_decode(const uint8_t *payload, size_t len,
+                               pipesix_quota_state_t *out);
 
 /*
  * Build a handshake INIT payload.

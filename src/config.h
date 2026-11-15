@@ -33,6 +33,8 @@
  *   quota_period     - daily (default) or monthly
  *   quota_state      - File that keeps quota usage across a restart
  *                      (server mode, empty disables it)
+ *   usage_history    - Append-only CSV of completed quota periods
+ *                      (server mode, empty disables it)
  *   client_prefix_pool - IPv6 prefix no longer than /64 that
  *                      --add-client --delegate carves /64s from
  *                      (server mode, empty disables delegation)
@@ -195,6 +197,14 @@ typedef struct {
      * needs a restart.
      */
     char quota_state[CONFIG_PATH_MAX];
+
+    /*
+     * Completed quota periods are appended here as CSV (server mode).
+     * The path is read when a period rolls over, so an empty value keeps
+     * no history. Like quota_state it is not reloaded into the running
+     * server, so changing it needs a restart.
+     */
+    char usage_history[CONFIG_PATH_MAX];
 
     /*
      * Delegated return prefixes (server mode). When set, a /64 carved

@@ -73,6 +73,8 @@ static int flags_valid(uint16_t flags, size_t payload_len)
     if ((flags & PIPESIX_FLAG_SERVER_CLOSING) != 0) controls++;
     if ((flags & PIPESIX_FLAG_QUOTA_WARNING) != 0) controls++;
     if ((flags & PIPESIX_FLAG_QUOTA_EXHAUSTED) != 0) controls++;
+    if ((flags & PIPESIX_FLAG_QUOTA_REQUEST) != 0) controls++;
+    if ((flags & PIPESIX_FLAG_QUOTA_STATE) != 0) controls++;
 
     if (controls > 1) {
         return 0;
@@ -91,8 +93,13 @@ static int flags_valid(uint16_t flags, size_t payload_len)
     }
 
     if ((flags & (PIPESIX_FLAG_QUOTA_WARNING |
-                  PIPESIX_FLAG_QUOTA_EXHAUSTED)) != 0) {
+                  PIPESIX_FLAG_QUOTA_EXHAUSTED |
+                  PIPESIX_FLAG_QUOTA_REQUEST)) != 0) {
         return payload_len == 0;
+    }
+
+    if ((flags & PIPESIX_FLAG_QUOTA_STATE) != 0) {
+        return payload_len == PIPESIX_QUOTA_STATE_LEN;
     }
 
     if ((flags & (PIPESIX_FLAG_HANDSHAKE_INIT |
@@ -534,6 +541,36 @@ int pipesix_replay_accept(pipesix_replay_t *replay, uint64_t seq)
 
     replay->bitmap |= bit;
     return 1;
+}
+
+size_t pipesix_quota_state_encode(uint8_t *buf, size_t bufsize,
+                                  const pipesix_quota_state_t *state)
+{
+    if (buf == NULL || state == NULL ||
+        bufsize < PIPESIX_QUOTA_STATE_LEN) {
+        return 0;
+    }
+
+    put_u64(buf, state->limit_bytes);
+    put_u64(buf + 8, state->used_bytes);
+    put_u64(buf + 16, (uint64_t)state->period_start);
+    put_u64(buf + 24, (uint64_t)state->period_end);
+    return PIPESIX_QUOTA_STATE_LEN;
+}
+
+int pipesix_quota_state_decode(const uint8_t *payload, size_t len,
+                               pipesix_quota_state_t *out)
+{
+    if (payload == NULL || out == NULL ||
+        len != PIPESIX_QUOTA_STATE_LEN) {
+        return PIPESIX_ERR_LENGTH;
+    }
+
+    out->limit_bytes = get_u64(payload);
+    out->used_bytes = get_u64(payload + 8);
+    out->period_start = (int64_t)get_u64(payload + 16);
+    out->period_end = (int64_t)get_u64(payload + 24);
+    return PIPESIX_OK;
 }
 
 const char *pipesix_strerror(int code)

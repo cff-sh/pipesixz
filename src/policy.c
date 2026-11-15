@@ -264,6 +264,153 @@ time_t policy_period_end(int period, int monthly)
     return policy_period_start(period + 1, monthly);
 }
 
+int policy_format_date(time_t t, char *out, size_t size)
+{
+    struct tm *tmp;
+    struct tm tm;
+
+    if (out == NULL || size == 0) {
+        return -1;
+    }
+
+    tmp = gmtime(&t);
+    if (tmp == NULL) {
+        return -1;
+    }
+    tm = *tmp;
+
+    return (strftime(out, size, "%Y-%m-%d", &tm) == 0) ? -1 : 0;
+}
+
+#define POLICY_HISTORY_HEADER \
+    "client_id,period_start,period_end,period_kind,used_bytes\n"
+
+int policy_history_append(const char *path, int monthly,
+                          const policy_usage_t *usage, int count)
+{
+    FILE *fp;
+    long size;
+    int i;
+
+    if (path == NULL || path[0] == '\0' || usage == NULL || count < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (count == 0) {
+        return 0;
+    }
+
+    fp = fopen(path, "a");
+    if (fp == NULL) {
+        return -1;
+    }
+
+#if !defined(_WIN32)
+    (void)chmod(path, 0600);
+#endif
+
+    if (fseek(fp, 0, SEEK_END) != 0 || (size = ftell(fp)) < 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    if (size == 0 && fputs(POLICY_HISTORY_HEADER, fp) == EOF) {
+        fclose(fp);
+        return -1;
+    }
+
+    for (i = 0; i < count; i++) {
+        time_t start = policy_period_start((int)usage[i].period, monthly);
+        time_t end = policy_period_end((int)usage[i].period, monthly);
+
+        if (fprintf(fp, "%s,%lld,%lld,%s,%llu\n", usage[i].id,
+                    (long long)start, (long long)end,
+                    monthly ? "monthly" : "daily",
+                    (unsigned long long)usage[i].used) < 0) {
+            fclose(fp);
+            return -1;
+        }
+    }
+
+    if (fflush(fp) != 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    return fclose(fp);
+}
+
+int policy_history_load(const char *path, policy_history_t *out, int max,
+                        int *count, int *total)
+{
+    char line[512];
+    FILE *fp;
+    int n = 0;
+    int seen = 0;
+
+    if (path == NULL || path[0] == '\0' || out == NULL || max < 0 ||
+        count == NULL || total == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    *count = 0;
+    *total = 0;
+
+    fp = fopen(path, "r");
+    if (fp == NULL) {
+        return (errno == ENOENT) ? 0 : -1;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *p = line;
+        char id[POLICY_MAX_ID];
+        char kind[16];
+        long long start;
+        long long end;
+        unsigned long long used;
+
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        if (*p == '\0' || *p == '\n' || *p == '#' ||
+            strncmp(p, "client_id,", 10) == 0) {
+            continue;
+        }
+
+        if (sscanf(p, "%32[^,],%lld,%lld,%15[^,],%llu", id, &start, &end,
+                   kind, &used) != 5) {
+            continue;
+        }
+
+        seen++;
+        if (n >= max) {
+            continue;
+        }
+
+        memset(&out[n], 0, sizeof(out[n]));
+        snprintf(out[n].id, sizeof(out[n].id), "%s", id);
+        out[n].start_unix = (int64_t)start;
+        out[n].end_unix = (int64_t)end;
+        out[n].monthly = (strcmp(kind, "monthly") == 0);
+        out[n].used = (uint64_t)used;
+        n++;
+    }
+
+    if (ferror(fp)) {
+        fclose(fp);
+        return -1;
+    }
+    if (fclose(fp) != 0) {
+        return -1;
+    }
+
+    *count = n;
+    *total = seen;
+    return 0;
+}
+
 int policy_state_save(const char *path, int monthly,
                       const policy_usage_t *usage, int count)
 {

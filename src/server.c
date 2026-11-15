@@ -95,6 +95,8 @@ typedef struct {
     int                     quota_warn_sent;
     int                     quota_exhausted_sent;
     int                     notice_period;
+    /* Set when the client asked for quota state; enables period pushes. */
+    int                     quota_requested;
     pipesix_bucket_t        rx_bucket;
     pipesix_bucket_t        tx_bucket;
 } server_session_t;
@@ -119,6 +121,10 @@ typedef struct {
      * from the bytes already moved today.
      */
     pipesix_quota_t    quotas[CONFIG_MAX_CLIENTS];
+    /* Period index whose counters are live; rolled when the clock moves. */
+    int                usage_period;
+    /* One warning per failure streak, so a broken history file is quiet. */
+    int                history_warned;
     /* One warning per failure streak, so a broken state file is not noisy. */
     int                quota_save_warned;
 } server_context_t;
@@ -177,6 +183,68 @@ static uint64_t quota_limit_for(const pipesix_config_t *config,
     return config->policies[policy].quota_mib * 1048576u;
 }
 
+static void send_session_quota_state(server_context_t *ctx,
+                                     const struct sockaddr_storage *peer,
+                                     socklen_t peer_len,
+                                     const uint8_t key[PIPESIX_KEY_LEN],
+                                     int client_index);
+
+/*
+ * Close the live accounting period and open 'new_period'.
+ *
+ * The old totals are appended to the usage history (when configured)
+ * before the counters are reset, so no completed period is lost even if
+ * the relay was idle at the boundary. Requires ctx->lock: both data-path
+ * threads call this through quota_admit().
+ */
+static void roll_quota_period_locked(server_context_t *ctx, int old_period,
+                                     int new_period)
+{
+    policy_usage_t usage[CONFIG_MAX_CLIENTS];
+    int count = 0;
+    int i;
+
+    if (old_period >= 0 && ctx->config->usage_history[0] != '\0') {
+        for (i = 0; i < ctx->config->client_count; i++) {
+            snprintf(usage[count].id, sizeof(usage[count].id), "%s",
+                     ctx->config->clients[i].id);
+            usage[count].period = old_period;
+            usage[count].used = policy_quota_used(&ctx->quotas[i], old_period);
+            count++;
+        }
+
+        if (count > 0 &&
+            policy_history_append(ctx->config->usage_history,
+                                  ctx->config->quota_period, usage,
+                                  count) != 0) {
+            if (!ctx->history_warned) {
+                log_warn("Cannot append to the usage history '%s': %s",
+                         ctx->config->usage_history, strerror(errno));
+                ctx->history_warned = 1;
+            }
+        } else {
+            ctx->history_warned = 0;
+        }
+    }
+
+    for (i = 0; i < ctx->config->client_count; i++) {
+        policy_quota_restore(&ctx->quotas[i], 0, new_period);
+    }
+
+    ctx->usage_period = new_period;
+
+    /* A client that asked for its quota state gets the new period now. */
+    for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+        server_session_t *session = &ctx->sessions[i];
+
+        if (session->active && session->established &&
+            session->quota_requested) {
+            send_session_quota_state(ctx, &session->addr, session->addr_len,
+                                     session->tx_key, session->client_index);
+        }
+    }
+}
+
 /*
  * Charge one packet against a client's quota.
  *
@@ -206,6 +274,10 @@ static int quota_admit(server_context_t *ctx, server_session_t *session,
 
     quota = &ctx->quotas[session->client_index];
     period = policy_period(now, ctx->config->quota_period);
+
+    if (ctx->usage_period != period) {
+        roll_quota_period_locked(ctx, ctx->usage_period, period);
+    }
 
     /* A session that spans midnight or a month boundary warns again. */
     if (session->notice_period != period) {
@@ -561,6 +633,63 @@ static void send_session_control(server_context_t *ctx,
     }
 }
 
+/*
+ * Send a client its current quota state, authenticated in its session.
+ *
+ * The client asks for this periodically rather than the server pushing
+ * it, so a client that does not know the flag is never sent a frame it
+ * would reject as invalid.
+ */
+static void send_session_quota_state(server_context_t *ctx,
+                                     const struct sockaddr_storage *peer,
+                                     socklen_t peer_len,
+                                     const uint8_t key[PIPESIX_KEY_LEN],
+                                     int client_index)
+{
+    pipesix_quota_state_t state;
+    uint8_t payload[PIPESIX_QUOTA_STATE_LEN];
+    uint8_t frame[PIPESIX_HEADER_SIZE + PIPESIX_QUOTA_STATE_LEN +
+                  PIPESIX_AUTH_TAG_SIZE];
+    size_t payload_len;
+    size_t frame_len;
+    time_t now;
+    int period;
+
+    if (key == NULL || client_index < 0) {
+        return;
+    }
+
+    now = time(NULL);
+    period = policy_period(now, ctx->config->quota_period);
+    memset(&state, 0, sizeof(state));
+    state.limit_bytes = ctx->quotas[client_index].limit;
+    state.used_bytes = policy_quota_used(&ctx->quotas[client_index], period);
+    state.period_start =
+        (int64_t)policy_period_start(period, ctx->config->quota_period);
+    state.period_end =
+        (int64_t)policy_period_end(period, ctx->config->quota_period);
+
+    payload_len = pipesix_quota_state_encode(payload, sizeof(payload),
+                                             &state);
+    if (payload_len == 0) {
+        return;
+    }
+
+    frame_len = pipesix_frame_build(frame, sizeof(frame),
+                                    PIPESIX_FLAG_QUOTA_STATE, ctx->salt,
+                                    next_seq(ctx), payload, payload_len,
+                                    key);
+    if (frame_len == 0) {
+        return;
+    }
+
+    if (sendto(ctx->udp_fd, frame, frame_len, 0,
+               (const struct sockaddr *)peer, peer_len) !=
+        (ssize_t)frame_len) {
+        log_debug("Failed to send the quota state: %s", strerror(errno));
+    }
+}
+
 static void send_need_handshake(server_context_t *ctx,
                                 const struct sockaddr_storage *peer,
                                 socklen_t peer_len)
@@ -821,6 +950,7 @@ static void handle_handshake_init(server_context_t *ctx,
         ctx->sessions[slot].quota_warn_sent = 0;
         ctx->sessions[slot].quota_exhausted_sent = 0;
         ctx->sessions[slot].notice_period = -1;
+        ctx->sessions[slot].quota_requested = 0;
         pipesix_replay_reset(&ctx->sessions[slot].replay);
 
         {
@@ -1477,6 +1607,16 @@ static void *receiver_loop(void *arg)
             log_warn("Rejected replayed/out-of-window frame (seq=%llu)",
                      (unsigned long long)frame.seq);
             stats_add_replayed(&ctx->stats);
+            continue;
+        }
+
+        if ((frame.flags & PIPESIX_FLAG_QUOTA_REQUEST) != 0) {
+            ctx->sessions[slot].quota_requested = 1;
+            send_session_quota_state(ctx, &ctx->sessions[slot].addr,
+                                     ctx->sessions[slot].addr_len,
+                                     ctx->sessions[slot].tx_key,
+                                     ctx->sessions[slot].client_index);
+            pthread_mutex_unlock(&ctx->lock);
             continue;
         }
 
@@ -2768,6 +2908,29 @@ static void load_quota_state(server_context_t *ctx)
         return;
     }
 
+    /*
+     * The relay was down across a boundary: archive the stored period
+     * before the counters are reset for the current one.
+     */
+    if (ctx->config->usage_history[0] != '\0') {
+        policy_usage_t old[CONFIG_MAX_CLIENTS];
+        int old_count = 0;
+
+        for (i = 0; i < count; i++) {
+            if (stored[i].period != period && stored[i].used > 0) {
+                old[old_count++] = stored[i];
+            }
+        }
+
+        if (old_count > 0 &&
+            policy_history_append(ctx->config->usage_history,
+                                  ctx->config->quota_period, old,
+                                  old_count) != 0) {
+            log_warn("Cannot append to the usage history '%s': %s",
+                     ctx->config->usage_history, strerror(errno));
+        }
+    }
+
     for (i = 0; i < count; i++) {
         int index = client_index_lookup(ctx->config, stored[i].id);
 
@@ -2799,6 +2962,24 @@ static void load_quota_state(server_context_t *ctx)
  * session lock, and the file is replaced atomically. A failure is logged
  * once per failure streak, since this runs every 30 seconds.
  */
+/*
+ * Roll the accounting period when the clock crosses a boundary.
+ *
+ * Called from the main loop, so history is written even when no packet
+ * happens to arrive at midnight. quota_admit() does the same check under
+ * the same lock, so traffic cannot slip in between.
+ */
+static void sync_quota_period(server_context_t *ctx)
+{
+    int period = policy_period(time(NULL), ctx->config->quota_period);
+
+    pthread_mutex_lock(&ctx->lock);
+    if (ctx->usage_period != period) {
+        roll_quota_period_locked(ctx, ctx->usage_period, period);
+    }
+    pthread_mutex_unlock(&ctx->lock);
+}
+
 static int save_quota_state(server_context_t *ctx)
 {
     policy_usage_t usage[CONFIG_MAX_CLIENTS];
@@ -2891,6 +3072,7 @@ int server_start(pipesix_config_t *config)
         }
     }
 
+    ctx.usage_period = policy_period(time(NULL), config->quota_period);
     load_quota_state(&ctx);
 
     rc = pthread_mutex_init(&ctx.lock, NULL);
@@ -2974,6 +3156,7 @@ int server_start(pipesix_config_t *config)
             }
 
             sessions_expire(&ctx, now);
+            sync_quota_period(&ctx);
 
             if (ctx.config->quota_state[0] != '\0' &&
                 (now - last_quota_save) >= 30) {

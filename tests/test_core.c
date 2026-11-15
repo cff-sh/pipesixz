@@ -1673,6 +1673,176 @@ static void test_prefix_delegation(void)
     unlink(path);
 }
 
+static void test_quota_state_frames(void)
+{
+    uint8_t key[PIPESIX_KEY_LEN];
+    uint8_t payload[PIPESIX_QUOTA_STATE_LEN];
+    uint8_t frame[256];
+    pipesix_quota_state_t in;
+    pipesix_quota_state_t out;
+    pipesix_frame_t parsed;
+    size_t payload_len;
+    size_t frame_len;
+
+    memset(key, 0x5a, sizeof(key));
+    memset(&in, 0, sizeof(in));
+    in.limit_bytes = 10485760u;
+    in.used_bytes = 123456u;
+    in.period_start = 1793491200;
+    in.period_end = 1796083200;
+
+    payload_len = pipesix_quota_state_encode(payload, sizeof(payload), &in);
+    check(payload_len == PIPESIX_QUOTA_STATE_LEN,
+          "quota state encodes to 32 bytes");
+    check(pipesix_quota_state_encode(payload, 31, &in) == 0,
+          "a short quota state buffer is refused");
+
+    frame_len = pipesix_frame_build(frame, sizeof(frame),
+                                    PIPESIX_FLAG_QUOTA_STATE, 7, 42,
+                                    payload, payload_len, key);
+    check(frame_len > 0, "a quota state frame builds");
+    check(pipesix_frame_parse(frame, frame_len, &parsed, key) == PIPESIX_OK,
+          "a quota state frame parses with the session key");
+    check((parsed.flags & PIPESIX_FLAG_QUOTA_STATE) != 0 &&
+              parsed.payload_len == PIPESIX_QUOTA_STATE_LEN,
+          "the quota state payload survives the frame");
+    check(pipesix_quota_state_decode(parsed.payload, parsed.payload_len,
+                                     &out) == PIPESIX_OK,
+          "the quota state decodes");
+    check(out.limit_bytes == in.limit_bytes &&
+              out.used_bytes == in.used_bytes &&
+              out.period_start == in.period_start &&
+              out.period_end == in.period_end,
+          "the quota state round-trips");
+
+    check(pipesix_frame_build(frame, sizeof(frame),
+                              PIPESIX_FLAG_QUOTA_STATE, 7, 43,
+                              payload, 31, key) == 0,
+          "a quota state frame with a short payload is refused");
+    check(pipesix_quota_state_decode(payload, 31, &out) == PIPESIX_ERR_LENGTH,
+          "a short quota state payload fails to decode");
+
+    frame_len = pipesix_frame_build(frame, sizeof(frame),
+                                    PIPESIX_FLAG_QUOTA_REQUEST, 7, 44,
+                                    NULL, 0, key);
+    check(frame_len > 0, "a quota request frame builds");
+    check(pipesix_frame_parse(frame, frame_len, &parsed, key) == PIPESIX_OK &&
+              (parsed.flags & PIPESIX_FLAG_QUOTA_REQUEST) != 0,
+          "a quota request parses");
+    check(pipesix_frame_build(frame, sizeof(frame),
+                              PIPESIX_FLAG_QUOTA_REQUEST, 7, 45,
+                              payload, 1, key) == 0,
+          "a quota request with a payload is refused");
+}
+
+static void test_usage_history(void)
+{
+    char path[64];
+    char date[16];
+    policy_usage_t usage[2];
+    policy_history_t rows[4];
+    int count = -1;
+    int total = -1;
+    int period = 2026 * 12 + 10;
+    FILE *fp;
+
+    snprintf(path, sizeof(path), "/tmp/pipesix_history_%ld",
+             (long)getpid());
+    unlink(path);
+
+    memset(usage, 0, sizeof(usage));
+    snprintf(usage[0].id, sizeof(usage[0].id), "%s", "alice");
+    usage[0].period = period;
+    usage[0].used = 111u;
+    snprintf(usage[1].id, sizeof(usage[1].id), "%s", "bob");
+    usage[1].period = period;
+    usage[1].used = 222u;
+
+    check(policy_history_append(path, 1, usage, 2) == 0,
+          "completed periods append to the history");
+    check(policy_history_load(path, rows, 4, &count, &total) == 0 &&
+              count == 2 && total == 2,
+          "the history loads both rows");
+    check(strcmp(rows[0].id, "alice") == 0 && rows[0].monthly &&
+              rows[0].used == 111u,
+          "a history row keeps its client and usage");
+    check(rows[0].start_unix == (int64_t)policy_period_start(period, 1) &&
+              rows[0].end_unix == (int64_t)policy_period_end(period, 1),
+          "a history row carries the period bounds");
+    check(policy_format_date((time_t)rows[0].start_unix, date,
+                             sizeof(date)) == 0 &&
+              strcmp(date, "2026-11-01") == 0,
+          "period bounds format as UTC dates");
+    check(policy_format_date((time_t)1794700800, date, sizeof(date)) == 0 &&
+              strcmp(date, "2026-11-15") == 0,
+          "a known timestamp formats as a UTC date");
+
+    usage[0].period = 20772;
+    usage[0].used = 333u;
+    check(policy_history_append(path, 0, usage, 1) == 0,
+          "a daily period appends next to the monthly ones");
+    check(policy_history_load(path, rows, 4, &count, &total) == 0 &&
+              count == 3 && total == 3,
+          "the history keeps every appended period");
+    check(rows[2].monthly == 0 && rows[2].used == 333u,
+          "the daily row keeps its kind and usage");
+
+    fp = fopen(path, "a");
+    check(fp != NULL, "open the history to corrupt a line");
+    if (fp != NULL) {
+        fputs("not,a,history,row\n", fp);
+        fclose(fp);
+    }
+    check(policy_history_load(path, rows, 4, &count, &total) == 0 &&
+              count == 3 && total == 3,
+          "a malformed history line is skipped");
+
+    unlink(path);
+    check(policy_history_load(path, rows, 4, &count, &total) == 0 &&
+              count == 0 && total == 0,
+          "a missing history file is not an error");
+}
+
+static void test_usage_history_config(void)
+{
+    static const char server_conf[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "usage_history = /tmp/pipesix-usage.csv\n";
+    static const char client_conf[] =
+        "mode = client\n"
+        "tun_address = fd00::2/64\n"
+        "remote_address = 203.0.113.1\n"
+        "client_id = alice\n"
+        "secret = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "usage_history = /tmp/pipesix-usage.csv\n";
+    pipesix_config_t config;
+    char path[64];
+
+    check(write_temp_file(server_conf, path, sizeof(path)) == 0,
+          "write the usage history configuration");
+    check(config_load(path, &config) == 0,
+          "load the usage history configuration");
+    check(strcmp(config.usage_history, "/tmp/pipesix-usage.csv") == 0,
+          "the usage history path is parsed");
+    check(config_validate(&config) == 0,
+          "a server may configure a usage history");
+    unlink(path);
+
+    check(write_temp_file(client_conf, path, sizeof(path)) == 0,
+          "write a client usage-history fixture");
+    {
+        int rejected = config_load(path, &config) != 0;
+
+        if (!rejected) {
+            rejected = config_validate(&config) != 0;
+        }
+        check(rejected, "a client rejects a usage history");
+    }
+    unlink(path);
+}
+
 static void test_stats_json(void)
 {
     pipesix_stats_t stats;
@@ -2167,6 +2337,9 @@ int main(void)
     test_allow_client();
     test_client_provisioning();
     test_prefix_delegation();
+    test_quota_state_frames();
+    test_usage_history();
+    test_usage_history_config();
     test_stats_json();
     test_stats_prometheus();
     test_packet_too_big();

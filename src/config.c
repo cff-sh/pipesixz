@@ -737,6 +737,9 @@ static int config_set_value(pipesix_config_t *config, const char *key,
     if (strcmp(key, "quota_state") == 0) {
         return copy_string(config->quota_state, CONFIG_PATH_MAX, value);
     }
+    if (strcmp(key, "usage_history") == 0) {
+        return copy_string(config->usage_history, CONFIG_PATH_MAX, value);
+    }
     if (strcmp(key, "client_prefix_pool") == 0) {
         return set_prefix_pool(config, value);
     }
@@ -991,6 +994,11 @@ int config_validate(const pipesix_config_t *config)
         if (config->client_prefix_pool[0] != '\0') {
             log_error("Configuration validation failed: "
                       "'client_prefix_pool' is only valid in server mode");
+            return -1;
+        }
+        if (config->usage_history[0] != '\0') {
+            log_error("Configuration validation failed: "
+                      "'usage_history' is only valid in server mode");
             return -1;
         }
     }
@@ -1276,6 +1284,9 @@ void config_dump(const pipesix_config_t *config)
             log_info("  quota_state     = %s", config->quota_state);
         } else {
             log_info("  quota_state     = disabled");
+        }
+        if (config->usage_history[0] != '\0') {
+            log_info("  usage_history   = %s", config->usage_history);
         }
         if (config->client_prefix_pool[0] != '\0') {
             log_info("  client_prefix_pool = %s",

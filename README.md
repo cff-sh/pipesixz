@@ -33,6 +33,9 @@ Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] �
   the configuration atomically and make a running server reload it
 - Prefix delegation: `--add-client <id> --delegate` hands a client a whole
   /64 from `client_prefix_pool`, so it can route a LAN instead of one address
+- Completed quota periods are kept in an append-only history
+  (`--usage --history`), and a client can read its own quota state through
+  `--status` instead of only seeing warning notices
 - Periodic statistics and on-demand dumps via SIGUSR1, plus Prometheus
   metrics over HTTP (`metrics_address`) or `--metrics`
 - Path-MTU feedback: a packet larger than the relay's `tun_mtu` is answered
@@ -332,6 +335,22 @@ Each notice is sent once per session, state and period. A client from an
 older release drops the notice as an unknown frame and keeps working; the
 visible warning needs both ends updated.
 
+A current client asks for its quota state once per session with an
+authenticated request, and the server answers with the limit, the bytes
+counted for the current period and the period bounds. The server also
+pushes a fresh state when a period ends, and a warning or exhaustion
+notice makes the client ask again. `--status` shows it:
+
+```text
+quota: used=734003200 B limit=10737418240 B left=10003415040 B period=2026-11-01..2026-12-01 UTC
+```
+
+The same numbers appear as a `quota` object in `--status --json`. An older
+server rejects the single request as an unknown frame and keeps the
+session; the client simply prints no quota line, so neither side needs a
+flag day. The request and the reply are authenticated with the session
+key, so an off-path attacker cannot fake either.
+
 Limits follow the `client` line that names them, like `client_route`, and
 `--remove-client` removes them along with the client.
 
@@ -405,6 +424,45 @@ table with the header
 `client_id,period_start,period_end,used_bytes,quota_bytes,quota_remaining_bytes,rate_kbps,connected`.
 Both strip the `OK` line, so the output pipes straight into `jq` or a
 spreadsheet.
+
+#### Period history
+
+Set `usage_history` to keep completed periods, not just the current one:
+
+```ini
+usage_history = /var/lib/pipesix/usage.csv
+```
+
+The server appends one row per client when a day or month ends, and also
+at startup when it was down across a boundary and the state file still
+holds the old period. Records are never rewritten, so a restart cannot
+lose or duplicate an earlier period. The file is created with mode `0600`,
+and its directory must exist.
+
+```bash
+sudo pipesix --usage --history -c /etc/pipesix/pipesix.conf
+sudo pipesix --usage --history --json -c /etc/pipesix/pipesix.conf | jq .history
+sudo pipesix --usage --history --csv -c /etc/pipesix/pipesix.conf > history.csv
+```
+
+```text
+$ sudo pipesix --usage --history
+mode: server
+config: /etc/pipesix/pipesix.conf
+history: /var/lib/pipesix/usage.csv (3 record(s))
+  alice 2026-09-01..2026-10-01 (monthly) used=536870912 B
+  bob 2026-09-01..2026-10-01 (monthly) used=1048576 B
+  alice 2026-10-01..2026-11-01 (monthly) used=734003200 B
+```
+
+The history is read directly from the file, so the command works while the
+server is stopped and does not need the control socket. `--json` emits
+`{"mode","config","history":[{"client_id","period_start_unix",
+"period_end_unix","period","used_bytes"}]}`; `--csv` emits
+`client_id,period_start,period_end,period,used_bytes`. At most 8192 records
+are loaded; the text report says how many older rows were not shown.
+Rotate the file yourself when it grows; changing `usage_history` needs a
+restart, like `quota_state`.
 
 ### Provisioning clients
 

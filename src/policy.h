@@ -142,6 +142,59 @@ typedef struct {
     uint64_t used;   /* bytes charged that period */
 } policy_usage_t;
 
+/* Most completed periods a single history query loads. */
+#define POLICY_HISTORY_MAX 8192
+
+/*
+ * One client's completed period, as stored in the usage history.
+ */
+typedef struct {
+    char     id[POLICY_MAX_ID];
+    int64_t  start_unix;
+    int64_t  end_unix;
+    int      monthly;  /* period kind the record was written under */
+    uint64_t used;
+} policy_history_t;
+
+/*
+ * Append completed periods to 'path' as CSV.
+ *
+ * The file is created with mode 0600 and a header when it is empty; every
+ * call appends one row per entry, so a failed period can never overwrite
+ * an older one. The caller passes the period kind the usage was counted
+ * under. A directory that does not exist is an error.
+ *
+ * Returns:
+ *   0 on success (including count 0), -1 on failure
+ */
+int policy_history_append(const char *path, int monthly,
+                          const policy_usage_t *usage, int count);
+
+/*
+ * Read completed periods from 'path'.
+ *
+ * A missing file is not an error: *count and *total are 0. Malformed
+ * lines and header/comment lines are skipped. At most max entries are
+ * stored in out; *total reports how many valid rows the file holds, so a
+ * caller can say that older records were not shown.
+ *
+ * Returns:
+ *   0 on success (including a missing file), -1 when the file cannot be
+ *   read
+ */
+int policy_history_load(const char *path, policy_history_t *out, int max,
+                        int *count, int *total);
+
+/*
+ * Format a timestamp as YYYY-MM-DD in UTC.
+ *
+ * Uses gmtime()'s static buffer, so this is for reporting paths only, not
+ * the data path (which uses the pure arithmetic above).
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+int policy_format_date(time_t t, char *out, size_t size);
+
 /*
  * Write usage to 'path', replacing it atomically.
  *

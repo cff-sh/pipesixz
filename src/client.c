@@ -35,6 +35,7 @@
 #include "ipv6.h"
 #include "logger.h"
 #include "metrics.h"
+#include "policy.h"
 #include "proto.h"
 #include "runtime.h"
 #include "stats.h"
@@ -73,6 +74,13 @@ typedef struct {
     _Atomic int        stop_workers;
     _Atomic int        handshake_needed;
     _Atomic int        server_closing;
+    /* Last quota state the server reported (see PIPESIX_FLAG_QUOTA_STATE). */
+    _Atomic int        quota_valid;
+    _Atomic uint64_t   quota_limit;
+    _Atomic uint64_t   quota_used;
+    _Atomic int64_t    quota_start;
+    _Atomic int64_t    quota_end;
+    _Atomic time_t     last_quota_request;
     pipesix_replay_t   replay;
     pipesix_stats_t    stats;
 } client_context_t;
@@ -143,6 +151,8 @@ static void reset_session(client_context_t *ctx)
     atomic_store(&ctx->seq, seed);
     atomic_store(&ctx->salt, salt);
     pipesix_replay_reset(&ctx->replay);
+    atomic_store_explicit(&ctx->last_quota_request, 0, memory_order_relaxed);
+    atomic_store_explicit(&ctx->quota_valid, 0, memory_order_relaxed);
 }
 
 /*
@@ -323,6 +333,18 @@ static void *forward_loop(void *arg)
         now = time(NULL);
         keepalive = atomic_load(&ctx->keepalive);
 
+        /*
+         * Ask once per session, and again after a quota notice. The
+         * server keeps the state fresh at period boundaries.
+         */
+        if (atomic_load_explicit(&ctx->last_quota_request,
+                                 memory_order_relaxed) == 0) {
+            if (send_frame(ctx, PIPESIX_FLAG_QUOTA_REQUEST, NULL, 0) == 0) {
+                atomic_store_explicit(&ctx->last_quota_request, now,
+                                      memory_order_relaxed);
+            }
+        }
+
         if (ready > 0) {
             ssize_t nread = tun_read(ctx->tun, packet, sizeof(packet));
 
@@ -452,11 +474,30 @@ static void *reverse_loop(void *arg)
         if ((frame.flags & PIPESIX_FLAG_QUOTA_EXHAUSTED) != 0) {
             log_error("Server reports the quota is exhausted; traffic is "
                       "dropped until the period resets");
+            atomic_store(&ctx->last_quota_request, 0);
             continue;
         }
 
         if ((frame.flags & PIPESIX_FLAG_QUOTA_WARNING) != 0) {
             log_warn("Server reports the quota is nearly exhausted");
+            atomic_store(&ctx->last_quota_request, 0);
+            continue;
+        }
+
+        if ((frame.flags & PIPESIX_FLAG_QUOTA_STATE) != 0) {
+            pipesix_quota_state_t state;
+
+            if (pipesix_quota_state_decode(frame.payload, frame.payload_len,
+                                           &state) != PIPESIX_OK) {
+                stats_add_invalid(&ctx->stats);
+                continue;
+            }
+
+            atomic_store(&ctx->quota_limit, state.limit_bytes);
+            atomic_store(&ctx->quota_used, state.used_bytes);
+            atomic_store(&ctx->quota_start, state.period_start);
+            atomic_store(&ctx->quota_end, state.period_end);
+            atomic_store(&ctx->quota_valid, 1);
             continue;
         }
 
@@ -683,6 +724,7 @@ static int client_control_handler(const char *request, char *reply,
         char tun_addr_esc[256];
         char remote_esc[512];
         char stats_json[768];
+        char quota_json[192];
         int n;
 
         if (control_json_escape(ctx->config->config_path, config_esc,
@@ -705,19 +747,40 @@ static int client_control_handler(const char *request, char *reply,
         stats_format_json(&ctx->stats, "client", stats_json,
                           sizeof(stats_json));
 
+        if (atomic_load(&ctx->quota_valid)) {
+            uint64_t limit = atomic_load(&ctx->quota_limit);
+            uint64_t used = atomic_load(&ctx->quota_used);
+            uint64_t left = (limit > 0)
+                                ? (used >= limit ? 0 : limit - used)
+                                : 0;
+
+            snprintf(quota_json, sizeof(quota_json),
+                     ",\"quota\":{\"limit_bytes\":%llu,"
+                     "\"used_bytes\":%llu,\"remaining_bytes\":%llu,"
+                     "\"period_start_unix\":%lld,"
+                     "\"period_end_unix\":%lld}",
+                     (unsigned long long)limit,
+                     (unsigned long long)used,
+                     (unsigned long long)left,
+                     (long long)atomic_load(&ctx->quota_start),
+                     (long long)atomic_load(&ctx->quota_end));
+        } else {
+            quota_json[0] = '\0';
+        }
+
         n = snprintf(reply, reply_size,
                      "OK\n{\"mode\":\"client\",\"config\":\"%s\","
                      "\"client_id\":\"%s\","
                      "\"remote\":{\"address\":\"%s\",\"port\":%d},"
                      "\"tun\":{\"name\":\"%s\",\"address\":\"%s\","
                      "\"prefixlen\":%d},"
-                     "\"uptime_seconds\":%lu,\"session\":\"%s\","
+                     "\"uptime_seconds\":%lu,\"session\":\"%s\"%s,"
                      "\"stats\":%s}\n",
                      config_esc, ctx->config->client_id, remote_esc,
                      ctx->config->remote_port, tun_name_esc, tun_addr_esc,
                      ctx->config->tun_prefixlen, uptime,
                      ctx->udp_fd == PSIX_INVALID_SOCKET ? "closed" : "open",
-                     stats_json);
+                     quota_json, stats_json);
 
         if (n < 0 || (size_t)n >= reply_size) {
             snprintf(reply, reply_size,
@@ -752,21 +815,57 @@ static int client_control_handler(const char *request, char *reply,
                  ? (unsigned long)(now - ctx->stats.started)
                  : 0ul;
 
-    snprintf(reply, reply_size,
-             "OK\n"
-             "mode: client\n"
-             "client_id: %s\n"
-             "remote: %s:%d\n"
-             "tun: %s %s/%d\n"
-             "uptime: %lus\n"
-             "session: %s\n"
-             "%s\n",
-             ctx->config->client_id, ctx->config->remote_address,
-             ctx->config->remote_port, ctx->config->tun_name,
-             ctx->config->tun_address, ctx->config->tun_prefixlen,
-             uptime,
-             ctx->udp_fd == PSIX_INVALID_SOCKET ? "closed" : "open",
-             stats_line);
+    {
+        char quota_line[192];
+
+        if (atomic_load(&ctx->quota_valid)) {
+            char start[16] = "?";
+            char end[16] = "?";
+            uint64_t limit = atomic_load(&ctx->quota_limit);
+            uint64_t used = atomic_load(&ctx->quota_used);
+            uint64_t left = (limit > 0)
+                                ? (used >= limit ? 0 : limit - used)
+                                : 0;
+
+            (void)policy_format_date((time_t)atomic_load(&ctx->quota_start),
+                                     start, sizeof(start));
+            (void)policy_format_date((time_t)atomic_load(&ctx->quota_end),
+                                     end, sizeof(end));
+
+            if (limit > 0) {
+                snprintf(quota_line, sizeof(quota_line),
+                         "quota: used=%llu B limit=%llu B left=%llu B "
+                         "period=%s..%s UTC\n",
+                         (unsigned long long)used,
+                         (unsigned long long)limit,
+                         (unsigned long long)left, start, end);
+            } else {
+                snprintf(quota_line, sizeof(quota_line),
+                         "quota: used=%llu B limit=unlimited "
+                         "period=%s..%s UTC\n",
+                         (unsigned long long)used, start, end);
+            }
+        } else {
+            quota_line[0] = '\0';
+        }
+
+        snprintf(reply, reply_size,
+                 "OK\n"
+                 "mode: client\n"
+                 "client_id: %s\n"
+                 "remote: %s:%d\n"
+                 "tun: %s %s/%d\n"
+                 "uptime: %lus\n"
+                 "session: %s\n"
+                 "%s"
+                 "%s\n",
+                 ctx->config->client_id, ctx->config->remote_address,
+                 ctx->config->remote_port, ctx->config->tun_name,
+                 ctx->config->tun_address, ctx->config->tun_prefixlen,
+                 uptime,
+                 ctx->udp_fd == PSIX_INVALID_SOCKET ? "closed" : "open",
+                 quota_line, stats_line);
+    }
     return 0;
 }
 
@@ -805,6 +904,8 @@ int client_start(pipesix_config_t *config)
     atomic_init(&ctx.stop_workers, 0);
     atomic_init(&ctx.handshake_needed, 0);
     atomic_init(&ctx.server_closing, 0);
+    atomic_init(&ctx.quota_valid, 0);
+    atomic_init(&ctx.last_quota_request, 0);
     pipesix_replay_reset(&ctx.replay);
     stats_init(&ctx.stats);
 
