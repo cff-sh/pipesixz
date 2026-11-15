@@ -7,6 +7,10 @@
  *   - a token bucket that caps a client's rate in bytes per second;
  *   - a UTC-day byte quota shared by both directions.
  *
+ * Every configured client is accounted for, with or without a quota, so
+ * 'pipesix --usage' can report the bytes a client moved today and a limit
+ * added later does not start from zero.
+ *
  * Neither structure knows about clients, sockets or configuration, and
  * the time is passed in rather than read, so both can be unit-tested
  * without a clock, a tunnel or root privileges.
@@ -22,6 +26,9 @@
 
 /* Smallest bucket that can still pass one full frame. */
 #define POLICY_MIN_BURST 1600u
+
+/* Longest client id accepted by the state file, including the NUL. */
+#define POLICY_MAX_ID 33
 
 /*
  * Token bucket. A rate of 0 means unlimited, and the bucket functions
@@ -53,7 +60,7 @@ int policy_bucket_allow(pipesix_bucket_t *bucket, size_t bytes,
                         uint64_t now_ms);
 
 /*
- * Per-client daily quota.
+ * Per-client daily usage, and the quota that may cap it.
  *
  * 'used' and 'day' are atomic because the receiver charges traffic the
  * client sent and the sender charges traffic the client received, and
@@ -72,7 +79,8 @@ void policy_quota_init(pipesix_quota_t *quota, uint64_t limit_bytes);
  *
  * Returns 1 while the client is within its budget, 0 once it is not.
  * The bytes are charged either way, so exceeding the quota does not let
- * the next packet through. The counter resets when 'day' changes; two
+ * the next packet through, and a quota of 0 still counts usage instead of
+ * letting it pass unseen. The counter resets when 'day' changes; two
  * threads racing across midnight may lose a handful of bytes from the
  * count, which is deliberate: the data path must not take a lock to
  * account for a policy.
@@ -87,6 +95,59 @@ int policy_quota_charge(pipesix_quota_t *quota, size_t bytes, int day);
  * budget without storing anything.
  */
 uint64_t policy_quota_remaining(const pipesix_quota_t *quota, int day);
+
+/*
+ * Bytes charged for 'day'.
+ *
+ * Returns 0 when the counter belongs to another day. Unlike
+ * policy_quota_remaining() this works for a client without a quota, which
+ * is what 'pipesix --usage' reports.
+ */
+uint64_t policy_quota_used(const pipesix_quota_t *quota, int day);
+
+/*
+ * Put a counter back to a value read from the state file.
+ *
+ * Only meaningful at startup or under the server's session lock: it
+ * replaces the counter without charging anything.
+ */
+void policy_quota_restore(pipesix_quota_t *quota, uint64_t used, int day);
+
+/*
+ * One client's persisted usage line.
+ */
+typedef struct {
+    char     id[POLICY_MAX_ID];
+    int64_t  day;   /* UTC day number, as policy_day() */
+    uint64_t used;  /* bytes charged that day */
+} policy_usage_t;
+
+/*
+ * Write usage to 'path', replacing it atomically.
+ *
+ * The file is written to '<path>.tmp', flushed, and renamed over the
+ * destination, so a crash mid-write leaves the previous state file intact.
+ * It is created with mode 0600.
+ *
+ * Returns:
+ *   0 on success, -1 on failure (the previous file is left alone)
+ */
+int policy_state_save(const char *path, const policy_usage_t *usage,
+                      int count);
+
+/*
+ * Read usage lines from 'path'.
+ *
+ * A missing file is not an error: it means the server has not saved any
+ * state yet, so *count is 0 and the call returns 0. Malformed or
+ * overlong lines are skipped, and at most max entries are stored.
+ *
+ * Returns:
+ *   0 on success (including a missing file), -1 when the file exists but
+ *   cannot be read
+ */
+int policy_state_load(const char *path, policy_usage_t *usage, int max,
+                      int *count);
 
 /*
  * Monotonic milliseconds, for the token buckets. Monotonic matters: a

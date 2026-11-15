@@ -1722,6 +1722,82 @@ static void test_client_policy(void)
           "an unlimited quota always allows");
     check(policy_quota_remaining(&quota, 100) == 0u,
           "an unlimited quota reports no remaining budget");
+
+    /* Usage is counted even without a quota, for --usage. */
+    check(policy_quota_used(&quota, 100) == (1u << 20),
+          "an unlimited quota still counts usage");
+    check(policy_quota_used(&quota, 101) == 0u,
+          "usage belongs to the day it was charged");
+
+    policy_quota_restore(&quota, 2048u, 100);
+    check(policy_quota_used(&quota, 100) == 2048u,
+          "a restored counter is visible again");
+
+    {
+        /* The state file round-trips today's usage per client id. */
+        policy_usage_t saved[2];
+        policy_usage_t loaded[2];
+        char state_path[64];
+        int loaded_count = -1;
+
+        snprintf(state_path, sizeof(state_path), "/tmp/pipesix_state_%ld",
+                 (long)getpid());
+        unlink(state_path);
+
+        memset(saved, 0, sizeof(saved));
+        snprintf(saved[0].id, sizeof(saved[0].id), "%s", "alice");
+        saved[0].day = 20000;
+        saved[0].used = 123456789u;
+        snprintf(saved[1].id, sizeof(saved[1].id), "%s", "bob");
+        saved[1].day = 20000;
+        saved[1].used = 42u;
+
+        check(policy_state_save(state_path, saved, 2) == 0,
+              "save the quota state");
+        check(policy_state_load(state_path, loaded, 2, &loaded_count) == 0,
+              "load the quota state");
+        check(loaded_count == 2, "every client is restored");
+        check(strcmp(loaded[0].id, "alice") == 0 &&
+              loaded[0].day == 20000 && loaded[0].used == 123456789u,
+              "the state file round-trips");
+
+        unlink(state_path);
+        loaded_count = -1;
+        check(policy_state_load(state_path, loaded, 2, &loaded_count) == 0 &&
+              loaded_count == 0,
+              "a missing state file is not an error");
+    }
+
+    {
+        /* A SIGHUP reload applies a changed limit to the live table. */
+        static const char before_reload[] =
+            "mode = server\n"
+            "tun_address = fd00::1/64\n"
+            "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "client_quota = alice 1\n";
+        static const char after_reload[] =
+            "mode = server\n"
+            "tun_address = fd00::1/64\n"
+            "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "client_quota = alice 2\n"
+            "client_rate_limit = alice 1000\n";
+
+        check(write_temp_file(before_reload, path, sizeof(path)) == 0,
+              "write the policy reload fixture");
+        check(config_load(path, &config) == 0,
+              "load the policy reload fixture");
+        check(config.policy_count == 1 && config.policies[0].quota_mib == 1u,
+              "the initial limit is parsed");
+        check(overwrite_file(path, after_reload) == 0,
+              "rewrite the policy reload fixture");
+        check(config_reload_runtime(&config) == 0,
+              "reload applies per-client limits");
+        check(config.policy_count == 1 &&
+              config.policies[0].quota_mib == 2u &&
+              config.policies[0].rate_kbps == 1000u,
+              "the reloaded limits take effect");
+        unlink(path);
+    }
 }
 
 int main(void)

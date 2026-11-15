@@ -204,6 +204,7 @@ static void print_usage(const char *progname)
             "       %s --rotate-all [-c <config>]\n"
             "       %s --add-client <id> [--route <prefix>] [-c <config>]\n"
             "       %s --remove-client <id> [-c <config>]\n"
+            "       %s --usage [--json|--csv] [-c <config>]\n"
             "\n"
             "pipesix %s - IPv6 over UDP Tunnel\n"
             "\n"
@@ -220,7 +221,10 @@ static void print_usage(const char *progname)
             "                          configuration to reload it\n"
             "      --stats             Ask it to dump statistics now\n"
             "      --status            Report the running instance's state\n"
-            "      --json              Print --status as one JSON object\n"
+            "      --json              Print --status or --usage as one\n"
+            "                          JSON object\n"
+            "      --usage             Report per-client usage and limits\n"
+            "      --csv               Print --usage as one CSV table\n"
             "      --metrics           Print the running instance's Prometheus\n"
             "                          metrics\n"
             "      --kick <client-id>  Drop that client's session; it\n"
@@ -249,6 +253,7 @@ static void print_usage(const char *progname)
             "  client          <id>: <secret> entry (server mode, repeatable)\n"
             "  client_rate_limit <id> <kbit/s> (server, repeatable)\n"
             "  client_quota    <id> <MiB/day> (server, repeatable)\n"
+            "  quota_state     File for daily quota usage (server, empty = off)\n"
             "  keepalive       Client keepalive seconds (default: 20, 0 = off)\n"
             "  session_timeout Server idle timeout seconds (default: 120)\n"
             "  peer_timeout    Client reconnect timeout seconds (default: 120, 0 = off)\n"
@@ -266,13 +271,13 @@ static void print_usage(const char *progname)
             "\n"
             "Signal SIGUSR1 dumps traffic statistics immediately.\n"
             "Signal SIGHUP reloads log_level, keepalive, peer_timeout,\n"
-            "session_timeout, stats_interval and keys (server: client\n"
-            "table, client: own secret) for live key rotation.\n"
+            "session_timeout, stats_interval, per-client limits and keys\n"
+            "(server: client table, client: own secret) for live rotation.\n"
             "On Windows there are no signals: use --reload and --stats.\n"
             "The control channel (--status, --kick) is a 0600 UNIX socket\n"
             "and is available on POSIX only.\n",
             progname, progname, progname, progname, progname, progname,
-            PIPESIX_APP_VERSION, DEFAULT_CONFIG_PATH);
+            progname, PIPESIX_APP_VERSION, DEFAULT_CONFIG_PATH);
 }
 
 static int generate_key(void)
@@ -511,6 +516,8 @@ int main(int argc, char *argv[])
         { "status",    no_argument,       NULL, 1002 },
         { "json",      no_argument,       NULL, 1007 },
         { "metrics",   no_argument,       NULL, 1008 },
+        { "usage",     no_argument,       NULL, 1010 },
+        { "csv",       no_argument,       NULL, 1011 },
         { "kick",      required_argument, NULL, 1003 },
         { "add-client", required_argument, NULL, 1004 },
         { "remove-client", required_argument, NULL, 1005 },
@@ -531,6 +538,8 @@ int main(int argc, char *argv[])
     int status_only = 0;
     int json_output = 0;
     int metrics_only = 0;
+    int usage_only = 0;
+    int csv_output = 0;
     const char *kick_id = NULL;
     const char *add_client = NULL;
     const char *remove_client = NULL;
@@ -575,6 +584,12 @@ int main(int argc, char *argv[])
             case 1008:
                 metrics_only = 1;
                 break;
+            case 1010:
+                usage_only = 1;
+                break;
+            case 1011:
+                csv_output = 1;
+                break;
             case 1004:
                 add_client = optarg;
                 break;
@@ -618,8 +633,18 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    if (json_output && !status_only) {
-        fprintf(stderr, "Error: --json requires --status\n");
+    if (json_output && !status_only && !usage_only) {
+        fprintf(stderr, "Error: --json requires --status or --usage\n");
+        return EXIT_FAILURE;
+    }
+
+    if (csv_output && !usage_only) {
+        fprintf(stderr, "Error: --csv requires --usage\n");
+        return EXIT_FAILURE;
+    }
+
+    if (json_output && csv_output) {
+        fprintf(stderr, "Error: --json and --csv are mutually exclusive\n");
         return EXIT_FAILURE;
     }
 
@@ -628,7 +653,7 @@ int main(int argc, char *argv[])
      * starting a second one, so they are answered before the
      * configuration is loaded (and before anything is logged to stderr).
      */
-    if (status_only || kick_id != NULL || metrics_only) {
+    if (status_only || kick_id != NULL || metrics_only || usage_only) {
         char reply[CONTROL_MAX_REPLY];
         char request[CONFIG_MAX_CLIENT_ID + 16];
 
@@ -638,6 +663,9 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
             snprintf(request, sizeof(request), "kick %s", kick_id);
+        } else if (usage_only) {
+            snprintf(request, sizeof(request), "usage%s",
+                     csv_output ? " csv" : (json_output ? " json" : ""));
         } else if (metrics_only) {
             snprintf(request, sizeof(request), "metrics");
         } else if (json_output) {
@@ -654,7 +682,7 @@ int main(int argc, char *argv[])
             return EXIT_FAILURE;
         }
 
-        if (json_output || metrics_only) {
+        if (json_output || metrics_only || csv_output) {
             /*
              * Strip the channel's OK line so stdout is the JSON object or
              * the metrics body itself, ready to pipe into jq or a scraper.

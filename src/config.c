@@ -578,6 +578,9 @@ static int config_set_value(pipesix_config_t *config, const char *key,
     if (strcmp(key, "metrics_token") == 0) {
         return copy_string(config->metrics_token, CONFIG_MAX_SECRET, value);
     }
+    if (strcmp(key, "quota_state") == 0) {
+        return copy_string(config->quota_state, CONFIG_PATH_MAX, value);
+    }
     if (strcmp(key, "client_id") == 0) {
         if (!valid_client_id(value)) {
             return -1;
@@ -967,6 +970,13 @@ void config_dump(const pipesix_config_t *config)
     } else {
         log_info("  metrics         = disabled");
     }
+    if (strcmp(config->mode, "server") == 0) {
+        if (config->quota_state[0] != '\0') {
+            log_info("  quota_state     = %s", config->quota_state);
+        } else {
+            log_info("  quota_state     = disabled");
+        }
+    }
     log_info("  log_level       = %s", level_str);
 }
 
@@ -1005,6 +1015,14 @@ int config_reload_runtime(pipesix_config_t *config)
     if (strcmp(config->mode, "server") == 0) {
         config->client_count = fresh.client_count;
         memcpy(config->clients, fresh.clients, sizeof(config->clients));
+
+        /*
+         * Limits are reloadable too, so a cap can be raised, lowered or
+         * lifted on a live tunnel. The server re-indexes its accounting
+         * and buckets from the new table.
+         */
+        config->policy_count = fresh.policy_count;
+        memcpy(config->policies, fresh.policies, sizeof(config->policies));
     } else {
         /*
          * A client's own identity and key are reloadable as well; the

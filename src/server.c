@@ -89,6 +89,8 @@ typedef struct {
     /* Per-client limits, resolved from the configuration at handshake. */
     int                     policy_index;   /* -1 = no limits configured */
     int                     policy_warned;  /* logged once per session */
+    /* Index in the credential table; owns this client's daily usage. */
+    int                     client_index;   /* -1 = unknown client */
     pipesix_bucket_t        rx_bucket;
     pipesix_bucket_t        tx_bucket;
 } server_session_t;
@@ -106,8 +108,15 @@ typedef struct {
     int                hint_count;
     pthread_mutex_t    lock;
     pipesix_stats_t    stats;
-    /* One quota per configured policy, indexed by session->policy_index. */
+    /*
+     * Daily usage and quota, one entry per configured client, indexed like
+     * config->clients. Every client is counted, with or without a quota,
+     * so 'pipesix --usage' can report it and a limit added later starts
+     * from the bytes already moved today.
+     */
     pipesix_quota_t    quotas[CONFIG_MAX_CLIENTS];
+    /* One warning per failure streak, so a broken state file is not noisy. */
+    int                quota_save_warned;
 } server_context_t;
 
 static uint64_t next_seq(server_context_t *ctx)
@@ -130,6 +139,38 @@ static int policy_lookup(const pipesix_config_t *config, const char *id)
     }
 
     return -1;
+}
+
+/*
+ * Index of a client in the credential table.
+ *
+ * The daily usage counters are indexed the same way, so an established
+ * session can charge its own client's counter without a string lookup.
+ */
+static int client_index_lookup(const pipesix_config_t *config, const char *id)
+{
+    int i;
+
+    for (i = 0; i < config->client_count; i++) {
+        if (strcmp(config->clients[i].id, id) == 0) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+/* Daily quota in bytes for a client id, or 0 when it has none. */
+static uint64_t quota_limit_for(const pipesix_config_t *config,
+                                const char *id)
+{
+    int policy = policy_lookup(config, id);
+
+    if (policy < 0) {
+        return 0;
+    }
+
+    return config->policies[policy].quota_mib * 1048576u;
 }
 
 static int sockaddr_equal(const struct sockaddr_storage *a,
@@ -683,6 +724,8 @@ static void handle_handshake_init(server_context_t *ctx,
 
             ctx->sessions[slot].policy_index = policy;
             ctx->sessions[slot].policy_warned = 0;
+            ctx->sessions[slot].client_index =
+                client_index_lookup(ctx->config, id);
 
             if (policy >= 0) {
                 rate_bps = ctx->config->policies[policy].rate_kbps * 125u;
@@ -885,6 +928,18 @@ static const pipesix_client_cred_t *find_cred_in(
 }
 
 /*
+ * Today's usage for one client, kept across a reload.
+ *
+ * The id points into the credential snapshot rather than copying it: that
+ * table is immutable for the duration of the reload.
+ */
+typedef struct {
+    const char *id;
+    uint64_t    used;
+    int         day;
+} quota_snapshot_t;
+
+/*
  * Apply a SIGHUP reload.
  *
  * Timing settings are replaced in place. In server mode the per-client
@@ -907,7 +962,9 @@ static void reload_config(server_context_t *ctx)
     socklen_t hint_addr_len[SERVER_MAX_CLIENTS];
     char hint_ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
     char dropped_ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
+    quota_snapshot_t old_usage[CONFIG_MAX_CLIENTS];
     int before_count = ctx->config->client_count;
+    int old_usage_count = 0;
     int hint_count = 0;
     int dropped_count = 0;
     int rerouted = 0;
@@ -915,6 +972,16 @@ static void reload_config(server_context_t *ctx)
     int i;
 
     memcpy(before, ctx->config->clients, sizeof(before));
+
+    /* Today's usage, keyed by the credential table it belongs to. */
+    for (i = 0; i < before_count; i++) {
+        old_usage[i].id = before[i].id;
+        old_usage[i].day = atomic_load_explicit(&ctx->quotas[i].day,
+                                                memory_order_relaxed);
+        old_usage[i].used = atomic_load_explicit(&ctx->quotas[i].used,
+                                                 memory_order_relaxed);
+    }
+    old_usage_count = before_count;
 
     /*
      * The table swap has to exclude the receiver thread, which reads
@@ -934,6 +1001,40 @@ static void reload_config(server_context_t *ctx)
     atomic_store(&ctx->session_timeout, ctx->config->session_timeout);
 
     pthread_mutex_lock(&ctx->lock);
+
+    /*
+     * The credential table may have been reordered, shrunk or grown, and
+     * the quota table is indexed the same way. Move usage by client id,
+     * not by index, so a reload never charges one client's bytes to
+     * another. A client that gained a quota keeps the usage it already
+     * accumulated today.
+     */
+    {
+        int day = policy_day(time(NULL));
+
+        for (i = 0; i < ctx->config->client_count; i++) {
+            const char *id = ctx->config->clients[i].id;
+            uint64_t limit = quota_limit_for(ctx->config, id);
+            int j;
+
+            policy_quota_init(&ctx->quotas[i], limit);
+
+            for (j = 0; j < old_usage_count; j++) {
+                if (strcmp(old_usage[j].id, id) == 0) {
+                    if (old_usage[j].day == day) {
+                        policy_quota_restore(&ctx->quotas[i],
+                                             old_usage[j].used,
+                                             old_usage[j].day);
+                    }
+                    break;
+                }
+            }
+        }
+
+        for (i = ctx->config->client_count; i < CONFIG_MAX_CLIENTS; i++) {
+            policy_quota_init(&ctx->quotas[i], 0);
+        }
+    }
 
     for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
         server_session_t *session = &ctx->sessions[i];
@@ -992,6 +1093,31 @@ static void reload_config(server_context_t *ctx)
             session->route_warned = 0;
             rerouted++;
         }
+
+        {
+            int policy = policy_lookup(ctx->config, session->client_id);
+            uint64_t rate_bps = 0;
+
+            if (policy >= 0) {
+                rate_bps = ctx->config->policies[policy].rate_kbps * 125u;
+            }
+
+            session->policy_index = policy;
+            session->client_index =
+                client_index_lookup(ctx->config, session->client_id);
+            session->policy_warned = 0;
+
+            /*
+             * Keep the refilled tokens when the cap did not change; only
+             * a new rate may reset the bucket.
+             */
+            if (session->rx_bucket.rate_bps != rate_bps) {
+                policy_bucket_init(&session->rx_bucket, rate_bps,
+                                   policy_now_ms());
+                policy_bucket_init(&session->tx_bucket, rate_bps,
+                                   policy_now_ms());
+            }
+        }
     }
 
     pthread_mutex_unlock(&ctx->lock);
@@ -1015,9 +1141,10 @@ static void reload_config(server_context_t *ctx)
     }
 
     log_info("Configuration reloaded (log_level, keepalive, "
-             "session_timeout, stats_interval, %d credential(s)); "
-             "interface, endpoint and mode changes need a restart",
-             ctx->config->client_count);
+             "session_timeout, stats_interval, %d credential(s), "
+             "%d limit(s)); interface, endpoint and mode changes need a "
+             "restart",
+             ctx->config->client_count, ctx->config->policy_count);
 }
 
 /*
@@ -1260,8 +1387,8 @@ static void *receiver_loop(void *arg)
                                           frame.payload_len,
                                           policy_now_ms());
 
-            if (allowed && session->policy_index >= 0 &&
-                !policy_quota_charge(&ctx->quotas[session->policy_index],
+            if (allowed && session->client_index >= 0 &&
+                !policy_quota_charge(&ctx->quotas[session->client_index],
                                      frame.payload_len, policy_day(now))) {
                 allowed = 0;
             }
@@ -1482,8 +1609,8 @@ static void *sender_loop(void *arg)
             allowed = policy_bucket_allow(&session->tx_bucket,
                                           (size_t)nread, policy_now_ms());
 
-            if (allowed && session->policy_index >= 0 &&
-                !policy_quota_charge(&ctx->quotas[session->policy_index],
+            if (allowed && session->client_index >= 0 &&
+                !policy_quota_charge(&ctx->quotas[session->client_index],
                                      (size_t)nread, policy_day(time(NULL)))) {
                 allowed = 0;
             }
@@ -1745,9 +1872,9 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
             rate_kbps[count] = policy->rate_kbps;
             quota_mib[count] = policy->quota_mib;
 
-            if (policy->quota_mib > 0) {
+            if (policy->quota_mib > 0 && session->client_index >= 0) {
                 quota_remaining[count] = policy_quota_remaining(
-                    &ctx->quotas[session->policy_index], policy_day(now));
+                    &ctx->quotas[session->client_index], policy_day(now));
             }
 
             snprintf(limits[count], sizeof(limits[count]),
@@ -1906,9 +2033,9 @@ static int server_status_json(server_context_t *ctx, char *reply, size_t size)
             rate_kbps[count] = policy->rate_kbps;
             quota_mib[count] = policy->quota_mib;
 
-            if (policy->quota_mib > 0) {
+            if (policy->quota_mib > 0 && session->client_index >= 0) {
                 quota_remaining[count] = policy_quota_remaining(
-                    &ctx->quotas[session->policy_index], policy_day(now));
+                    &ctx->quotas[session->client_index], policy_day(now));
             }
 
             snprintf(limits[count], sizeof(limits[count]),
@@ -1985,6 +2112,190 @@ too_large:
 }
 
 /*
+ * Format the per-client usage report, for --usage.
+ *
+ * Unlike --status this walks the credential table, not the session table,
+ * so a client that is currently offline still shows the bytes it moved
+ * today (and its remaining quota). All three formats are one control
+ * reply: text keeps the OK line like --status, JSON and CSV are stripped
+ * by the CLI before they reach stdout.
+ */
+typedef enum {
+    USAGE_TEXT,
+    USAGE_JSON,
+    USAGE_CSV
+} usage_format_t;
+
+static int server_usage(server_context_t *ctx, char *reply, size_t size,
+                        usage_format_t format)
+{
+    char ids[CONFIG_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
+    uint64_t bytes_used[CONFIG_MAX_CLIENTS];
+    uint64_t quota[CONFIG_MAX_CLIENTS];
+    uint64_t left[CONFIG_MAX_CLIENTS];
+    uint64_t rate[CONFIG_MAX_CLIENTS];
+    int connected[CONFIG_MAX_CLIENTS];
+    char config_esc[1024];
+    char day_start[32] = "?";
+    time_t now = time(NULL);
+    int day = policy_day(now);
+    struct tm tm;
+    size_t len = 0;
+    int count = 0;
+    int i;
+    int j;
+
+    if (gmtime_r(&now, &tm) == NULL ||
+        strftime(day_start, sizeof(day_start), "%Y-%m-%d", &tm) == 0) {
+        snprintf(day_start, sizeof(day_start), "day-%d", day);
+    }
+
+    pthread_mutex_lock(&ctx->lock);
+
+    for (i = 0; i < ctx->config->client_count; i++) {
+        const char *id = ctx->config->clients[i].id;
+        int policy = policy_lookup(ctx->config, id);
+
+        snprintf(ids[count], sizeof(ids[count]), "%s", id);
+        bytes_used[count] = policy_quota_used(&ctx->quotas[i], day);
+        quota[count] = ctx->quotas[i].limit;
+        left[count] = (quota[count] > 0)
+                          ? policy_quota_remaining(&ctx->quotas[i], day)
+                          : 0;
+        rate[count] = (policy >= 0)
+                          ? ctx->config->policies[policy].rate_kbps
+                          : 0;
+        connected[count] = 0;
+
+        for (j = 0; j < SERVER_MAX_CLIENTS; j++) {
+            if (ctx->sessions[j].active &&
+                strcmp(ctx->sessions[j].client_id, ids[count]) == 0) {
+                connected[count] = 1;
+                break;
+            }
+        }
+
+        count++;
+    }
+
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (format == USAGE_CSV) {
+        if (server_control_append(
+                reply, size, &len,
+                "OK\nclient_id,utc_day,used_bytes,quota_bytes,"
+                "quota_remaining_bytes,rate_kbps,connected\n") != 0) {
+            return -1;
+        }
+
+        for (i = 0; i < count; i++) {
+            if (server_control_append(
+                    reply, size, &len, "%s,%s,%llu,%llu,%llu,%llu,%s\n",
+                    ids[i], day_start,
+                    (unsigned long long)bytes_used[i],
+                    (unsigned long long)quota[i],
+                    (unsigned long long)left[i],
+                    (unsigned long long)rate[i],
+                    connected[i] ? "true" : "false") != 0) {
+                return -1;
+            }
+        }
+
+        return 0;
+    }
+
+    if (format == USAGE_JSON) {
+        if (control_json_escape(ctx->config->config_path, config_esc,
+                                sizeof(config_esc)) != 0) {
+            snprintf(reply, size, "ERR cannot encode the usage as JSON\n");
+            return -1;
+        }
+
+        if (server_control_append(
+                reply, size, &len,
+                "OK\n{\"mode\":\"server\",\"config\":\"%s\","
+                "\"utc_day\":\"%s\",\"day_start_unix\":%lld,"
+                "\"clients\":[",
+                config_esc, day_start, (long long)day * 86400) != 0) {
+            goto too_large;
+        }
+
+        for (i = 0; i < count; i++) {
+            if (server_control_append(
+                    reply, size, &len,
+                    "%s{\"client_id\":\"%s\",\"used_bytes\":%llu,"
+                    "\"quota_bytes\":%llu,"
+                    "\"quota_remaining_bytes\":%llu,"
+                    "\"rate_kbps\":%llu,\"connected\":%s}",
+                    i > 0 ? "," : "", ids[i],
+                    (unsigned long long)bytes_used[i],
+                    (unsigned long long)quota[i],
+                    (unsigned long long)left[i],
+                    (unsigned long long)rate[i],
+                    connected[i] ? "true" : "false") != 0) {
+                goto too_large;
+            }
+        }
+
+        if (server_control_append(reply, size, &len, "]}\n") != 0) {
+            goto too_large;
+        }
+
+        return 0;
+    }
+
+    if (server_control_append(reply, size, &len,
+                              "OK\nmode: server\nconfig: %s\n"
+                              "utc_day: %s\nusage: %d client(s)\n",
+                              ctx->config->config_path, day_start,
+                              count) != 0) {
+        goto too_large;
+    }
+
+    for (i = 0; i < count; i++) {
+        if (server_control_append(reply, size, &len, "  %s used=%llu B",
+                                  ids[i],
+                                  (unsigned long long)bytes_used[i]) != 0) {
+            goto too_large;
+        }
+
+        if (quota[i] > 0) {
+            if (server_control_append(reply, size, &len,
+                                      " quota=%llu B left=%llu B",
+                                      (unsigned long long)quota[i],
+                                      (unsigned long long)left[i]) != 0) {
+                goto too_large;
+            }
+        } else if (server_control_append(reply, size, &len,
+                                         " quota=unlimited") != 0) {
+            goto too_large;
+        }
+
+        if (rate[i] > 0) {
+            if (server_control_append(reply, size, &len,
+                                      " rate=%llu kbit/s",
+                                      (unsigned long long)rate[i]) != 0) {
+                goto too_large;
+            }
+        } else if (server_control_append(reply, size, &len,
+                                         " rate=unlimited") != 0) {
+            goto too_large;
+        }
+
+        if (server_control_append(reply, size, &len, " connected=%s\n",
+                                  connected[i] ? "yes" : "no") != 0) {
+            goto too_large;
+        }
+    }
+
+    return 0;
+
+too_large:
+    snprintf(reply, size, "ERR usage is too large to report\n");
+    return -1;
+}
+
+/*
  * Render the Prometheus body for the metrics endpoint.
  *
  * Same rule as --status: the session table is copied under the lock and
@@ -2027,10 +2338,11 @@ static int server_metrics_body(char *out, size_t size, void *arg)
         quota_remaining[count] = 0;
 
         if (session->policy_index >= 0 &&
-            ctx->config->policies[session->policy_index].quota_mib > 0) {
-            quota_limit[count] = ctx->quotas[session->policy_index].limit;
+            ctx->config->policies[session->policy_index].quota_mib > 0 &&
+            session->client_index >= 0) {
+            quota_limit[count] = ctx->quotas[session->client_index].limit;
             quota_remaining[count] = policy_quota_remaining(
-                &ctx->quotas[session->policy_index], policy_day(now));
+                &ctx->quotas[session->client_index], policy_day(now));
         }
 
         idle[count] = (long)(now - session->last_seen);
@@ -2181,6 +2493,18 @@ static int server_control_handler(const char *request, char *reply,
 {
     server_context_t *ctx = (server_context_t *)arg;
 
+    if (strcmp(request, "usage json") == 0) {
+        return server_usage(ctx, reply, size, USAGE_JSON);
+    }
+
+    if (strcmp(request, "usage csv") == 0) {
+        return server_usage(ctx, reply, size, USAGE_CSV);
+    }
+
+    if (strcmp(request, "usage") == 0) {
+        return server_usage(ctx, reply, size, USAGE_TEXT);
+    }
+
     if (strcmp(request, "status json") == 0) {
         return server_status_json(ctx, reply, size);
     }
@@ -2236,6 +2560,102 @@ static int server_control_handler(const char *request, char *reply,
     return -1;
 }
 
+/*
+ * Restore the current UTC day's counters from the state file.
+ *
+ * Called once before the worker threads start, so it needs no lock. A
+ * missing file means nothing has been saved yet, and an entry for another
+ * day is left behind: the quota resets at midnight anyway. Entries for
+ * ids that no longer exist are ignored, which is what makes removing a
+ * client and restoring an older file harmless.
+ */
+static void load_quota_state(server_context_t *ctx)
+{
+    policy_usage_t stored[CONFIG_MAX_CLIENTS];
+    int count = 0;
+    int restored = 0;
+    int today = policy_day(time(NULL));
+    int i;
+
+    if (ctx->config->quota_state[0] == '\0') {
+        return;
+    }
+
+    if (policy_state_load(ctx->config->quota_state, stored,
+                          CONFIG_MAX_CLIENTS, &count) != 0) {
+        log_warn("Cannot read the quota state file '%s': %s",
+                 ctx->config->quota_state, strerror(errno));
+        return;
+    }
+
+    for (i = 0; i < count; i++) {
+        int index = client_index_lookup(ctx->config, stored[i].id);
+
+        if (index < 0) {
+            log_debug("Ignoring quota state for unknown client '%s'",
+                      stored[i].id);
+            continue;
+        }
+
+        if (stored[i].day != today) {
+            continue;
+        }
+
+        policy_quota_restore(&ctx->quotas[index], stored[i].used,
+                             (int)stored[i].day);
+        restored++;
+    }
+
+    if (restored > 0) {
+        log_info("Restored today's quota usage for %d client(s) from '%s'",
+                 restored, ctx->config->quota_state);
+    }
+}
+
+/*
+ * Write every client's current usage to the state file.
+ *
+ * Safe to call at any time: the counters are read atomically under the
+ * session lock, and the file is replaced atomically. A failure is logged
+ * once per failure streak, since this runs every 30 seconds.
+ */
+static int save_quota_state(server_context_t *ctx)
+{
+    policy_usage_t usage[CONFIG_MAX_CLIENTS];
+    int count = 0;
+    int i;
+
+    if (ctx->config->quota_state[0] == '\0') {
+        return 0;
+    }
+
+    pthread_mutex_lock(&ctx->lock);
+
+    for (i = 0; i < ctx->config->client_count; i++) {
+        snprintf(usage[count].id, sizeof(usage[count].id), "%s",
+                 ctx->config->clients[i].id);
+        usage[count].day = (int64_t)atomic_load_explicit(
+            &ctx->quotas[i].day, memory_order_relaxed);
+        usage[count].used = atomic_load_explicit(&ctx->quotas[i].used,
+                                                 memory_order_relaxed);
+        count++;
+    }
+
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (policy_state_save(ctx->config->quota_state, usage, count) != 0) {
+        if (!ctx->quota_save_warned) {
+            log_warn("Cannot write the quota state file '%s': %s",
+                     ctx->config->quota_state, strerror(errno));
+            ctx->quota_save_warned = 1;
+        }
+        return -1;
+    }
+
+    ctx->quota_save_warned = 0;
+    return 0;
+}
+
 int server_start(pipesix_config_t *config)
 {
     tun_device_t tun;
@@ -2279,13 +2699,18 @@ int server_start(pipesix_config_t *config)
     {
         int i;
 
-        /* One accounting entry per policy, indexed like config->policies. */
-        for (i = 0; i < config->policy_count; i++) {
-            uint64_t limit = config->policies[i].quota_mib * 1048576u;
-
-            policy_quota_init(&ctx.quotas[i], limit);
+        /*
+         * Every configured client gets an accounting entry, even without
+         * a quota: --usage reports what it moved today, and a limit added
+         * later does not start from zero.
+         */
+        for (i = 0; i < config->client_count; i++) {
+            policy_quota_init(&ctx.quotas[i],
+                              quota_limit_for(config, config->clients[i].id));
         }
     }
+
+    load_quota_state(&ctx);
 
     rc = pthread_mutex_init(&ctx.lock, NULL);
     if (rc != 0) {
@@ -2340,6 +2765,7 @@ int server_start(pipesix_config_t *config)
 
     {
         time_t last_report = time(NULL);
+        time_t last_quota_save = time(NULL);
 
         while (!runtime_should_stop()) {
             struct timespec delay;
@@ -2367,6 +2793,12 @@ int server_start(pipesix_config_t *config)
             }
 
             sessions_expire(&ctx, now);
+
+            if (ctx.config->quota_state[0] != '\0' &&
+                (now - last_quota_save) >= 30) {
+                save_quota_state(&ctx);
+                last_quota_save = now;
+            }
         }
     }
 
@@ -2385,6 +2817,9 @@ int server_start(pipesix_config_t *config)
 
     pthread_join(sender_thread, NULL);
     log_info("Sender thread joined");
+
+    /* The counters no longer change; keep today's usage for a restart. */
+    save_quota_state(&ctx);
 
     /*
      * The session table and the socket are still intact, and no worker can

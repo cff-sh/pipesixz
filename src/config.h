@@ -28,6 +28,8 @@
  *                      (server mode, repeatable, follows its client line)
  *   client_rate_limit - <id> <kbit/s> bandwidth cap (server, repeatable)
  *   client_quota     - <id> <MiB> bytes per UTC day (server, repeatable)
+ *   quota_state      - File that keeps daily usage across a restart
+ *                      (server mode, empty disables it)
  *   keepalive        - Client keepalive interval in seconds (0 disables)
  *   session_timeout  - Server session idle timeout in seconds (0 disables)
  *   peer_timeout     - Client dead-peer timeout in seconds (0 disables)
@@ -41,10 +43,11 @@
  *   log_level        - debug, info, warn, error, fatal
  *
  * SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout,
- * stats_interval and the credentials from the original configuration
- * file: the client table in server mode, this client's own client_id and
- * secret in client mode. Changes to the interface, endpoints, mode,
- * allow_client or the per-client limits require a restart.
+ * stats_interval, the credentials and the per-client limits from the
+ * original configuration file: the client table in server mode, this
+ * client's own client_id and secret in client mode. Changes to the
+ * interface, endpoints, mode, allow_client, metrics_* or quota_state
+ * require a restart.
  */
 
 #ifndef PIPESIX_CONFIG_H
@@ -173,6 +176,15 @@ typedef struct {
     int  metrics_port;
     char metrics_token[CONFIG_MAX_SECRET];
 
+    /*
+     * Per-client daily quota state (server mode). When set, the server
+     * restores today's counters from this file at startup and rewrites it
+     * periodically and on shutdown. Empty disables persistence. It is
+     * applied at startup like the metrics endpoint, so changing the path
+     * needs a restart.
+     */
+    char quota_state[CONFIG_PATH_MAX];
+
     /* Source path, used by the SIGHUP reload */
     char config_path[CONFIG_PATH_MAX];
 } pipesix_config_t;
@@ -206,10 +218,11 @@ void config_dump(const pipesix_config_t *config);
  * Re-read runtime-tunable settings from config->config_path.
  *
  * Applies log_level, keepalive, peer_timeout, session_timeout,
- * stats_interval and the credentials: the per-client table in server
- * mode, this client's own client_id and secret in client mode (so a key
- * can be rotated on either end without a restart). Interface, endpoint,
- * mode and allow-list changes are ignored until the process restarts.
+ * stats_interval, the per-client limits and the credentials: the
+ * per-client table in server mode, this client's own client_id and secret
+ * in client mode (so a key can be rotated on either end without a
+ * restart). Interface, endpoint, mode, allow-list, metrics and
+ * quota_state changes are ignored until the process restarts.
  *
  * Returns:
  *   0 on success, -1 if the file cannot be loaded or validated (the
