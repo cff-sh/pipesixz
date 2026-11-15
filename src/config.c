@@ -390,6 +390,121 @@ static int set_client_route(pipesix_config_t *config, const char *value)
     return 0;
 }
 
+/*
+ * Read and write the first 64 bits of an IPv6 address in network order.
+ */
+static uint64_t load_be64(const uint8_t *p)
+{
+    return ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+           ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+           ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+           ((uint64_t)p[6] << 8)  | (uint64_t)p[7];
+}
+
+static void store_be64(uint8_t *p, uint64_t value)
+{
+    p[0] = (uint8_t)(value >> 56);
+    p[1] = (uint8_t)(value >> 48);
+    p[2] = (uint8_t)(value >> 40);
+    p[3] = (uint8_t)(value >> 32);
+    p[4] = (uint8_t)(value >> 24);
+    p[5] = (uint8_t)(value >> 16);
+    p[6] = (uint8_t)(value >> 8);
+    p[7] = (uint8_t)value;
+}
+
+/*
+ * Do two IPv6 prefixes cover any common address?
+ */
+static int prefixes_overlap(const uint8_t *a, int a_len,
+                            const uint8_t *b, int b_len)
+{
+    int bits;
+    int full;
+    int rem;
+    uint8_t mask;
+
+    if (a_len <= 0 || b_len <= 0) {
+        return 0;
+    }
+
+    bits = (a_len < b_len) ? a_len : b_len;
+    full = bits / 8;
+    rem = bits % 8;
+
+    if (full > 0 && memcmp(a, b, (size_t)full) != 0) {
+        return 0;
+    }
+    if (rem == 0) {
+        return 1;
+    }
+
+    mask = (uint8_t)(0xFFu << (8 - rem));
+    return (a[full] & mask) == (b[full] & mask);
+}
+
+/*
+ * Parse "client_prefix_pool = <ipv6>/<len>" with a length of 1-64.
+ *
+ * The address must already be the network address: host bits below the
+ * prefix are rejected, so a pool always names a real block. Delegated
+ * prefixes are always /64, which is why the pool cannot be longer.
+ */
+static int set_prefix_pool(pipesix_config_t *config, const char *value)
+{
+    const char *slash;
+    char addr[CONFIG_MAX_ADDRESS];
+    struct in6_addr parsed;
+    size_t addr_len;
+    int prefix_len;
+    int i;
+
+    if (value == NULL) return -1;
+
+    slash = strchr(value, '/');
+    if (slash == NULL) return -1;
+
+    addr_len = (size_t)(slash - value);
+    if (addr_len == 0 || addr_len >= sizeof(addr)) return -1;
+
+    if (parse_int(slash + 1, &prefix_len) != 0 ||
+        prefix_len < 1 || prefix_len > 64) {
+        return -1;
+    }
+
+    memcpy(addr, value, addr_len);
+    addr[addr_len] = '\0';
+
+    if (inet_pton(AF_INET6, addr, &parsed) != 1) return -1;
+    if (IN6_IS_ADDR_UNSPECIFIED(&parsed) ||
+        IN6_IS_ADDR_MULTICAST(&parsed) ||
+        IN6_IS_ADDR_LINKLOCAL(&parsed) ||
+        IN6_IS_ADDR_LOOPBACK(&parsed)) {
+        return -1;
+    }
+
+    for (i = 0; i < 16; i++) {
+        int keep = prefix_len - i * 8;
+
+        if (keep >= 8) {
+            continue;
+        }
+        if (keep <= 0) {
+            if (parsed.s6_addr[i] != 0) return -1;
+        } else {
+            uint8_t mask = (uint8_t)(0xFFu << (8 - keep));
+
+            if ((parsed.s6_addr[i] & (uint8_t)~mask) != 0) return -1;
+        }
+    }
+
+    memcpy(config->prefix_pool, &parsed, sizeof(config->prefix_pool));
+    config->prefix_pool_len = prefix_len;
+
+    return copy_string(config->client_prefix_pool, CONFIG_MAX_ADDRESS,
+                       value);
+}
+
 const pipesix_client_cred_t *config_find_client(const pipesix_config_t *config,
                                                 const char *id)
 {
@@ -621,6 +736,9 @@ static int config_set_value(pipesix_config_t *config, const char *key,
     }
     if (strcmp(key, "quota_state") == 0) {
         return copy_string(config->quota_state, CONFIG_PATH_MAX, value);
+    }
+    if (strcmp(key, "client_prefix_pool") == 0) {
+        return set_prefix_pool(config, value);
     }
     if (strcmp(key, "client_id") == 0) {
         if (!valid_client_id(value)) {
@@ -870,6 +988,11 @@ int config_validate(const pipesix_config_t *config)
             log_error("Configuration validation failed: 'secret' (this client's pre-shared key) is required in client mode");
             return -1;
         }
+        if (config->client_prefix_pool[0] != '\0') {
+            log_error("Configuration validation failed: "
+                      "'client_prefix_pool' is only valid in server mode");
+            return -1;
+        }
     }
 
     if (strcmp(config->mode, "server") == 0) {
@@ -891,6 +1014,14 @@ int config_validate(const pipesix_config_t *config)
         if (config->secret[0] != '\0') {
             log_warn("Server 'secret' is ignored: each client authenticates "
                      "with its own credential from 'client = <id>: <secret>'");
+        }
+
+        if (config->client_prefix_pool[0] != '\0' &&
+            (config->prefix_pool_len < 1 || config->prefix_pool_len > 64)) {
+            log_error("Configuration validation failed: "
+                      "'client_prefix_pool' must be an IPv6 prefix no "
+                      "longer than /64");
+            return -1;
         }
 
         /*
@@ -956,6 +1087,93 @@ int config_validate(const pipesix_config_t *config)
                          "with 'pipesix --genkey'", config->clients[i].id);
             }
         }
+    }
+
+    return 0;
+}
+
+int config_delegate_prefix(const pipesix_config_t *config, uint8_t prefix[16])
+{
+    struct in6_addr tun;
+    uint64_t base;
+    uint64_t blocks;
+    uint64_t index;
+    int free_bits;
+    int tun_len = 0;
+    int have_tun = 0;
+    int i;
+
+    if (config == NULL || prefix == NULL) return -1;
+    if (config->prefix_pool_len < 1 || config->prefix_pool_len > 64) {
+        return -1;
+    }
+
+    free_bits = 64 - config->prefix_pool_len;
+    /*
+     * At most one route per client plus the relay's own /64 can be
+     * unavailable, so scanning two blocks past the client table always
+     * finds a free one when the pool has it. A smaller pool is scanned
+     * in full.
+     */
+    blocks = (free_bits >= 7)
+                 ? (uint64_t)(CONFIG_MAX_CLIENTS + 2)
+                 : (1ULL << (unsigned)free_bits);
+
+    if (config->tun_prefixlen > 0 &&
+        inet_pton(AF_INET6, config->tun_address, &tun) == 1) {
+        have_tun = 1;
+        tun_len = (config->tun_prefixlen > 64) ? 64 : config->tun_prefixlen;
+    }
+
+    base = load_be64(config->prefix_pool);
+
+    for (index = 0; index < blocks; index++) {
+        uint8_t candidate[16];
+        int used = 0;
+
+        memcpy(candidate, config->prefix_pool, sizeof(candidate));
+        store_be64(candidate, base | index);
+        memset(candidate + 8, 0, 8);
+
+        for (i = 0; i < config->client_count; i++) {
+            const pipesix_client_cred_t *cred = &config->clients[i];
+
+            if (cred->prefix_len > 0 &&
+                prefixes_overlap(candidate, 64, cred->prefix,
+                                 cred->prefix_len)) {
+                used = 1;
+                break;
+            }
+        }
+
+        if (used) {
+            continue;
+        }
+        if (have_tun &&
+            prefixes_overlap(candidate, 64, tun.s6_addr, tun_len)) {
+            continue;
+        }
+
+        memcpy(prefix, candidate, sizeof(candidate));
+        return 0;
+    }
+
+    return -1;
+}
+
+int config_format_prefix(const uint8_t addr[16], int prefix_len,
+                         char *out, size_t size)
+{
+    char text[INET6_ADDRSTRLEN];
+
+    if (addr == NULL || out == NULL || size == 0) {
+        return -1;
+    }
+    if (inet_ntop(AF_INET6, addr, text, sizeof(text)) == NULL) {
+        return -1;
+    }
+    if (snprintf(out, size, "%s/%d", text, prefix_len) >= (int)size) {
+        return -1;
     }
 
     return 0;
@@ -1058,6 +1276,10 @@ void config_dump(const pipesix_config_t *config)
             log_info("  quota_state     = %s", config->quota_state);
         } else {
             log_info("  quota_state     = disabled");
+        }
+        if (config->client_prefix_pool[0] != '\0') {
+            log_info("  client_prefix_pool = %s",
+                     config->client_prefix_pool);
         }
     }
     log_info("  log_level       = %s", level_str);

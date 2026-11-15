@@ -88,6 +88,14 @@ secret    = replace-this-with-pipesix-genkey-output
 #client_route = client1 2001:db8:1::2/128  # keep it inside tun_address' prefix
 #client_route = client2 2001:db8:1:2::/64
 #
+# client_prefix_pool: a /64 delegation pool (server mode, optional).
+# 'pipesix --add-client <id> --delegate' takes the lowest /64 that no
+# client_route covers and writes it as that client's client_route, so the
+# client can route a whole LAN. The delegated length is always /64, and
+# the upstream must route the entire pool to the relay's tun0.
+#
+#client_prefix_pool = 2a01:d0:a33f:100::/56
+#
 # Per-client limits (server mode, optional). Both apply in both
 # directions, take the client id first, and are reloaded on SIGHUP.
 # 0 means unlimited and the default is no entry at all.

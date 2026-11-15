@@ -33,6 +33,9 @@
  *   quota_period     - daily (default) or monthly
  *   quota_state      - File that keeps quota usage across a restart
  *                      (server mode, empty disables it)
+ *   client_prefix_pool - IPv6 prefix no longer than /64 that
+ *                      --add-client --delegate carves /64s from
+ *                      (server mode, empty disables delegation)
  *   keepalive        - Client keepalive interval in seconds (0 disables)
  *   session_timeout  - Server session idle timeout in seconds (0 disables)
  *   peer_timeout     - Client dead-peer timeout in seconds (0 disables)
@@ -193,6 +196,17 @@ typedef struct {
      */
     char quota_state[CONFIG_PATH_MAX];
 
+    /*
+     * Delegated return prefixes (server mode). When set, a /64 carved
+     * from this pool can become a client's route, so that client owns a
+     * whole LAN instead of a single address. The pool has to be routed
+     * to the relay by the upstream. Only provisioning reads it, so it
+     * needs no reload handling.
+     */
+    char    client_prefix_pool[CONFIG_MAX_ADDRESS];
+    uint8_t prefix_pool[16];
+    int     prefix_pool_len;   /* 0 = unset, otherwise 1-64 */
+
     /* Source path, used by the SIGHUP reload */
     char config_path[CONFIG_PATH_MAX];
 } pipesix_config_t;
@@ -295,6 +309,30 @@ int config_set_limits(pipesix_config_t *config, const char *id,
                       const uint64_t *warn_percent);
 
 int config_clear_limits(pipesix_config_t *config, const char *id);
+
+/*
+ * Allocate the lowest free /64 in 'client_prefix_pool'.
+ *
+ * A block is free when no configured 'client_route' overlaps it and it
+ * does not contain the relay's own 'tun_address'. Explicit routes always
+ * win, so a host route carved out of a delegated prefix makes that /64
+ * unavailable. The allocation is not recorded here: the caller writes
+ * the prefix as the client's 'client_route', which is what makes it
+ * stable across restarts.
+ *
+ * On success prefix holds the 16 address bytes and 0 is returned.
+ * Returns -1 when no pool is configured or every /64 is taken.
+ */
+int config_delegate_prefix(const pipesix_config_t *config, uint8_t prefix[16]);
+
+/*
+ * Format a 16-byte IPv6 address and prefix length as "<addr>/<len>".
+ *
+ * Returns 0 on success, -1 when the address cannot be formatted or the
+ * result does not fit in out.
+ */
+int config_format_prefix(const uint8_t addr[16], int prefix_len,
+                         char *out, size_t size);
 
 /*
  * Remove a client and its 'client_route' line from a server

@@ -1484,6 +1484,195 @@ static void test_client_provisioning(void)
     unlink(path);
 }
 
+/*
+ * Prefix delegation: the pool is parsed and validated, allocation skips
+ * explicit routes and the relay's own prefix, and --add-client can write
+ * the result as an ordinary client_route.
+ */
+static void test_prefix_delegation(void)
+{
+    static const char fixture[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client_prefix_pool = 2a01:d0:aa:100::/56\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_route = alice 2a01:d0:aa:100::/64\n";
+    static const char tun_in_pool[] =
+        "mode = server\n"
+        "tun_address = 2a01:d0:aa:100::1/64\n"
+        "client_prefix_pool = 2a01:d0:aa:100::/56\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+    static const char host_inside_block[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client_prefix_pool = 2a01:d0:aa:100::/56\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_route = alice 2a01:d0:aa:102::5/128\n";
+    static const char exhausted[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client_prefix_pool = 2a01:d0:aa:100::/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_route = alice 2a01:d0:aa:100::/64\n";
+    static const char bad_host_bits[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client_prefix_pool = 2a01:d0:aa:100::1/56\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+    static const char bad_too_long[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client_prefix_pool = 2a01:d0:aa:100::/65\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+    static const char bad_no_slash[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client_prefix_pool = 2a01:d0:aa:100::\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+    static const char bad_unspecified[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client_prefix_pool = ::/48\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+    static const char bad_client_mode[] =
+        "mode = client\n"
+        "tun_address = fd00::2/64\n"
+        "remote_address = 203.0.113.1\n"
+        "client_id = alice\n"
+        "secret = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_prefix_pool = 2a01:d0:aa:100::/56\n";
+    pipesix_config_t config;
+    pipesix_config_t reloaded;
+    const pipesix_client_cred_t *cred;
+    char path[64];
+    char route[CONFIG_MAX_ADDRESS];
+    char secret[PIPESIX_KEY_LEN * 2 + 1];
+    uint8_t prefix[16];
+    uint8_t expected[16];
+
+    check(write_temp_file(fixture, path, sizeof(path)) == 0,
+          "write the delegation fixture");
+    check(config_load(path, &config) == 0, "load the delegation fixture");
+    check(config_validate(&config) == 0, "the delegation fixture validates");
+    check(config.prefix_pool_len == 56, "the pool prefix length is parsed");
+    check(config_delegate_prefix(&config, prefix) == 0,
+          "a free /64 is delegated");
+    check(config_format_prefix(prefix, 64, route, sizeof(route)) == 0,
+          "the delegated prefix formats");
+    check(strcmp(route, "2a01:d0:aa:101::/64") == 0,
+          "allocation skips the prefix alice already routes");
+
+    check(config_add_client(&config, "bob", route, NULL, secret,
+                            sizeof(secret)) == 0,
+          "add-client accepts the delegated route");
+    check(config_load(path, &reloaded) == 0, "reload after delegation");
+    cred = config_find_client(&reloaded, "bob");
+    check(cred != NULL && cred->prefix_len == 64,
+          "the delegated prefix is a /64 route");
+    check(cred != NULL &&
+              inet_pton(AF_INET6, "2a01:d0:aa:101::", expected) == 1 &&
+              memcmp(cred->prefix, expected, sizeof(expected)) == 0,
+          "the delegated prefix is in the file");
+    check(config_delegate_prefix(&reloaded, prefix) == 0 &&
+              config_format_prefix(prefix, 64, route, sizeof(route)) == 0 &&
+              strcmp(route, "2a01:d0:aa:102::/64") == 0,
+          "the next allocation moves on");
+
+    unlink(path);
+    check(write_temp_file(host_inside_block, path, sizeof(path)) == 0,
+          "write the host-route fixture");
+    check(config_load(path, &config) == 0, "load the host-route fixture");
+    check(config_delegate_prefix(&config, prefix) == 0 &&
+              config_format_prefix(prefix, 64, route, sizeof(route)) == 0 &&
+              strcmp(route, "2a01:d0:aa:100::/64") == 0,
+          "a free block before the conflict is still used");
+
+    unlink(path);
+    check(write_temp_file(tun_in_pool, path, sizeof(path)) == 0,
+          "write the tun-in-pool fixture");
+    check(config_load(path, &config) == 0, "load the tun-in-pool fixture");
+    check(config_delegate_prefix(&config, prefix) == 0 &&
+              config_format_prefix(prefix, 64, route, sizeof(route)) == 0 &&
+              strcmp(route, "2a01:d0:aa:101::/64") == 0,
+          "the relay's own /64 is skipped");
+
+    /*
+     * The relay plus 63 client routes can block the first 64 blocks; a
+     * larger pool must still yield block 64 instead of claiming to be
+     * full.
+     */
+    {
+        pipesix_config_t wide;
+        uint8_t wide_prefix[16];
+        int i;
+
+        memset(&wide, 0, sizeof(wide));
+        check(inet_pton(AF_INET6, "2a01:d0:aa:100::", wide.prefix_pool) == 1,
+              "parse the wide pool");
+        wide.prefix_pool_len = 56;
+        snprintf(wide.tun_address, sizeof(wide.tun_address), "%s",
+                 "2a01:d0:aa:100::1");
+        wide.tun_prefixlen = 64;
+        for (i = 1; i <= 63; i++) {
+            memcpy(wide.clients[wide.client_count].prefix,
+                   wide.prefix_pool, 16);
+            wide.clients[wide.client_count].prefix[7] =
+                (uint8_t)(wide.clients[wide.client_count].prefix[7] +
+                          (uint8_t)i);
+            wide.clients[wide.client_count].prefix_len = 64;
+            snprintf(wide.clients[wide.client_count].id,
+                     sizeof(wide.clients[0].id), "c%d", i);
+            wide.client_count++;
+        }
+
+        check(config_delegate_prefix(&wide, wide_prefix) == 0 &&
+                  config_format_prefix(wide_prefix, 64, route,
+                                       sizeof(route)) == 0 &&
+                  strcmp(route, "2a01:d0:aa:140::/64") == 0,
+              "the allocator looks past a full first table of blocks");
+    }
+
+    unlink(path);
+    check(write_temp_file(exhausted, path, sizeof(path)) == 0,
+          "write the exhausted-pool fixture");
+    check(config_load(path, &config) == 0, "load the exhausted-pool fixture");
+    check(config_delegate_prefix(&config, prefix) != 0,
+          "a full pool delegates nothing");
+
+    unlink(path);
+    check(write_temp_file(bad_host_bits, path, sizeof(path)) == 0,
+          "write the host-bits fixture");
+    check(config_load(path, &config) != 0,
+          "a pool with host bits is rejected");
+
+    check(write_temp_file(bad_too_long, path, sizeof(path)) == 0,
+          "write the long-prefix fixture");
+    check(config_load(path, &config) != 0,
+          "a pool longer than /64 is rejected");
+
+    check(write_temp_file(bad_no_slash, path, sizeof(path)) == 0,
+          "write the no-slash fixture");
+    check(config_load(path, &config) != 0,
+          "a pool without a length is rejected");
+
+    check(write_temp_file(bad_unspecified, path, sizeof(path)) == 0,
+          "write the unspecified-pool fixture");
+    check(config_load(path, &config) != 0, "an unspecified pool is rejected");
+
+    check(write_temp_file(bad_client_mode, path, sizeof(path)) == 0,
+          "write the client-mode pool fixture");
+    {
+        int rejected = config_load(path, &config) != 0;
+
+        if (!rejected) {
+            rejected = config_validate(&config) != 0;
+        }
+        check(rejected, "a client configuration rejects a delegation pool");
+    }
+
+    unlink(path);
+}
+
 static void test_stats_json(void)
 {
     pipesix_stats_t stats;
@@ -1977,6 +2166,7 @@ int main(void)
     test_rotate_all_keys();
     test_allow_client();
     test_client_provisioning();
+    test_prefix_delegation();
     test_stats_json();
     test_stats_prometheus();
     test_packet_too_big();

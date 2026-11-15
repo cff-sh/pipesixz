@@ -31,6 +31,8 @@ Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] �
   credential can be rotated without restarting a process
 - Runtime client provisioning: `--add-client` and `--remove-client` rewrite
   the configuration atomically and make a running server reload it
+- Prefix delegation: `--add-client <id> --delegate` hands a client a whole
+  /64 from `client_prefix_pool`, so it can route a LAN instead of one address
 - Periodic statistics and on-demand dumps via SIGUSR1, plus Prometheus
   metrics over HTTP (`metrics_address`) or `--metrics`
 - Path-MTU feedback: a packet larger than the relay's `tun_mtu` is answered
@@ -424,6 +426,55 @@ server needs at least one credential.
 
 Without `--route` the client is admitted but only receives return traffic
 while it is the single connected session.
+
+### Delegated prefixes
+
+A client that routes a LAN needs a /64 of its own, not a single /128.
+Configure a pool on the server and let provisioning carve a prefix from it:
+
+```ini
+client_prefix_pool = 2a01:d0:a33f:100::/56
+```
+
+```bash
+sudo pipesix --add-client mac1 --delegate -c /etc/pipesix/pipesix.conf
+```
+
+The command takes the lowest /64 in the pool that no `client_route` covers
+and that does not contain the relay's own `tun_address`, writes
+`client_route = mac1 <prefix>/64`, and prints the prefix plus a suggested
+client address:
+
+```text
+  client_route = mac1 2a01:d0:a33f:101::/64
+
+Delegated 2a01:d0:a33f:101::/64 from 'client_prefix_pool'.
+  on the client: tun_address = 2a01:d0:a33f:101::1/64 (and route the /64 on its LAN)
+```
+
+`--delegate` and `--route` are mutually exclusive, and `--delegate` needs a
+`client_prefix_pool`. A full pool is an error rather than a reused prefix.
+The allocation is a provisioning step: the chosen route is written to the
+file like any other `client_route`, so it survives restarts and reloads,
+and explicit routes always win. A host route carved out of a delegated /64
+therefore stays with its own client, and the delegating client sees that
+block as unavailable.
+
+Two things must hold outside pipesix:
+
+- The upstream must route the whole pool to the relay's `tun0`, not only
+  the relay's own /64. A /56 pool needs a /56 (or larger) allocated to the
+  VPS; Route64's /48 is large enough for 65,536 delegated /64s. The relay
+  can
+  only forward packets that reach its TUN device.
+- The client must put `tun_address` inside its delegated /64, enable IPv6
+  forwarding, and route or advertise that /64 on its LAN. On Linux that
+  means `net.ipv6.conf.all.forwarding=1` plus a static route on the LAN
+  router or Router Advertisements from the client itself.
+
+The server does not verify inner source addresses, so a client may use any
+address in its delegated /64. Rate limits and quotas count the whole
+session, LAN traffic included.
 
 ### Rotating a key
 

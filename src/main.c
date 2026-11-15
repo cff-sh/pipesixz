@@ -11,7 +11,7 @@
  *   pipesix -t [-c <config>]      Validate the configuration and exit
  *   pipesix --genkey              Print a random 256-bit per-client key
  *   pipesix --rotate-all          Replace every client key and reload the server
- *   pipesix --add-client <id> [--route <prefix>]
+ *   pipesix --add-client <id> [--route <prefix> | --delegate]
  *                                 Add a client to the server configuration
  *   pipesix --remove-client <id>  Remove a client from the configuration
  *   pipesix -V                    Show version information
@@ -202,7 +202,8 @@ static void print_usage(const char *progname)
             "       %s -t [-c <config>]\n"
             "       %s --genkey\n"
             "       %s --rotate-all [-c <config>]\n"
-            "       %s --add-client <id> [--route <prefix>] [-c <config>]\n"
+            "       %s --add-client <id> [--route <prefix> | --delegate]\n"
+            "                          [-c <config>]\n"
             "       %s --remove-client <id> [-c <config>]\n"
             "       %s --set-limit <id> [--rate <kbps>] [--quota <MiB>]\n"
             "                          [--quota-warn <percent>] [-c <config>]\n"
@@ -252,6 +253,8 @@ static void print_usage(const char *progname)
             "      --quota-warn <pct>  Tell the client when this percentage\n"
             "                          of its quota is used (1-99)\n"
             "      --route <prefix>    Return route for --add-client\n"
+            "      --delegate          Give --add-client a free /64 from\n"
+            "                          'client_prefix_pool' as its route\n"
             "  -V, --version           Show version information\n"
             "  -h, --help              Show this help message\n"
             "\n"
@@ -268,11 +271,15 @@ static void print_usage(const char *progname)
             "  secret          This client's pre-shared key (client mode)\n"
             "  client_id       This client's identity (client mode)\n"
             "  client          <id>: <secret> entry (server mode, repeatable)\n"
+            "  client_route    <id> <prefix> (server, repeatable)\n"
+            "  client_prefix_pool <ipv6>/<len> /64 delegation pool (server)\n"
             "  client_rate_limit <id> <kbit/s> (server, repeatable)\n"
             "  client_quota    <id> <MiB> per period (server, repeatable)\n"
             "  client_quota_warn <id> <percent> (server, repeatable)\n"
             "  quota_period    daily | monthly (default: daily)\n"
-            "  quota_state     File for quota usage (server, empty = off)\n"
+            "  quota_state     File for quota usage (server, empty = off)\n");
+
+    fprintf(stderr,
             "  keepalive       Client keepalive seconds (default: 20, 0 = off)\n"
             "  session_timeout Server idle timeout seconds (default: 120)\n"
             "  peer_timeout    Client reconnect timeout seconds (default: 120, 0 = off)\n"
@@ -563,6 +570,7 @@ int main(int argc, char *argv[])
         { "add-client", required_argument, NULL, 1004 },
         { "remove-client", required_argument, NULL, 1005 },
         { "route",     required_argument, NULL, 1006 },
+        { "delegate",  no_argument,       NULL, 1017 },
         { "version",   no_argument,       NULL, 'V' },
         { "help",      no_argument,       NULL, 'h' },
         { NULL,        0,                 NULL, 0   }
@@ -596,6 +604,7 @@ int main(int argc, char *argv[])
     const char *add_client = NULL;
     const char *remove_client = NULL;
     const char *add_route = NULL;
+    int delegate = 0;
     int opt;
 
     while ((opt = getopt_long(argc, argv, "c:tl:gRVh", long_options, NULL)) != -1) {
@@ -666,6 +675,9 @@ int main(int argc, char *argv[])
             case 1006:
                 add_route = optarg;
                 break;
+            case 1017:
+                delegate = 1;
+                break;
             case 'V':
                 printf("pipesix %s (protocol %d)\n",
                        PIPESIX_APP_VERSION, PIPESIX_VERSION);
@@ -697,6 +709,18 @@ int main(int argc, char *argv[])
 
     if (add_route != NULL && add_client == NULL) {
         fprintf(stderr, "Error: --route is only valid with --add-client\n");
+        return EXIT_FAILURE;
+    }
+
+    if (delegate && add_client == NULL) {
+        fprintf(stderr, "Error: --delegate is only valid with "
+                        "--add-client\n");
+        return EXIT_FAILURE;
+    }
+
+    if (delegate && add_route != NULL) {
+        fprintf(stderr, "Error: --delegate and --route are mutually "
+                        "exclusive\n");
         return EXIT_FAILURE;
     }
 
@@ -844,6 +868,48 @@ int main(int argc, char *argv[])
         if (add_client != NULL) {
             pipesix_client_policy_t limits;
             int have_limits = have_rate || have_quota || have_warn;
+            const char *route = add_route;
+            char delegated_route[CONFIG_MAX_ADDRESS];
+            char client_address[CONFIG_MAX_ADDRESS];
+            uint8_t delegated[16];
+
+            if (delegate) {
+                uint8_t address[16];
+
+                if (config.prefix_pool_len <= 0) {
+                    fprintf(stderr,
+                            "Error: --delegate needs a "
+                            "'client_prefix_pool' in '%s'\n",
+                            config_path);
+                    return EXIT_FAILURE;
+                }
+
+                if (config_delegate_prefix(&config, delegated) != 0) {
+                    fprintf(stderr,
+                            "Error: no free /64 left in "
+                            "'client_prefix_pool' for client '%s'\n",
+                            add_client);
+                    return EXIT_FAILURE;
+                }
+
+                if (config_format_prefix(delegated, 64, delegated_route,
+                                         sizeof(delegated_route)) != 0) {
+                    fprintf(stderr,
+                            "Error: cannot format the delegated prefix\n");
+                    return EXIT_FAILURE;
+                }
+
+                memcpy(address, delegated, sizeof(address));
+                address[15] = 1;
+                if (config_format_prefix(address, 64, client_address,
+                                         sizeof(client_address)) != 0) {
+                    fprintf(stderr,
+                            "Error: cannot format the client address\n");
+                    return EXIT_FAILURE;
+                }
+
+                route = delegated_route;
+            }
 
             memset(&limits, 0, sizeof(limits));
             snprintf(limits.id, sizeof(limits.id), "%s", add_client);
@@ -851,7 +917,7 @@ int main(int argc, char *argv[])
             limits.quota_mib = have_quota ? quota_mib : 0;
             limits.warn_percent = have_warn ? warn_percent : 0;
 
-            if (config_add_client(&config, add_client, add_route,
+            if (config_add_client(&config, add_client, route,
                                   have_limits ? &limits : NULL, secret,
                                   sizeof(secret)) != 0) {
                 fprintf(stderr, "Error: cannot add client '%s' to '%s'\n",
@@ -862,8 +928,14 @@ int main(int argc, char *argv[])
             printf("Added client '%s' to %s\n\n", add_client, config_path);
             printf("  client_id = %s\n", add_client);
             printf("  secret    = %s\n", secret);
-            if (add_route != NULL) {
-                printf("  client_route = %s %s\n", add_client, add_route);
+            if (route != NULL) {
+                printf("  client_route = %s %s\n", add_client, route);
+            }
+            if (delegate) {
+                printf("\nDelegated %s from 'client_prefix_pool'.\n",
+                       delegated_route);
+                printf("  on the client: tun_address = %s "
+                       "(and route the /64 on its LAN)\n", client_address);
             }
             if (limits.rate_kbps > 0) {
                 printf("  client_rate_limit = %s %llu\n", add_client,
