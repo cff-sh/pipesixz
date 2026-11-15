@@ -1412,7 +1412,7 @@ static void test_client_provisioning(void)
     check(config_load(path, &config) == 0, "load provisioning fixture");
     check(config_validate(&config) == 0, "provisioning fixture validates");
 
-    check(config_add_client(&config, "bob", "fd00::3/128", secret,
+    check(config_add_client(&config, "bob", "fd00::3/128", NULL, secret,
                             sizeof(secret)) == 0,
           "add-client rewrites the configuration");
     check(strlen(secret) == (size_t)PIPESIX_KEY_LEN * 2u,
@@ -1427,15 +1427,38 @@ static void test_client_provisioning(void)
     check(cred != NULL && cred->prefix_len == 128,
           "provisioned client got its route");
 
-    check(config_add_client(&reloaded, "bob", NULL, secret,
+    check(config_add_client(&reloaded, "bob", NULL, NULL, secret,
                             sizeof(secret)) != 0,
           "duplicate id is refused");
-    check(config_add_client(&reloaded, "carol", "fd00::3/128", secret,
+    check(config_add_client(&reloaded, "carol", "fd00::3/128", NULL, secret,
                             sizeof(secret)) != 0,
           "duplicate route is refused");
-    check(config_add_client(&reloaded, "bad id", NULL, secret,
+    check(config_add_client(&reloaded, "bad id", NULL, NULL, secret,
                             sizeof(secret)) != 0,
           "invalid client id is refused");
+
+    {
+        pipesix_client_policy_t limits;
+
+        memset(&limits, 0, sizeof(limits));
+        snprintf(limits.id, sizeof(limits.id), "%s", "dave");
+        limits.rate_kbps = 50000;
+        limits.quota_mib = 100;
+        limits.warn_percent = 90;
+
+        check(config_add_client(&reloaded, "dave", "fd00::4/128", &limits,
+                                secret, sizeof(secret)) == 0,
+              "add-client provisions limits in one step");
+        check(config_load(path, &reloaded) == 0,
+              "reload the provisioned limits");
+        check(config_find_policy(&reloaded, "dave") != NULL &&
+              config_find_policy(&reloaded, "dave")->rate_kbps == 50000u &&
+              config_find_policy(&reloaded, "dave")->quota_mib == 100u &&
+              config_find_policy(&reloaded, "dave")->warn_percent == 90u,
+              "the provisioned limits are in the file");
+        check(config_remove_client(&reloaded, "dave") == 0,
+              "a limited client can be removed again");
+    }
 
     check(config_remove_client(&reloaded, "bob") == 0,
           "remove-client rewrites the configuration");
@@ -1636,7 +1659,7 @@ static void test_stats_prometheus(void)
 
 /*
  * Per-client limits: the configuration parser, the token bucket and the
- * daily quota. The data path needs a TUN device and root, so the maths is
+ * quota. The data path needs a TUN device and root, so the maths is
  * tested here at the same layer the server calls.
  */
 static void test_client_policy(void)
@@ -1733,11 +1756,127 @@ static void test_client_policy(void)
     check(policy_quota_used(&quota, 100) == 2048u,
           "a restored counter is visible again");
 
+    /* Period arithmetic, anchored on 2026-11-15 00:00 UTC. */
+    {
+        static const time_t nov15 = (time_t)1794700800;
+        int period_day = policy_period(nov15, POLICY_PERIOD_DAILY);
+        int period_month = policy_period(nov15, POLICY_PERIOD_MONTHLY);
+
+        check(period_day == 20772, "a timestamp maps to its UTC day");
+        check(period_month == 2026 * 12 + 10,
+              "a timestamp maps to its calendar month");
+        check(policy_period_start(period_day, POLICY_PERIOD_DAILY) == nov15,
+              "a daily period starts at midnight");
+        check(policy_period_start(period_month, POLICY_PERIOD_MONTHLY) ==
+                  (time_t)1793491200,
+              "a monthly period starts on the first");
+        check(policy_period_end(period_month, POLICY_PERIOD_MONTHLY) ==
+                  (time_t)1796083200,
+              "a monthly period ends before the next month");
+        check(policy_period_end(period_day, POLICY_PERIOD_DAILY) -
+                  policy_period_start(period_day, POLICY_PERIOD_DAILY) ==
+              86400,
+              "a daily period is exactly one day");
+    }
+
+    {
+        /* Change the limit through a reload, and check a warning parses. */
+        static const char warn_config[] =
+            "mode = server\n"
+            "tun_address = fd00::1/64\n"
+            "quota_period = monthly\n"
+            "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "client_quota = alice 100\n"
+            "client_quota_warn = alice 90\n";
+        static const char warn_without_quota[] =
+            "mode = server\n"
+            "tun_address = fd00::1/64\n"
+            "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "client_quota_warn = alice 90\n";
+
+        check(write_temp_file(warn_config, path, sizeof(path)) == 0,
+              "write the quota warning fixture");
+        check(config_load(path, &config) == 0,
+              "load the quota warning fixture");
+        unlink(path);
+        check(config_validate(&config) == 0,
+              "a warning with a quota validates");
+        check(config.quota_period == 1, "monthly quota period parsed");
+        check(config_find_policy(&config, "alice") != NULL &&
+              config_find_policy(&config, "alice")->warn_percent == 90u,
+              "the warning threshold is parsed");
+
+        check(write_temp_file(warn_without_quota, path, sizeof(path)) == 0,
+              "write the warning without a quota fixture");
+        check(config_load(path, &config) == 0,
+              "load the warning without a quota fixture");
+        unlink(path);
+        check(config_validate(&config) != 0,
+              "a warning without a quota is rejected");
+    }
+
+    {
+        /* The CLI rewrites limit lines and keeps everything else. */
+        static const char limits_fixture[] =
+            "# limits fixture\n"
+            "mode = server\n"
+            "tun_address = fd00::1/64\n"
+            "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "client_quota = alice 100\n"
+            "client_rate_limit = alice 5000\n";
+        uint64_t rate = 9000;
+        uint64_t quota_mib = 200;
+        uint64_t warn = 80;
+        char body[1024];
+        FILE *fp;
+        size_t have;
+
+        check(write_temp_file(limits_fixture, path, sizeof(path)) == 0,
+              "write the limits fixture");
+        check(config_load(path, &config) == 0, "load the limits fixture");
+
+        check(config_set_limits(&config, "alice", &rate, NULL, NULL) == 0,
+              "set-limit rewrites the rate");
+        check(config_find_policy(&config, "alice") != NULL &&
+              config_find_policy(&config, "alice")->rate_kbps == 9000u,
+              "the new rate is in memory");
+        check(config_find_policy(&config, "alice")->quota_mib == 100u,
+              "an unspecified quota is kept");
+
+        check(config_set_limits(&config, "alice", NULL, &quota_mib, &warn) ==
+                  0,
+              "set-limit adds a warning");
+        check(config_find_policy(&config, "alice")->warn_percent == 80u,
+              "the warning is in memory");
+
+        fp = fopen(path, "r");
+        have = (fp != NULL) ? fread(body, 1, sizeof(body) - 1, fp) : 0;
+        if (fp != NULL) {
+            fclose(fp);
+        }
+        body[have] = '\0';
+        check(strstr(body, "# limits fixture") != NULL,
+              "comments survive a limit rewrite");
+        check(strstr(body, "client_quota = alice 200") != NULL,
+              "the rewritten quota is in the file");
+        check(strstr(body, "client_quota_warn = alice 80") != NULL,
+              "the warning is in the file");
+
+        check(config_clear_limits(&config, "alice") == 0,
+              "clear-limit removes the limits");
+        check(config_find_policy(&config, "alice") == NULL,
+              "no policy survives clear-limit");
+        check(config_clear_limits(&config, "alice") != 0,
+              "clearing absent limits is refused");
+        unlink(path);
+    }
+
     {
         /* The state file round-trips today's usage per client id. */
         policy_usage_t saved[2];
         policy_usage_t loaded[2];
         char state_path[64];
+        int loaded_monthly = -1;
         int loaded_count = -1;
 
         snprintf(state_path, sizeof(state_path), "/tmp/pipesix_state_%ld",
@@ -1746,25 +1885,34 @@ static void test_client_policy(void)
 
         memset(saved, 0, sizeof(saved));
         snprintf(saved[0].id, sizeof(saved[0].id), "%s", "alice");
-        saved[0].day = 20000;
+        saved[0].period = 20000;
         saved[0].used = 123456789u;
         snprintf(saved[1].id, sizeof(saved[1].id), "%s", "bob");
-        saved[1].day = 20000;
+        saved[1].period = 20000;
         saved[1].used = 42u;
 
-        check(policy_state_save(state_path, saved, 2) == 0,
+        check(policy_state_save(state_path, 0, saved, 2) == 0,
               "save the quota state");
-        check(policy_state_load(state_path, loaded, 2, &loaded_count) == 0,
+        check(policy_state_load(state_path, &loaded_monthly, loaded, 2,
+                                &loaded_count) == 0,
               "load the quota state");
-        check(loaded_count == 2, "every client is restored");
+        check(loaded_count == 2 && loaded_monthly == 0,
+              "every client is restored with the period kind");
         check(strcmp(loaded[0].id, "alice") == 0 &&
-              loaded[0].day == 20000 && loaded[0].used == 123456789u,
+              loaded[0].period == 20000 && loaded[0].used == 123456789u,
               "the state file round-trips");
+
+        check(policy_state_save(state_path, 1, saved, 2) == 0,
+              "save a monthly quota state");
+        loaded_monthly = -1;
+        check(policy_state_load(state_path, &loaded_monthly, loaded, 2,
+                                &loaded_count) == 0 && loaded_monthly == 1,
+              "the period kind is recorded");
 
         unlink(state_path);
         loaded_count = -1;
-        check(policy_state_load(state_path, loaded, 2, &loaded_count) == 0 &&
-              loaded_count == 0,
+        check(policy_state_load(state_path, &loaded_monthly, loaded, 2,
+                                &loaded_count) == 0 && loaded_count == 0,
               "a missing state file is not an error");
     }
 

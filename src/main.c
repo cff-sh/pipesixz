@@ -204,13 +204,21 @@ static void print_usage(const char *progname)
             "       %s --rotate-all [-c <config>]\n"
             "       %s --add-client <id> [--route <prefix>] [-c <config>]\n"
             "       %s --remove-client <id> [-c <config>]\n"
+            "       %s --set-limit <id> [--rate <kbps>] [--quota <MiB>]\n"
+            "                          [--quota-warn <percent>] [-c <config>]\n"
+            "       %s --clear-limit <id> [-c <config>]\n"
             "       %s --usage [--json|--csv] [-c <config>]\n"
             "\n"
             "pipesix %s - IPv6 over UDP Tunnel\n"
             "\n"
             "Options:\n"
             "  -c, --config <path>     Configuration file\n"
-            "                          (default: %s)\n"
+            "                          (default: %s)\n",
+            progname, progname, progname, progname, progname, progname,
+            progname, progname, progname, PIPESIX_APP_VERSION,
+            DEFAULT_CONFIG_PATH);
+
+    fprintf(stderr,
             "  -t, --check             Validate configuration and exit\n"
             "  -l, --log-level <name>  Override log level\n"
             "  -g, --genkey            Generate a per-client key and exit\n"
@@ -234,6 +242,15 @@ static void print_usage(const char *progname)
             "                          and reload the running server\n"
             "      --remove-client <id>\n"
             "                          Remove that client's entry and route\n"
+            "      --set-limit <id>    Replace that client's limits in the\n"
+            "                          configuration and reload the server\n"
+            "      --clear-limit <id>  Remove every limit for that client\n"
+            "      --rate <kbps>       Bandwidth cap for --add-client or\n"
+            "                          --set-limit (0 = unlimited)\n"
+            "      --quota <MiB>       Quota per period for --add-client or\n"
+            "                          --set-limit (0 = unlimited)\n"
+            "      --quota-warn <pct>  Tell the client when this percentage\n"
+            "                          of its quota is used (1-99)\n"
             "      --route <prefix>    Return route for --add-client\n"
             "  -V, --version           Show version information\n"
             "  -h, --help              Show this help message\n"
@@ -252,8 +269,10 @@ static void print_usage(const char *progname)
             "  client_id       This client's identity (client mode)\n"
             "  client          <id>: <secret> entry (server mode, repeatable)\n"
             "  client_rate_limit <id> <kbit/s> (server, repeatable)\n"
-            "  client_quota    <id> <MiB/day> (server, repeatable)\n"
-            "  quota_state     File for daily quota usage (server, empty = off)\n"
+            "  client_quota    <id> <MiB> per period (server, repeatable)\n"
+            "  client_quota_warn <id> <percent> (server, repeatable)\n"
+            "  quota_period    daily | monthly (default: daily)\n"
+            "  quota_state     File for quota usage (server, empty = off)\n"
             "  keepalive       Client keepalive seconds (default: 20, 0 = off)\n"
             "  session_timeout Server idle timeout seconds (default: 120)\n"
             "  peer_timeout    Client reconnect timeout seconds (default: 120, 0 = off)\n"
@@ -275,9 +294,26 @@ static void print_usage(const char *progname)
             "(server: client table, client: own secret) for live rotation.\n"
             "On Windows there are no signals: use --reload and --stats.\n"
             "The control channel (--status, --kick) is a 0600 UNIX socket\n"
-            "and is available on POSIX only.\n",
-            progname, progname, progname, progname, progname, progname,
-            progname, PIPESIX_APP_VERSION, DEFAULT_CONFIG_PATH);
+            "and is available on POSIX only.\n");
+}
+
+static int parse_u64(const char *text, uint64_t *out)
+{
+    char *end = NULL;
+    unsigned long long value;
+
+    if (text == NULL || text[0] == '\0' || out == NULL) {
+        return -1;
+    }
+
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0') {
+        return -1;
+    }
+
+    *out = (uint64_t)value;
+    return 0;
 }
 
 static int generate_key(void)
@@ -518,6 +554,11 @@ int main(int argc, char *argv[])
         { "metrics",   no_argument,       NULL, 1008 },
         { "usage",     no_argument,       NULL, 1010 },
         { "csv",       no_argument,       NULL, 1011 },
+        { "set-limit", required_argument, NULL, 1012 },
+        { "clear-limit", required_argument, NULL, 1013 },
+        { "rate",      required_argument, NULL, 1014 },
+        { "quota",     required_argument, NULL, 1015 },
+        { "quota-warn", required_argument, NULL, 1016 },
         { "kick",      required_argument, NULL, 1003 },
         { "add-client", required_argument, NULL, 1004 },
         { "remove-client", required_argument, NULL, 1005 },
@@ -540,6 +581,17 @@ int main(int argc, char *argv[])
     int metrics_only = 0;
     int usage_only = 0;
     int csv_output = 0;
+    const char *set_limit = NULL;
+    const char *clear_limit = NULL;
+    const char *rate_arg = NULL;
+    const char *quota_arg = NULL;
+    const char *warn_arg = NULL;
+    uint64_t rate_kbps = 0;
+    uint64_t quota_mib = 0;
+    uint64_t warn_percent = 0;
+    int have_rate = 0;
+    int have_quota = 0;
+    int have_warn = 0;
     const char *kick_id = NULL;
     const char *add_client = NULL;
     const char *remove_client = NULL;
@@ -590,6 +642,21 @@ int main(int argc, char *argv[])
             case 1011:
                 csv_output = 1;
                 break;
+            case 1012:
+                set_limit = optarg;
+                break;
+            case 1013:
+                clear_limit = optarg;
+                break;
+            case 1014:
+                rate_arg = optarg;
+                break;
+            case 1015:
+                quota_arg = optarg;
+                break;
+            case 1016:
+                warn_arg = optarg;
+                break;
             case 1004:
                 add_client = optarg;
                 break;
@@ -630,6 +697,59 @@ int main(int argc, char *argv[])
 
     if (add_route != NULL && add_client == NULL) {
         fprintf(stderr, "Error: --route is only valid with --add-client\n");
+        return EXIT_FAILURE;
+    }
+
+    if (set_limit != NULL && clear_limit != NULL) {
+        fprintf(stderr, "Error: --set-limit and --clear-limit are "
+                        "mutually exclusive\n");
+        return EXIT_FAILURE;
+    }
+
+    if ((set_limit != NULL || clear_limit != NULL) &&
+        (add_client != NULL || remove_client != NULL)) {
+        fprintf(stderr, "Error: --set-limit/--clear-limit cannot be "
+                        "combined with --add-client or --remove-client\n");
+        return EXIT_FAILURE;
+    }
+
+    if (rate_arg != NULL) {
+        if (parse_u64(rate_arg, &rate_kbps) != 0 ||
+            rate_kbps > 100000000u) {
+            fprintf(stderr, "Error: --rate must be 0-100000000 kbit/s\n");
+            return EXIT_FAILURE;
+        }
+        have_rate = 1;
+    }
+
+    if (quota_arg != NULL) {
+        if (parse_u64(quota_arg, &quota_mib) != 0 ||
+            quota_mib > 1048576u) {
+            fprintf(stderr, "Error: --quota must be 0-1048576 MiB\n");
+            return EXIT_FAILURE;
+        }
+        have_quota = 1;
+    }
+
+    if (warn_arg != NULL) {
+        if (parse_u64(warn_arg, &warn_percent) != 0 ||
+            warn_percent > 99u) {
+            fprintf(stderr, "Error: --quota-warn must be 0-99 percent\n");
+            return EXIT_FAILURE;
+        }
+        have_warn = 1;
+    }
+
+    if ((have_rate || have_quota || have_warn) && add_client == NULL &&
+        set_limit == NULL) {
+        fprintf(stderr, "Error: --rate, --quota and --quota-warn require "
+                        "--add-client or --set-limit\n");
+        return EXIT_FAILURE;
+    }
+
+    if (set_limit != NULL && !(have_rate || have_quota || have_warn)) {
+        fprintf(stderr, "Error: --set-limit needs --rate, --quota or "
+                        "--quota-warn\n");
         return EXIT_FAILURE;
     }
 
@@ -722,7 +842,17 @@ int main(int argc, char *argv[])
         char secret[PIPESIX_KEY_LEN * 2 + 1];
 
         if (add_client != NULL) {
-            if (config_add_client(&config, add_client, add_route, secret,
+            pipesix_client_policy_t limits;
+            int have_limits = have_rate || have_quota || have_warn;
+
+            memset(&limits, 0, sizeof(limits));
+            snprintf(limits.id, sizeof(limits.id), "%s", add_client);
+            limits.rate_kbps = have_rate ? rate_kbps : 0;
+            limits.quota_mib = have_quota ? quota_mib : 0;
+            limits.warn_percent = have_warn ? warn_percent : 0;
+
+            if (config_add_client(&config, add_client, add_route,
+                                  have_limits ? &limits : NULL, secret,
                                   sizeof(secret)) != 0) {
                 fprintf(stderr, "Error: cannot add client '%s' to '%s'\n",
                         add_client, config_path);
@@ -734,6 +864,18 @@ int main(int argc, char *argv[])
             printf("  secret    = %s\n", secret);
             if (add_route != NULL) {
                 printf("  client_route = %s %s\n", add_client, add_route);
+            }
+            if (limits.rate_kbps > 0) {
+                printf("  client_rate_limit = %s %llu\n", add_client,
+                       (unsigned long long)limits.rate_kbps);
+            }
+            if (limits.quota_mib > 0) {
+                printf("  client_quota = %s %llu\n", add_client,
+                       (unsigned long long)limits.quota_mib);
+            }
+            if (limits.warn_percent > 0) {
+                printf("  client_quota_warn = %s %llu\n", add_client,
+                       (unsigned long long)limits.warn_percent);
             }
             printf("\nSet these on the client host and start it; the key is "
                    "printed once\nand is not stored anywhere else.\n");
@@ -753,6 +895,66 @@ int main(int argc, char *argv[])
          * credential table in memory: ask it to reload so the change takes
          * effect without a restart (and a removal drops the session).
          */
+        if (control_request(config_path, "reload", reply, sizeof(reply)) == 0) {
+            printf("Running server asked to reload.\n");
+        } else {
+            printf("No running server for this configuration; the change "
+                   "applies when it starts.\n");
+        }
+
+        return EXIT_SUCCESS;
+    }
+
+    if (set_limit != NULL || clear_limit != NULL) {
+        const char *id = (set_limit != NULL) ? set_limit : clear_limit;
+        const pipesix_client_policy_t *limits;
+        char reply[1024];
+
+        if (set_limit != NULL) {
+            if (config_set_limits(&config, id,
+                                  have_rate ? &rate_kbps : NULL,
+                                  have_quota ? &quota_mib : NULL,
+                                  have_warn ? &warn_percent : NULL) != 0) {
+                fprintf(stderr,
+                        "Error: cannot set limits for client '%s' in '%s'\n",
+                        id, config_path);
+                return EXIT_FAILURE;
+            }
+            printf("Limits for client '%s' in %s:\n", id, config_path);
+        } else {
+            if (config_clear_limits(&config, id) != 0) {
+                fprintf(stderr,
+                        "Error: cannot clear limits for client '%s' in "
+                        "'%s'\n", id, config_path);
+                return EXIT_FAILURE;
+            }
+            printf("Removed every limit for client '%s' in %s\n", id,
+                   config_path);
+        }
+
+        limits = config_find_policy(&config, id);
+        if (limits != NULL) {
+            if (limits->rate_kbps > 0) {
+                printf("  rate:  %llu kbit/s\n",
+                       (unsigned long long)limits->rate_kbps);
+            } else {
+                printf("  rate:  unlimited\n");
+            }
+
+            if (limits->quota_mib > 0) {
+                printf("  quota: %llu MiB per %s\n",
+                       (unsigned long long)limits->quota_mib,
+                       config.quota_period ? "month" : "day");
+            } else {
+                printf("  quota: unlimited\n");
+            }
+
+            if (limits->warn_percent > 0) {
+                printf("  warn:  at %llu%% of the quota\n",
+                       (unsigned long long)limits->warn_percent);
+            }
+        }
+
         if (control_request(config_path, "reload", reply, sizeof(reply)) == 0) {
             printf("Running server asked to reload.\n");
         } else {

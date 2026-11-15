@@ -27,8 +27,11 @@
  *   client_route     - <id> <ipv6[/len]> inner prefix for return traffic
  *                      (server mode, repeatable, follows its client line)
  *   client_rate_limit - <id> <kbit/s> bandwidth cap (server, repeatable)
- *   client_quota     - <id> <MiB> bytes per UTC day (server, repeatable)
- *   quota_state      - File that keeps daily usage across a restart
+ *   client_quota     - <id> <MiB> bytes per UTC period (server, repeatable)
+ *   client_quota_warn - <id> <percent> warn the client at this usage
+ *                      (server, repeatable)
+ *   quota_period     - daily (default) or monthly
+ *   quota_state      - File that keeps quota usage across a restart
  *                      (server mode, empty disables it)
  *   keepalive        - Client keepalive interval in seconds (0 disables)
  *   session_timeout  - Server session idle timeout in seconds (0 disables)
@@ -103,12 +106,14 @@ typedef struct {
 /*
  * Optional per-client limits, applied by the server in both directions.
  * rate_kbps caps bandwidth in kilobits per second and quota_mib caps the
- * bytes moved per UTC day; 0 means unlimited for either.
+ * bytes moved per UTC period; 0 means unlimited for either.
  */
 typedef struct {
     char     id[CONFIG_MAX_CLIENT_ID];
     uint64_t rate_kbps;
     uint64_t quota_mib;
+    /* Percentage of the quota at which the client is warned; 0 = off. */
+    uint64_t warn_percent;
 } pipesix_client_policy_t;
 
 /*
@@ -158,6 +163,9 @@ typedef struct {
     pipesix_client_policy_t policies[CONFIG_MAX_CLIENTS];
     int  policy_count;
 
+    /* Quota period: 0 = UTC day, 1 = UTC calendar month. */
+    int  quota_period;
+
     /* Observability */
     int  stats_interval;                     /* Periodic stats interval */
     log_level_t log_level;                   /* Minimum log level */
@@ -177,9 +185,9 @@ typedef struct {
     char metrics_token[CONFIG_MAX_SECRET];
 
     /*
-     * Per-client daily quota state (server mode). When set, the server
-     * restores today's counters from this file at startup and rewrites it
-     * periodically and on shutdown. Empty disables persistence. It is
+     * Per-client quota state (server mode). When set, the server restores
+     * the current period's counters from this file at startup and rewrites
+     * it periodically and on shutdown. Empty disables persistence. It is
      * applied at startup like the metrics endpoint, so changing the path
      * needs a restart.
      */
@@ -262,8 +270,31 @@ int config_rotate_all_keys(pipesix_config_t *config);
  *   0 on success, -1 on failure (the file is unchanged)
  */
 int config_add_client(pipesix_config_t *config, const char *id,
-                      const char *prefix, char *secret_out,
-                      size_t secret_size);
+                      const char *prefix,
+                      const pipesix_client_policy_t *limits,
+                      char *secret_out, size_t secret_size);
+
+/*
+ * Set or clear the per-client limits in a server configuration file.
+ *
+ * config_set_limits() drops the client's existing 'client_rate_limit',
+ * 'client_quota' and 'client_quota_warn' lines and appends the ones whose
+ * pointer is not NULL, so a NULL argument leaves that limit as it is.
+ * config_clear_limits() removes all three lines and fails when the client
+ * has no limits configured. Both keep every other line untouched, re-parse
+ * and validate the rewritten file, and only then replace the original.
+ *
+ * On success config is reloaded from the replaced file, so the caller can
+ * print the effective values.
+ *
+ * Returns:
+ *   0 on success, -1 on failure (the file is unchanged)
+ */
+int config_set_limits(pipesix_config_t *config, const char *id,
+                      const uint64_t *rate_kbps, const uint64_t *quota_mib,
+                      const uint64_t *warn_percent);
+
+int config_clear_limits(pipesix_config_t *config, const char *id);
 
 /*
  * Remove a client and its 'client_route' line from a server
@@ -289,6 +320,15 @@ int config_remove_client(pipesix_config_t *config, const char *id);
  */
 const pipesix_client_cred_t *config_find_client(const pipesix_config_t *config,
                                                 const char *id);
+
+/*
+ * Find a client's limits by id.
+ *
+ * Returns a pointer into config->policies, or NULL when the client has no
+ * 'client_rate_limit' or 'client_quota' line.
+ */
+const pipesix_client_policy_t *config_find_policy(const pipesix_config_t *config,
+                                                  const char *id);
 
 /*
  * Parse a log level name (case-insensitive).

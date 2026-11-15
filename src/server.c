@@ -89,8 +89,12 @@ typedef struct {
     /* Per-client limits, resolved from the configuration at handshake. */
     int                     policy_index;   /* -1 = no limits configured */
     int                     policy_warned;  /* logged once per session */
-    /* Index in the credential table; owns this client's daily usage. */
+    /* Index in the credential table; owns this client's period usage. */
     int                     client_index;   /* -1 = unknown client */
+    /* Quota notices are sent once per session, state and period. */
+    int                     quota_warn_sent;
+    int                     quota_exhausted_sent;
+    int                     notice_period;
     pipesix_bucket_t        rx_bucket;
     pipesix_bucket_t        tx_bucket;
 } server_session_t;
@@ -144,7 +148,7 @@ static int policy_lookup(const pipesix_config_t *config, const char *id)
 /*
  * Index of a client in the credential table.
  *
- * The daily usage counters are indexed the same way, so an established
+ * The usage counters are indexed the same way, so an established
  * session can charge its own client's counter without a string lookup.
  */
 static int client_index_lookup(const pipesix_config_t *config, const char *id)
@@ -160,7 +164,7 @@ static int client_index_lookup(const pipesix_config_t *config, const char *id)
     return -1;
 }
 
-/* Daily quota in bytes for a client id, or 0 when it has none. */
+/* Quota in bytes for a client id, or 0 when it has none. */
 static uint64_t quota_limit_for(const pipesix_config_t *config,
                                 const char *id)
 {
@@ -171,6 +175,70 @@ static uint64_t quota_limit_for(const pipesix_config_t *config,
     }
 
     return config->policies[policy].quota_mib * 1048576u;
+}
+
+/*
+ * Charge one packet against a client's quota.
+ *
+ * Returns 1 when the packet may pass, 0 when it has to be dropped. On
+ * the call that crosses the configured warning threshold, or the one that
+ * first has to drop a packet, *notify_* is set so the caller can tell the
+ * client once it releases the session lock. The caller must hold that
+ * lock: both data-path threads charge the same counter.
+ */
+static int quota_admit(server_context_t *ctx, server_session_t *session,
+                       size_t bytes, time_t now, int *notify_warn,
+                       int *notify_gone)
+{
+    pipesix_quota_t *quota;
+    const pipesix_client_policy_t *policy = NULL;
+    uint64_t limit;
+    uint64_t used;
+    int period;
+    int allowed;
+
+    *notify_warn = 0;
+    *notify_gone = 0;
+
+    if (session->client_index < 0) {
+        return 1;
+    }
+
+    quota = &ctx->quotas[session->client_index];
+    period = policy_period(now, ctx->config->quota_period);
+
+    /* A session that spans midnight or a month boundary warns again. */
+    if (session->notice_period != period) {
+        session->notice_period = period;
+        session->quota_warn_sent = 0;
+        session->quota_exhausted_sent = 0;
+    }
+
+    allowed = policy_quota_charge(quota, bytes, period);
+
+    if (session->policy_index >= 0) {
+        policy = &ctx->config->policies[session->policy_index];
+    }
+
+    if (!allowed) {
+        if (!session->quota_exhausted_sent) {
+            session->quota_exhausted_sent = 1;
+            *notify_gone = 1;
+        }
+        return 0;
+    }
+
+    limit = quota->limit;
+    if (policy != NULL && limit > 0 && policy->warn_percent > 0 &&
+        !session->quota_warn_sent) {
+        used = policy_quota_used(quota, period);
+        if (used * 100u >= limit * policy->warn_percent) {
+            session->quota_warn_sent = 1;
+            *notify_warn = 1;
+        }
+    }
+
+    return 1;
 }
 
 static int sockaddr_equal(const struct sockaddr_storage *a,
@@ -459,6 +527,40 @@ static void send_empty_control(server_context_t *ctx,
  * Ask a peer to run the handshake, rate limited so a flood of spoofed
  * datagrams cannot turn the server into an amplifier.
  */
+/*
+ * Send a control frame inside a session, authenticated with the
+ * server-to-client key.
+ *
+ * Used for the quota notices: unlike a plaintext hint, a spoofed datagram
+ * cannot fake one, so a client never takes "quota exhausted" from an
+ * off-path attacker.
+ */
+static void send_session_control(server_context_t *ctx,
+                                 const struct sockaddr_storage *peer,
+                                 socklen_t peer_len,
+                                 const uint8_t key[PIPESIX_KEY_LEN],
+                                 uint16_t flag)
+{
+    uint8_t frame[PIPESIX_HEADER_SIZE + PIPESIX_AUTH_TAG_SIZE];
+    size_t frame_len;
+
+    if (key == NULL) {
+        return;
+    }
+
+    frame_len = pipesix_frame_build(frame, sizeof(frame), flag, ctx->salt,
+                                    next_seq(ctx), NULL, 0, key);
+    if (frame_len == 0) {
+        return;
+    }
+
+    if (sendto(ctx->udp_fd, frame, frame_len, 0,
+               (const struct sockaddr *)peer, peer_len) !=
+        (ssize_t)frame_len) {
+        log_debug("Failed to send a control frame: %s", strerror(errno));
+    }
+}
+
 static void send_need_handshake(server_context_t *ctx,
                                 const struct sockaddr_storage *peer,
                                 socklen_t peer_len)
@@ -716,6 +818,9 @@ static void handle_handshake_init(server_context_t *ctx,
         ctx->sessions[slot].throttled = 0;
         ctx->sessions[slot].route_warned = 0;
         ctx->sessions[slot].mtu_warned = 0;
+        ctx->sessions[slot].quota_warn_sent = 0;
+        ctx->sessions[slot].quota_exhausted_sent = 0;
+        ctx->sessions[slot].notice_period = -1;
         pipesix_replay_reset(&ctx->sessions[slot].replay);
 
         {
@@ -936,7 +1041,7 @@ static const pipesix_client_cred_t *find_cred_in(
 typedef struct {
     const char *id;
     uint64_t    used;
-    int         day;
+    int         period;
 } quota_snapshot_t;
 
 /*
@@ -976,8 +1081,8 @@ static void reload_config(server_context_t *ctx)
     /* Today's usage, keyed by the credential table it belongs to. */
     for (i = 0; i < before_count; i++) {
         old_usage[i].id = before[i].id;
-        old_usage[i].day = atomic_load_explicit(&ctx->quotas[i].day,
-                                                memory_order_relaxed);
+        old_usage[i].period = atomic_load_explicit(&ctx->quotas[i].period,
+                                                   memory_order_relaxed);
         old_usage[i].used = atomic_load_explicit(&ctx->quotas[i].used,
                                                  memory_order_relaxed);
     }
@@ -1010,7 +1115,7 @@ static void reload_config(server_context_t *ctx)
      * accumulated today.
      */
     {
-        int day = policy_day(time(NULL));
+        int period = policy_period(time(NULL), ctx->config->quota_period);
 
         for (i = 0; i < ctx->config->client_count; i++) {
             const char *id = ctx->config->clients[i].id;
@@ -1021,10 +1126,10 @@ static void reload_config(server_context_t *ctx)
 
             for (j = 0; j < old_usage_count; j++) {
                 if (strcmp(old_usage[j].id, id) == 0) {
-                    if (old_usage[j].day == day) {
+                    if (old_usage[j].period == period) {
                         policy_quota_restore(&ctx->quotas[i],
                                              old_usage[j].used,
-                                             old_usage[j].day);
+                                             old_usage[j].period);
                     }
                     break;
                 }
@@ -1106,6 +1211,9 @@ static void reload_config(server_context_t *ctx)
             session->client_index =
                 client_index_lookup(ctx->config, session->client_id);
             session->policy_warned = 0;
+            session->quota_warn_sent = 0;
+            session->quota_exhausted_sent = 0;
+            session->notice_period = -1;
 
             /*
              * Keep the refilled tokens when the cap did not change; only
@@ -1276,6 +1384,11 @@ static void *receiver_loop(void *arg)
         uint64_t policy_rate = 0;
         uint64_t policy_quota = 0;
         int policy_warn = 0;
+        struct sockaddr_storage notify_addr;
+        socklen_t notify_len = 0;
+        uint8_t notify_key[PIPESIX_KEY_LEN];
+        int notify_warn = 0;
+        int notify_gone = 0;
 
         ready = poll(&pfd, 1, POLL_INTERVAL_MS);
         if (ready < 0) {
@@ -1387,10 +1500,15 @@ static void *receiver_loop(void *arg)
                                           frame.payload_len,
                                           policy_now_ms());
 
-            if (allowed && session->client_index >= 0 &&
-                !policy_quota_charge(&ctx->quotas[session->client_index],
-                                     frame.payload_len, policy_day(now))) {
-                allowed = 0;
+            if (allowed) {
+                allowed = quota_admit(ctx, session, frame.payload_len, now,
+                                      &notify_warn, &notify_gone);
+
+                if (notify_warn || notify_gone) {
+                    notify_addr = session->addr;
+                    notify_len = session->addr_len;
+                    memcpy(notify_key, session->tx_key, sizeof(notify_key));
+                }
             }
 
             if (!allowed) {
@@ -1415,9 +1533,15 @@ static void *receiver_loop(void *arg)
                 if (policy_warn) {
                     log_warn("Client '%s' exceeded its per-client limits; "
                              "dropping traffic (rate %llu kbit/s, quota "
-                             "%llu MiB/day)",
+                             "%llu MiB/%s)",
                              policy_id, (unsigned long long)policy_rate,
-                             (unsigned long long)policy_quota);
+                             (unsigned long long)policy_quota,
+                             ctx->config->quota_period ? "month" : "day");
+                }
+                if (notify_gone) {
+                    send_session_control(ctx, &notify_addr, notify_len,
+                                         notify_key,
+                                         PIPESIX_FLAG_QUOTA_EXHAUSTED);
                 }
                 stats_add_throttled(&ctx->stats);
                 continue;
@@ -1454,6 +1578,14 @@ static void *receiver_loop(void *arg)
         }
 
         pthread_mutex_unlock(&ctx->lock);
+
+        if (notify_gone || notify_warn) {
+            send_session_control(ctx, &notify_addr, notify_len, notify_key,
+                                 notify_gone
+                                     ? PIPESIX_FLAG_QUOTA_EXHAUSTED
+                                     : PIPESIX_FLAG_QUOTA_WARNING);
+            memset(notify_key, 0, sizeof(notify_key));
+        }
 
         if (mismatch) {
             char src_str[INET6_ADDRSTRLEN];
@@ -1556,6 +1688,11 @@ static void *sender_loop(void *arg)
         uint64_t policy_quota = 0;
         int denied = 0;
         int denied_warn = 0;
+        struct sockaddr_storage notify_addr;
+        socklen_t notify_len = 0;
+        uint8_t notify_key[PIPESIX_KEY_LEN];
+        int notify_warn = 0;
+        int notify_gone = 0;
 
         ready = poll(&pfd, 1, POLL_INTERVAL_MS);
         if (ready < 0) {
@@ -1609,10 +1746,16 @@ static void *sender_loop(void *arg)
             allowed = policy_bucket_allow(&session->tx_bucket,
                                           (size_t)nread, policy_now_ms());
 
-            if (allowed && session->client_index >= 0 &&
-                !policy_quota_charge(&ctx->quotas[session->client_index],
-                                     (size_t)nread, policy_day(time(NULL)))) {
-                allowed = 0;
+            if (allowed) {
+                allowed = quota_admit(ctx, session, (size_t)nread,
+                                      time(NULL), &notify_warn,
+                                      &notify_gone);
+
+                if (notify_warn || notify_gone) {
+                    notify_addr = session->addr;
+                    notify_len = session->addr_len;
+                    memcpy(notify_key, session->tx_key, sizeof(notify_key));
+                }
             }
 
             if (!allowed) {
@@ -1647,13 +1790,22 @@ static void *sender_loop(void *arg)
 
         pthread_mutex_unlock(&ctx->lock);
 
+        if (notify_gone || notify_warn) {
+            send_session_control(ctx, &notify_addr, notify_len, notify_key,
+                                 notify_gone
+                                     ? PIPESIX_FLAG_QUOTA_EXHAUSTED
+                                     : PIPESIX_FLAG_QUOTA_WARNING);
+            memset(notify_key, 0, sizeof(notify_key));
+        }
+
         if (denied) {
             if (denied_warn) {
                 log_warn("Client '%s' exceeded its per-client limits; "
                          "dropping traffic (rate %llu kbit/s, quota "
-                         "%llu MiB/day)",
+                         "%llu MiB/%s)",
                          denied_id, (unsigned long long)policy_rate,
-                         (unsigned long long)policy_quota);
+                         (unsigned long long)policy_quota,
+                         ctx->config->quota_period ? "month" : "day");
             }
             stats_add_throttled(&ctx->stats);
             continue;
@@ -1874,14 +2026,17 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
 
             if (policy->quota_mib > 0 && session->client_index >= 0) {
                 quota_remaining[count] = policy_quota_remaining(
-                    &ctx->quotas[session->client_index], policy_day(now));
+                    &ctx->quotas[session->client_index],
+                    policy_period(now, ctx->config->quota_period));
             }
 
             snprintf(limits[count], sizeof(limits[count]),
                      "{\"rate_kbps\":%llu,\"quota_mib\":%llu,"
+                     "\"quota_period\":\"%s\","
                      "\"quota_remaining_bytes\":%llu}",
                      (unsigned long long)rate_kbps[count],
                      (unsigned long long)quota_mib[count],
+                     ctx->config->quota_period ? "monthly" : "daily",
                      (unsigned long long)quota_remaining[count]);
         }
 
@@ -1931,8 +2086,9 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
 
         if (quota_mib[i] > 0 &&
             server_control_append(reply, size, &used,
-                                  " quota=%llu MiB/day left=%llu B",
+                                  " quota=%llu MiB/%s left=%llu B",
                                   (unsigned long long)quota_mib[i],
+                                  ctx->config->quota_period ? "month" : "day",
                                   (unsigned long long)quota_remaining[i]) != 0) {
             return -1;
         }
@@ -2035,14 +2191,17 @@ static int server_status_json(server_context_t *ctx, char *reply, size_t size)
 
             if (policy->quota_mib > 0 && session->client_index >= 0) {
                 quota_remaining[count] = policy_quota_remaining(
-                    &ctx->quotas[session->client_index], policy_day(now));
+                    &ctx->quotas[session->client_index],
+                    policy_period(now, ctx->config->quota_period));
             }
 
             snprintf(limits[count], sizeof(limits[count]),
                      "{\"rate_kbps\":%llu,\"quota_mib\":%llu,"
+                     "\"quota_period\":\"%s\","
                      "\"quota_remaining_bytes\":%llu}",
                      (unsigned long long)rate_kbps[count],
                      (unsigned long long)quota_mib[count],
+                     ctx->config->quota_period ? "monthly" : "daily",
                      (unsigned long long)quota_remaining[count]);
         }
 
@@ -2136,18 +2295,26 @@ static int server_usage(server_context_t *ctx, char *reply, size_t size,
     uint64_t rate[CONFIG_MAX_CLIENTS];
     int connected[CONFIG_MAX_CLIENTS];
     char config_esc[1024];
-    char day_start[32] = "?";
+    char start_str[16] = "?";
+    char end_str[16] = "?";
+    const char *kind = ctx->config->quota_period ? "monthly" : "daily";
     time_t now = time(NULL);
-    int day = policy_day(now);
+    int period = policy_period(now, ctx->config->quota_period);
+    time_t start = policy_period_start(period, ctx->config->quota_period);
+    time_t end = policy_period_end(period, ctx->config->quota_period);
     struct tm tm;
     size_t len = 0;
     int count = 0;
     int i;
     int j;
 
-    if (gmtime_r(&now, &tm) == NULL ||
-        strftime(day_start, sizeof(day_start), "%Y-%m-%d", &tm) == 0) {
-        snprintf(day_start, sizeof(day_start), "day-%d", day);
+    if (gmtime_r(&start, &tm) == NULL ||
+        strftime(start_str, sizeof(start_str), "%Y-%m-%d", &tm) == 0) {
+        snprintf(start_str, sizeof(start_str), "start-%d", period);
+    }
+    if (gmtime_r(&end, &tm) == NULL ||
+        strftime(end_str, sizeof(end_str), "%Y-%m-%d", &tm) == 0) {
+        snprintf(end_str, sizeof(end_str), "end-%d", period);
     }
 
     pthread_mutex_lock(&ctx->lock);
@@ -2157,10 +2324,10 @@ static int server_usage(server_context_t *ctx, char *reply, size_t size,
         int policy = policy_lookup(ctx->config, id);
 
         snprintf(ids[count], sizeof(ids[count]), "%s", id);
-        bytes_used[count] = policy_quota_used(&ctx->quotas[i], day);
+        bytes_used[count] = policy_quota_used(&ctx->quotas[i], period);
         quota[count] = ctx->quotas[i].limit;
         left[count] = (quota[count] > 0)
-                          ? policy_quota_remaining(&ctx->quotas[i], day)
+                          ? policy_quota_remaining(&ctx->quotas[i], period)
                           : 0;
         rate[count] = (policy >= 0)
                           ? ctx->config->policies[policy].rate_kbps
@@ -2183,15 +2350,16 @@ static int server_usage(server_context_t *ctx, char *reply, size_t size,
     if (format == USAGE_CSV) {
         if (server_control_append(
                 reply, size, &len,
-                "OK\nclient_id,utc_day,used_bytes,quota_bytes,"
-                "quota_remaining_bytes,rate_kbps,connected\n") != 0) {
+                "OK\nclient_id,period_start,period_end,used_bytes,"
+                "quota_bytes,quota_remaining_bytes,rate_kbps,connected\n") != 0) {
             return -1;
         }
 
         for (i = 0; i < count; i++) {
             if (server_control_append(
-                    reply, size, &len, "%s,%s,%llu,%llu,%llu,%llu,%s\n",
-                    ids[i], day_start,
+                    reply, size, &len,
+                    "%s,%s,%s,%llu,%llu,%llu,%llu,%s\n",
+                    ids[i], start_str, end_str,
                     (unsigned long long)bytes_used[i],
                     (unsigned long long)quota[i],
                     (unsigned long long)left[i],
@@ -2214,9 +2382,9 @@ static int server_usage(server_context_t *ctx, char *reply, size_t size,
         if (server_control_append(
                 reply, size, &len,
                 "OK\n{\"mode\":\"server\",\"config\":\"%s\","
-                "\"utc_day\":\"%s\",\"day_start_unix\":%lld,"
-                "\"clients\":[",
-                config_esc, day_start, (long long)day * 86400) != 0) {
+                "\"period\":{\"kind\":\"%s\",\"start_unix\":%lld,"
+                "\"end_unix\":%lld},\"clients\":[",
+                config_esc, kind, (long long)start, (long long)end) != 0) {
             goto too_large;
         }
 
@@ -2246,9 +2414,10 @@ static int server_usage(server_context_t *ctx, char *reply, size_t size,
 
     if (server_control_append(reply, size, &len,
                               "OK\nmode: server\nconfig: %s\n"
-                              "utc_day: %s\nusage: %d client(s)\n",
-                              ctx->config->config_path, day_start,
-                              count) != 0) {
+                              "period: %s %s..%s UTC\n"
+                              "usage: %d client(s)\n",
+                              ctx->config->config_path, kind, start_str,
+                              end_str, count) != 0) {
         goto too_large;
     }
 
@@ -2342,7 +2511,8 @@ static int server_metrics_body(char *out, size_t size, void *arg)
             session->client_index >= 0) {
             quota_limit[count] = ctx->quotas[session->client_index].limit;
             quota_remaining[count] = policy_quota_remaining(
-                &ctx->quotas[session->client_index], policy_day(now));
+                &ctx->quotas[session->client_index],
+                policy_period(now, ctx->config->quota_period));
         }
 
         idle[count] = (long)(now - session->last_seen);
@@ -2384,10 +2554,11 @@ static int server_metrics_body(char *out, size_t size, void *arg)
             "client's rate or quota limits since it connected.\n"
             "# TYPE pipesix_session_throttled gauge\n"
             "# HELP pipesix_session_quota_limit_bytes Bytes one client may "
-            "move per UTC day. Only exported for clients with a quota.\n"
+            "move per quota period. Only exported for clients with a "
+            "quota.\n"
             "# TYPE pipesix_session_quota_limit_bytes gauge\n"
             "# HELP pipesix_session_quota_remaining_bytes Bytes left in one "
-            "client's quota for the current UTC day. Only exported for "
+            "client's quota for the current period. Only exported for "
             "clients with a quota.\n"
             "# TYPE pipesix_session_quota_remaining_bytes gauge\n") != 0) {
         return -1;
@@ -2572,19 +2743,28 @@ static int server_control_handler(const char *request, char *reply,
 static void load_quota_state(server_context_t *ctx)
 {
     policy_usage_t stored[CONFIG_MAX_CLIENTS];
+    int stored_monthly = 0;
     int count = 0;
     int restored = 0;
-    int today = policy_day(time(NULL));
+    int period = policy_period(time(NULL), ctx->config->quota_period);
     int i;
 
     if (ctx->config->quota_state[0] == '\0') {
         return;
     }
 
-    if (policy_state_load(ctx->config->quota_state, stored,
+    if (policy_state_load(ctx->config->quota_state, &stored_monthly, stored,
                           CONFIG_MAX_CLIENTS, &count) != 0) {
         log_warn("Cannot read the quota state file '%s': %s",
                  ctx->config->quota_state, strerror(errno));
+        return;
+    }
+
+    if (stored_monthly != ctx->config->quota_period) {
+        log_info("Quota state '%s' was saved for a %s quota; starting this "
+                 "%s from zero", ctx->config->quota_state,
+                 stored_monthly ? "monthly" : "daily",
+                 ctx->config->quota_period ? "month" : "day");
         return;
     }
 
@@ -2597,12 +2777,12 @@ static void load_quota_state(server_context_t *ctx)
             continue;
         }
 
-        if (stored[i].day != today) {
+        if (stored[i].period != period) {
             continue;
         }
 
         policy_quota_restore(&ctx->quotas[index], stored[i].used,
-                             (int)stored[i].day);
+                             (int)stored[i].period);
         restored++;
     }
 
@@ -2634,8 +2814,8 @@ static int save_quota_state(server_context_t *ctx)
     for (i = 0; i < ctx->config->client_count; i++) {
         snprintf(usage[count].id, sizeof(usage[count].id), "%s",
                  ctx->config->clients[i].id);
-        usage[count].day = (int64_t)atomic_load_explicit(
-            &ctx->quotas[i].day, memory_order_relaxed);
+        usage[count].period = (int64_t)atomic_load_explicit(
+            &ctx->quotas[i].period, memory_order_relaxed);
         usage[count].used = atomic_load_explicit(&ctx->quotas[i].used,
                                                  memory_order_relaxed);
         count++;
@@ -2643,7 +2823,8 @@ static int save_quota_state(server_context_t *ctx)
 
     pthread_mutex_unlock(&ctx->lock);
 
-    if (policy_state_save(ctx->config->quota_state, usage, count) != 0) {
+    if (policy_state_save(ctx->config->quota_state,
+                          ctx->config->quota_period, usage, count) != 0) {
         if (!ctx->quota_save_warned) {
             log_warn("Cannot write the quota state file '%s': %s",
                      ctx->config->quota_state, strerror(errno));

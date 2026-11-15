@@ -411,15 +411,34 @@ const pipesix_client_cred_t *config_find_client(const pipesix_config_t *config,
  *
  * Returns NULL when the table is full.
  */
-static pipesix_client_policy_t *policy_entry(pipesix_config_t *config,
-                                             const char *id)
+static pipesix_client_policy_t *policy_find(const pipesix_config_t *config,
+                                            const char *id)
 {
     int i;
 
     for (i = 0; i < config->policy_count; i++) {
         if (strcmp(config->policies[i].id, id) == 0) {
-            return &config->policies[i];
+            return (pipesix_client_policy_t *)&config->policies[i];
         }
+    }
+
+    return NULL;
+}
+
+const pipesix_client_policy_t *config_find_policy(
+    const pipesix_config_t *config, const char *id)
+{
+    return policy_find(config, id);
+}
+
+static pipesix_client_policy_t *policy_entry(pipesix_config_t *config,
+                                             const char *id)
+{
+    pipesix_client_policy_t *existing = policy_find(config, id);
+    int i;
+
+    if (existing != NULL) {
+        return existing;
     }
 
     if (config->policy_count >= CONFIG_MAX_CLIENTS) {
@@ -436,16 +455,25 @@ static pipesix_client_policy_t *policy_entry(pipesix_config_t *config,
     return &config->policies[i];
 }
 
+/* Which limit a 'client_*' line sets. */
+#define POLICY_RATE  0
+#define POLICY_QUOTA 1
+#define POLICY_WARN  2
+
 /*
- * Parse "client_rate_limit = <id> <kbit/s>" or
- * "client_quota = <id> <MiB per UTC day>".
+ * Parse "client_rate_limit = <id> <kbit/s>",
+ * "client_quota = <id> <MiB per UTC period>" or
+ * "client_quota_warn = <id> <percent>".
  *
  * The 'client' line must come first, like 'client_route', so a typo in the
  * id is an error instead of a limit that silently never applies.
  */
 static int set_client_policy(pipesix_config_t *config, const char *value,
-                             int quota)
+                             int kind)
 {
+    static const char *const names[] = {
+        "client_rate_limit", "client_quota", "client_quota_warn"
+    };
     pipesix_client_policy_t *policy;
     char work[CONFIG_MAX_CLIENT_ID + 32];
     char *id;
@@ -477,39 +505,52 @@ static int set_client_policy(pipesix_config_t *config, const char *value,
     if (!valid_client_id(id)) return -1;
     if (parse_int(number, &parsed) != 0 || parsed < 0) return -1;
 
-    if (quota) {
-        if (parsed > 1048576) {         /* 1 TiB per day */
+    if (kind == POLICY_QUOTA) {
+        if (parsed > 1048576) {         /* 1 TiB per period */
             log_error("client_quota: '%d' MiB is too large", parsed);
             return -1;
         }
-    } else if (parsed > 100000000) {    /* 100 Gbit/s */
-        log_error("client_rate_limit: '%d' kbit/s is too large", parsed);
+    } else if (kind == POLICY_RATE) {
+        if (parsed > 100000000) {       /* 100 Gbit/s */
+            log_error("client_rate_limit: '%d' kbit/s is too large",
+                      parsed);
+            return -1;
+        }
+    } else if (parsed > 99) {
+        log_error("client_quota_warn: '%d'%% is not between 1 and 99",
+                  parsed);
         return -1;
     }
 
     if (config_find_client(config, id) == NULL) {
         log_error("%s: unknown client '%s' (the 'client' line must come "
-                  "before its limits)",
-                  quota ? "client_quota" : "client_rate_limit", id);
+                  "before its limits)", names[kind], id);
         return -1;
     }
 
     policy = policy_entry(config, id);
     if (policy == NULL) return -1;
 
-    if (quota) {
-        if (policy->quota_mib != 0) {
-            log_error("client_quota: client '%s' already has a quota", id);
-            return -1;
-        }
-        policy->quota_mib = (uint64_t)parsed;
-    } else {
+    if (kind == POLICY_RATE) {
         if (policy->rate_kbps != 0) {
             log_error("client_rate_limit: client '%s' already has a rate",
                       id);
             return -1;
         }
         policy->rate_kbps = (uint64_t)parsed;
+    } else if (kind == POLICY_QUOTA) {
+        if (policy->quota_mib != 0) {
+            log_error("client_quota: client '%s' already has a quota", id);
+            return -1;
+        }
+        policy->quota_mib = (uint64_t)parsed;
+    } else {
+        if (policy->warn_percent != 0) {
+            log_error("client_quota_warn: client '%s' already has a "
+                      "warning", id);
+            return -1;
+        }
+        policy->warn_percent = (uint64_t)parsed;
     }
 
     return 0;
@@ -595,10 +636,24 @@ static int config_set_value(pipesix_config_t *config, const char *key,
         return set_client_route(config, value);
     }
     if (strcmp(key, "client_rate_limit") == 0) {
-        return set_client_policy(config, value, 0);
+        return set_client_policy(config, value, POLICY_RATE);
     }
     if (strcmp(key, "client_quota") == 0) {
-        return set_client_policy(config, value, 1);
+        return set_client_policy(config, value, POLICY_QUOTA);
+    }
+    if (strcmp(key, "client_quota_warn") == 0) {
+        return set_client_policy(config, value, POLICY_WARN);
+    }
+    if (strcmp(key, "quota_period") == 0) {
+        if (strcasecmp(value, "daily") == 0) {
+            config->quota_period = 0;
+            return 0;
+        }
+        if (strcasecmp(value, "monthly") == 0) {
+            config->quota_period = 1;
+            return 0;
+        }
+        return -1;
     }
     if (strcmp(key, "log_level") == 0) {
         log_level_t level;
@@ -783,6 +838,20 @@ int config_validate(const pipesix_config_t *config)
         return -1;
     }
 
+    {
+        int i;
+
+        for (i = 0; i < config->policy_count; i++) {
+            if (config->policies[i].warn_percent > 0 &&
+                config->policies[i].quota_mib == 0) {
+                log_error("Configuration validation failed: client '%s' "
+                          "sets 'client_quota_warn' without a "
+                          "'client_quota'", config->policies[i].id);
+                return -1;
+            }
+        }
+    }
+
     if (strcmp(config->mode, "client") == 0) {
         if (strlen(config->remote_address) == 0) {
             log_error("Configuration validation failed: 'remote_address' is required in client mode");
@@ -951,11 +1020,25 @@ void config_dump(const pipesix_config_t *config)
                      prefix_str, config->clients[i].prefix_len);
         }
 
+        log_info("  quota_period    = %s",
+                 config->quota_period ? "monthly" : "daily");
+
         for (i = 0; i < config->policy_count; i++) {
-            log_info("    limits: %s rate %llu kbit/s, quota %llu MiB/day",
+            char warn[48];
+
+            if (config->policies[i].warn_percent > 0) {
+                snprintf(warn, sizeof(warn), ", warn at %llu%%",
+                         (unsigned long long)config->policies[i]
+                             .warn_percent);
+            } else {
+                warn[0] = '\0';
+            }
+
+            log_info("    limits: %s rate %llu kbit/s, quota %llu MiB/%s%s",
                      config->policies[i].id,
                      (unsigned long long)config->policies[i].rate_kbps,
-                     (unsigned long long)config->policies[i].quota_mib);
+                     (unsigned long long)config->policies[i].quota_mib,
+                     config->quota_period ? "month" : "day", warn);
         }
     }
     log_info("  keepalive       = %d s", config->keepalive);
@@ -1327,7 +1410,8 @@ int config_rotate_all_keys(pipesix_config_t *config)
  * The same conservative parser as the rest of the file: the key token is
  * read up to '=' or whitespace, and the id up to ':' or whitespace.
  */
-static int line_belongs_to_client(const char *line, const char *id)
+static int line_names_client(const char *line, const char *id,
+                             int limits_only)
 {
     const char *p = line;
     const char *eq;
@@ -1335,6 +1419,9 @@ static int line_belongs_to_client(const char *line, const char *id)
     const char *end;
     size_t key_len = 0;
     size_t id_len = strlen(id);
+    int is_client;
+    int is_route;
+    int is_limit;
 
     while (isspace((unsigned char)*p)) {
         p++;
@@ -1349,10 +1436,16 @@ static int line_belongs_to_client(const char *line, const char *id)
         key_len++;
     }
 
-    if (!((key_len == 6u && memcmp(p, "client", 6) == 0) ||
-          (key_len == 12u && memcmp(p, "client_route", 12) == 0) ||
-          (key_len == 12u && memcmp(p, "client_quota", 12) == 0) ||
-          (key_len == 17u && memcmp(p, "client_rate_limit", 17) == 0))) {
+    is_client = key_len == 6u && memcmp(p, "client", 6) == 0;
+    is_route = key_len == 12u && memcmp(p, "client_route", 12) == 0;
+    is_limit = (key_len == 12u && memcmp(p, "client_quota", 12) == 0) ||
+               (key_len == 17u &&
+                memcmp(p, "client_rate_limit", 17) == 0) ||
+               (key_len == 17u &&
+                memcmp(p, "client_quota_warn", 17) == 0);
+
+    if ((!is_client && !is_route && !is_limit) ||
+        (limits_only && !is_limit)) {
         return 0;
     }
 
@@ -1373,6 +1466,16 @@ static int line_belongs_to_client(const char *line, const char *id)
 
     return (size_t)(end - start) == id_len &&
            memcmp(start, id, id_len) == 0;
+}
+
+static int line_belongs_to_client(const char *line, const char *id)
+{
+    return line_names_client(line, id, 0);
+}
+
+static int line_is_limit_for(const char *line, const char *id)
+{
+    return line_names_client(line, id, 1);
 }
 
 /*
@@ -1421,8 +1524,9 @@ static int open_replacement(const char *path, char *tmp_path,
 }
 
 int config_add_client(pipesix_config_t *config, const char *id,
-                      const char *prefix, char *secret_out,
-                      size_t secret_size)
+                      const char *prefix,
+                      const pipesix_client_policy_t *limits,
+                      char *secret_out, size_t secret_size)
 {
     char key_hex[ROTATE_KEY_STRIDE];
     char tmp_path[CONFIG_PATH_MAX + 32];
@@ -1523,6 +1627,44 @@ int config_add_client(pipesix_config_t *config, const char *id,
         }
     }
 
+    if (limits != NULL) {
+        if (limits->rate_kbps > 0) {
+            if (snprintf(line, sizeof(line),
+                         "client_rate_limit = %s %llu\n", id,
+                         (unsigned long long)limits->rate_kbps) >=
+                (int)sizeof(line)) {
+                goto cleanup;
+            }
+            if (fputs(line, out) == EOF) {
+                goto cleanup;
+            }
+        }
+
+        if (limits->quota_mib > 0) {
+            if (snprintf(line, sizeof(line),
+                         "client_quota = %s %llu\n", id,
+                         (unsigned long long)limits->quota_mib) >=
+                (int)sizeof(line)) {
+                goto cleanup;
+            }
+            if (fputs(line, out) == EOF) {
+                goto cleanup;
+            }
+        }
+
+        if (limits->warn_percent > 0) {
+            if (snprintf(line, sizeof(line),
+                         "client_quota_warn = %s %llu\n", id,
+                         (unsigned long long)limits->warn_percent) >=
+                (int)sizeof(line)) {
+                goto cleanup;
+            }
+            if (fputs(line, out) == EOF) {
+                goto cleanup;
+            }
+        }
+    }
+
     if (fflush(out) != 0 || sync_file(out) != 0) {
         goto cleanup;
     }
@@ -1556,6 +1698,22 @@ int config_add_client(pipesix_config_t *config, const char *id,
                       "is unchanged", id, config->config_path);
             goto cleanup;
         }
+
+        if (limits != NULL &&
+            (limits->rate_kbps > 0 || limits->quota_mib > 0 ||
+             limits->warn_percent > 0)) {
+            const pipesix_client_policy_t *policy =
+                config_find_policy(&check, id);
+
+            if (policy == NULL ||
+                policy->rate_kbps != limits->rate_kbps ||
+                policy->quota_mib != limits->quota_mib ||
+                policy->warn_percent != limits->warn_percent) {
+                log_error("the limits for client '%s' were not accepted; "
+                          "'%s' is unchanged", id, config->config_path);
+                goto cleanup;
+            }
+        }
     }
 
     if (rename(tmp_path, config->config_path) != 0) {
@@ -1581,6 +1739,249 @@ cleanup:
     }
 
     return rc;
+}
+
+/*
+ * Replace one client's limit lines and reload the result.
+ *
+ * 'append' holds the replacement lines, or NULL to remove every limit for
+ * the client. Every other line is copied through unchanged, and the
+ * rewritten file is parsed and validated before it replaces the original.
+ */
+static int rewrite_limits(pipesix_config_t *config, const char *id,
+                          const char *append)
+{
+    char path[CONFIG_PATH_MAX];
+    char tmp_path[CONFIG_PATH_MAX + 32];
+    char buf[4096];
+    FILE *in = NULL;
+    FILE *out = NULL;
+    int last = '\n';
+    int rc = -1;
+
+    /*
+     * config_load() clears the destination before parsing, so it must
+     * never receive its own config->config_path buffer as the path.
+     */
+    snprintf(path, sizeof(path), "%s", config->config_path);
+
+    in = fopen(path, "r");
+    if (in == NULL) {
+        return -1;
+    }
+
+    if (open_replacement(path, tmp_path, sizeof(tmp_path), &out) != 0) {
+        fclose(in);
+        return -1;
+    }
+
+    while (fgets(buf, sizeof(buf), in) != NULL) {
+        if (line_is_limit_for(buf, id)) {
+            continue;
+        }
+        if (fputs(buf, out) == EOF) {
+            goto cleanup;
+        }
+        last = buf[strlen(buf) - 1];
+    }
+
+    if (ferror(in)) {
+        goto cleanup;
+    }
+
+    if (append != NULL) {
+        if (last != '\n' && fputc('\n', out) == EOF) {
+            goto cleanup;
+        }
+        if (fputs(append, out) == EOF) {
+            goto cleanup;
+        }
+    }
+
+    if (fflush(out) != 0 || sync_file(out) != 0) {
+        goto cleanup;
+    }
+    if (fclose(out) != 0) {
+        out = NULL;
+        goto cleanup;
+    }
+    out = NULL;
+
+    {
+        pipesix_config_t check;
+
+        if (config_load(tmp_path, &check) != 0 ||
+            config_validate(&check) != 0) {
+            log_error("the rewritten configuration is invalid; '%s' is "
+                      "unchanged", config->config_path);
+            goto cleanup;
+        }
+
+        if (append == NULL) {
+            if (config_find_policy(&check, id) != NULL) {
+                log_error("the limits for client '%s' were not removed; "
+                          "'%s' is unchanged", id, config->config_path);
+                goto cleanup;
+            }
+        } else if (append[0] != '\0' &&
+                   config_find_policy(&check, id) == NULL) {
+            log_error("the rewritten configuration has no limits for "
+                      "client '%s'; '%s' is unchanged", id,
+                      config->config_path);
+            goto cleanup;
+        }
+    }
+
+    if (rename(tmp_path, path) != 0) {
+        log_error("cannot replace '%s': %s", path, strerror(errno));
+        goto cleanup;
+    }
+
+    if (config_load(path, config) != 0) {
+        log_error("cannot reload '%s' after the rewrite", path);
+        return -1;
+    }
+
+    rc = 0;
+
+cleanup:
+    if (out != NULL) {
+        fclose(out);
+    }
+    fclose(in);
+
+    if (rc != 0) {
+        unlink(tmp_path);
+    }
+
+    return rc;
+}
+
+int config_set_limits(pipesix_config_t *config, const char *id,
+                      const uint64_t *rate_kbps, const uint64_t *quota_mib,
+                      const uint64_t *warn_percent)
+{
+    const pipesix_client_policy_t *current;
+    char append[512];
+    size_t used = 0;
+    uint64_t rate;
+    uint64_t quota;
+    uint64_t warn;
+
+    if (config == NULL || id == NULL || config->config_path[0] == '\0') {
+        return -1;
+    }
+
+    if (strcmp(config->mode, "server") != 0) {
+        log_error("limits can only be set on a server configuration");
+        return -1;
+    }
+
+    if (config_find_client(config, id) == NULL) {
+        log_error("client '%s' is not configured in '%s'", id,
+                  config->config_path);
+        return -1;
+    }
+
+    if (rate_kbps == NULL && quota_mib == NULL && warn_percent == NULL) {
+        log_error("--set-limit needs --rate, --quota or --quota-warn");
+        return -1;
+    }
+
+    if (rate_kbps != NULL && *rate_kbps > 100000000u) {
+        log_error("--rate: '%llu' kbit/s is too large",
+                  (unsigned long long)*rate_kbps);
+        return -1;
+    }
+
+    if (quota_mib != NULL && *quota_mib > 1048576u) {
+        log_error("--quota: '%llu' MiB is too large",
+                  (unsigned long long)*quota_mib);
+        return -1;
+    }
+
+    if (warn_percent != NULL && *warn_percent > 99u) {
+        log_error("--quota-warn: '%llu'%% is not between 0 and 99",
+                  (unsigned long long)*warn_percent);
+        return -1;
+    }
+
+    /* Unspecified limits keep whatever the file already has. */
+    current = config_find_policy(config, id);
+    rate = (rate_kbps != NULL) ? *rate_kbps
+                               : (current != NULL ? current->rate_kbps : 0);
+    quota = (quota_mib != NULL) ? *quota_mib
+                                : (current != NULL ? current->quota_mib : 0);
+    warn = (warn_percent != NULL)
+               ? *warn_percent
+               : (current != NULL ? current->warn_percent : 0);
+
+    if (warn > 0 && quota == 0) {
+        log_error("--quota-warn needs a quota: set --quota first");
+        return -1;
+    }
+
+    append[0] = '\0';
+
+    if (rate > 0) {
+        int n = snprintf(append + used, sizeof(append) - used,
+                         "client_rate_limit = %s %llu\n", id,
+                         (unsigned long long)rate);
+
+        if (n < 0 || (size_t)n >= sizeof(append) - used) {
+            return -1;
+        }
+        used += (size_t)n;
+    }
+
+    if (quota > 0) {
+        int n = snprintf(append + used, sizeof(append) - used,
+                         "client_quota = %s %llu\n", id,
+                         (unsigned long long)quota);
+
+        if (n < 0 || (size_t)n >= sizeof(append) - used) {
+            return -1;
+        }
+        used += (size_t)n;
+    }
+
+    if (warn > 0) {
+        int n = snprintf(append + used, sizeof(append) - used,
+                         "client_quota_warn = %s %llu\n", id,
+                         (unsigned long long)warn);
+
+        if (n < 0 || (size_t)n >= sizeof(append) - used) {
+            return -1;
+        }
+        used += (size_t)n;
+    }
+
+    return rewrite_limits(config, id, append);
+}
+
+int config_clear_limits(pipesix_config_t *config, const char *id)
+{
+    if (config == NULL || id == NULL || config->config_path[0] == '\0') {
+        return -1;
+    }
+
+    if (strcmp(config->mode, "server") != 0) {
+        log_error("limits can only be cleared on a server configuration");
+        return -1;
+    }
+
+    if (config_find_client(config, id) == NULL) {
+        log_error("client '%s' is not configured in '%s'", id,
+                  config->config_path);
+        return -1;
+    }
+
+    if (config_find_policy(config, id) == NULL) {
+        log_error("client '%s' has no limits configured", id);
+        return -1;
+    }
+
+    return rewrite_limits(config, id, NULL);
 }
 
 int config_remove_client(pipesix_config_t *config, const char *id)

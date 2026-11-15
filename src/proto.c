@@ -71,6 +71,8 @@ static int flags_valid(uint16_t flags, size_t payload_len)
     if ((flags & PIPESIX_FLAG_HANDSHAKE_RESP) != 0) controls++;
     if ((flags & PIPESIX_FLAG_HANDSHAKE_NEEDED) != 0) controls++;
     if ((flags & PIPESIX_FLAG_SERVER_CLOSING) != 0) controls++;
+    if ((flags & PIPESIX_FLAG_QUOTA_WARNING) != 0) controls++;
+    if ((flags & PIPESIX_FLAG_QUOTA_EXHAUSTED) != 0) controls++;
 
     if (controls > 1) {
         return 0;
@@ -85,6 +87,11 @@ static int flags_valid(uint16_t flags, size_t payload_len)
     }
 
     if ((flags & PIPESIX_FLAG_SERVER_CLOSING) != 0) {
+        return payload_len == 0;
+    }
+
+    if ((flags & (PIPESIX_FLAG_QUOTA_WARNING |
+                  PIPESIX_FLAG_QUOTA_EXHAUSTED)) != 0) {
         return payload_len == 0;
     }
 

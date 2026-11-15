@@ -36,6 +36,14 @@
  *   PIPESIX_FLAG_SERVER_CLOSING    - server is shutting down and the
  *                                    client should reconnect at once,
  *                                    payload length must be 0
+ *   PIPESIX_FLAG_QUOTA_WARNING     - server warns that the client has
+ *                                    reached its quota threshold
+ *   PIPESIX_FLAG_QUOTA_EXHAUSTED   - server has started dropping the
+ *                                    client's traffic because its quota
+ *                                    for this period is used up
+ *
+ * The two quota notices are sent inside the session, authenticated with
+ * the server-to-client key, so a spoofed datagram cannot fake them.
  *
  * Handshake
  * ---------
@@ -89,11 +97,15 @@
 #define PIPESIX_FLAG_HANDSHAKE_RESP  0x0008u
 #define PIPESIX_FLAG_HANDSHAKE_NEEDED 0x0010u
 #define PIPESIX_FLAG_SERVER_CLOSING  0x0020u
+#define PIPESIX_FLAG_QUOTA_WARNING   0x0040u
+#define PIPESIX_FLAG_QUOTA_EXHAUSTED 0x0080u
 #define PIPESIX_FLAG_KNOWN          (PIPESIX_FLAG_AUTH | PIPESIX_FLAG_KEEPALIVE | \
                                      PIPESIX_FLAG_HANDSHAKE_INIT | \
                                      PIPESIX_FLAG_HANDSHAKE_RESP | \
                                      PIPESIX_FLAG_HANDSHAKE_NEEDED | \
-                                     PIPESIX_FLAG_SERVER_CLOSING)
+                                     PIPESIX_FLAG_SERVER_CLOSING | \
+                                     PIPESIX_FLAG_QUOTA_WARNING | \
+                                     PIPESIX_FLAG_QUOTA_EXHAUSTED)
 
 /* Fixed header size on the wire */
 #define PIPESIX_HEADER_SIZE         24

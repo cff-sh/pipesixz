@@ -7,10 +7,11 @@
  * session. A clock that jumps backwards simply refills nothing until it
  * catches up, because elapsed time is clamped to zero.
  *
- * The quota is per client id and per UTC day. Keeping the counter out of
- * the session is what stops a reconnect (or a key rotation) from resetting
- * the budget, and the same counter feeds 'pipesix --usage' and the
- * optional state file, so a restart does not reset the day either.
+ * The quota is per client id and per UTC period (a day, or a calendar
+ * month). Keeping the counter out of the session is what stops a
+ * reconnect (or a key rotation) from resetting the budget, and the same
+ * counter feeds 'pipesix --usage' and the optional state file, so a
+ * restart does not reset the period either.
  */
 
 #include "policy.h"
@@ -104,10 +105,10 @@ void policy_quota_init(pipesix_quota_t *quota, uint64_t limit_bytes)
 
     quota->limit = limit_bytes;
     atomic_init(&quota->used, 0);
-    atomic_init(&quota->day, -1);
+    atomic_init(&quota->period, -1);
 }
 
-int policy_quota_charge(pipesix_quota_t *quota, size_t bytes, int day)
+int policy_quota_charge(pipesix_quota_t *quota, size_t bytes, int period)
 {
     uint64_t used;
 
@@ -115,8 +116,8 @@ int policy_quota_charge(pipesix_quota_t *quota, size_t bytes, int day)
         return 1;
     }
 
-    if (atomic_load_explicit(&quota->day, memory_order_relaxed) != day) {
-        atomic_store_explicit(&quota->day, day, memory_order_relaxed);
+    if (atomic_load_explicit(&quota->period, memory_order_relaxed) != period) {
+        atomic_store_explicit(&quota->period, period, memory_order_relaxed);
         atomic_store_explicit(&quota->used, 0, memory_order_relaxed);
     }
 
@@ -130,7 +131,7 @@ int policy_quota_charge(pipesix_quota_t *quota, size_t bytes, int day)
     return used <= quota->limit;
 }
 
-uint64_t policy_quota_remaining(const pipesix_quota_t *quota, int day)
+uint64_t policy_quota_remaining(const pipesix_quota_t *quota, int period)
 {
     uint64_t used;
 
@@ -138,7 +139,7 @@ uint64_t policy_quota_remaining(const pipesix_quota_t *quota, int day)
         return 0;
     }
 
-    if (atomic_load_explicit(&quota->day, memory_order_relaxed) != day) {
+    if (atomic_load_explicit(&quota->period, memory_order_relaxed) != period) {
         return quota->limit;
     }
 
@@ -150,31 +151,121 @@ uint64_t policy_quota_remaining(const pipesix_quota_t *quota, int day)
     return quota->limit - used;
 }
 
-uint64_t policy_quota_used(const pipesix_quota_t *quota, int day)
+uint64_t policy_quota_used(const pipesix_quota_t *quota, int period)
 {
     if (quota == NULL) {
         return 0;
     }
 
-    if (atomic_load_explicit(&quota->day, memory_order_relaxed) != day) {
+    if (atomic_load_explicit(&quota->period, memory_order_relaxed) != period) {
         return 0;
     }
 
     return atomic_load_explicit(&quota->used, memory_order_relaxed);
 }
 
-void policy_quota_restore(pipesix_quota_t *quota, uint64_t used, int day)
+void policy_quota_restore(pipesix_quota_t *quota, uint64_t used, int period)
 {
     if (quota == NULL) {
         return;
     }
 
     atomic_store_explicit(&quota->used, used, memory_order_relaxed);
-    atomic_store_explicit(&quota->day, day, memory_order_relaxed);
+    atomic_store_explicit(&quota->period, period, memory_order_relaxed);
 }
 
-int policy_state_save(const char *path, const policy_usage_t *usage,
-                      int count)
+/*
+ * Days since 1970-01-01 for a proleptic Gregorian date, and the inverse.
+ *
+ * The algorithms are Howard Hinnant's 'days_from_civil' and
+ * 'civil_from_days'. They are here so the monthly period is a pure
+ * function of a timestamp: gmtime() keeps one static result buffer, and
+ * both data-path threads call into this module at once.
+ */
+static int64_t days_from_civil(int y, unsigned m, unsigned d)
+{
+    int64_t era;
+    unsigned yoe;
+    unsigned doy;
+    unsigned doe;
+
+    y -= (m <= 2u);
+    era = (y >= 0 ? y : y - 399) / 400;
+    yoe = (unsigned)((int64_t)y - era * 400);
+    doy = (153u * (m > 2u ? m - 3u : m + 9u) + 2u) / 5u + d - 1u;
+    doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+static void civil_from_days(int64_t z, int *y, unsigned *m, unsigned *d)
+{
+    int64_t era;
+    int64_t yr;
+    unsigned doe;
+    unsigned yoe;
+    unsigned doy;
+    unsigned mp;
+
+    z += 719468;
+    era = (z >= 0 ? z : z - 146096) / 146097;
+    doe = (unsigned)(z - era * 146097);
+    yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
+    yr = (int64_t)yoe + era * 400;
+    doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
+    mp = (5u * doy + 2u) / 153u;
+
+    *d = doy - (153u * mp + 2u) / 5u + 1u;
+    *m = (mp < 10u) ? mp + 3u : mp - 9u;
+    *y = (int)(yr + (*m <= 2u));
+}
+
+int policy_period(time_t now, int monthly)
+{
+    int64_t days = (int64_t)now / 86400;
+
+    if (!monthly) {
+        return (int)days;
+    }
+
+    {
+        int year;
+        unsigned month;
+        unsigned day;
+
+        civil_from_days(days, &year, &month, &day);
+        return year * 12 + (int)month - 1;
+    }
+}
+
+time_t policy_period_start(int period, int monthly)
+{
+    if (!monthly) {
+        return (time_t)((int64_t)period * 86400);
+    }
+
+    {
+        int year = period / 12;
+        int month = period % 12;
+
+        /* Keep the arithmetic correct either side of the epoch. */
+        if (month < 0) {
+            month += 12;
+            year -= 1;
+        }
+
+        return (time_t)(days_from_civil(year, (unsigned)month + 1u, 1u) *
+                        86400);
+    }
+}
+
+time_t policy_period_end(int period, int monthly)
+{
+    return policy_period_start(period + 1, monthly);
+}
+
+int policy_state_save(const char *path, int monthly,
+                      const policy_usage_t *usage, int count)
 {
     char tmp_path[4096 + sizeof(POLICY_STATE_SUFFIX)];
     FILE *fp;
@@ -198,12 +289,13 @@ int policy_state_save(const char *path, const policy_usage_t *usage,
         return -1;
     }
 
-    if (fprintf(fp, "# pipesix quota state v1\n") < 0) {
+    if (fprintf(fp, "# pipesix quota state v2\nperiod %s\n",
+                monthly ? "monthly" : "daily") < 0) {
         goto close;
     }
 
     for (i = 0; i < count; i++) {
-        if (fprintf(fp, "%lld %llu %s\n", (long long)usage[i].day,
+        if (fprintf(fp, "%lld %llu %s\n", (long long)usage[i].period,
                     (unsigned long long)usage[i].used,
                     usage[i].id) < 0) {
             goto close;
@@ -248,20 +340,21 @@ fail:
     return rc;
 }
 
-int policy_state_load(const char *path, policy_usage_t *usage, int max,
-                      int *count)
+int policy_state_load(const char *path, int *monthly,
+                      policy_usage_t *usage, int max, int *count)
 {
     char line[256];
     FILE *fp;
     int n = 0;
 
-    if (path == NULL || path[0] == '\0' || usage == NULL || max < 0 ||
-        count == NULL) {
+    if (path == NULL || path[0] == '\0' || monthly == NULL ||
+        usage == NULL || max < 0 || count == NULL) {
         errno = EINVAL;
         return -1;
     }
 
     *count = 0;
+    *monthly = 0;
 
     fp = fopen(path, "r");
     if (fp == NULL) {
@@ -271,7 +364,7 @@ int policy_state_load(const char *path, policy_usage_t *usage, int max,
     while (fgets(line, sizeof(line), fp) != NULL) {
         char *p = line;
         char id[POLICY_MAX_ID];
-        long long day;
+        long long period;
         unsigned long long used;
 
         while (*p == ' ' || *p == '\t') {
@@ -282,17 +375,22 @@ int policy_state_load(const char *path, policy_usage_t *usage, int max,
             continue;
         }
 
-        if (sscanf(p, "%lld %llu %32s", &day, &used, id) != 3) {
+        if (strncmp(p, "period ", 7) == 0) {
+            *monthly = (strncmp(p + 7, "monthly", 7) == 0);
             continue;
         }
 
-        if (day < 0 || n >= max) {
+        if (sscanf(p, "%lld %llu %32s", &period, &used, id) != 3) {
+            continue;
+        }
+
+        if (period < 0 || n >= max) {
             continue;
         }
 
         memset(&usage[n], 0, sizeof(usage[n]));
         snprintf(usage[n].id, sizeof(usage[n].id), "%s", id);
-        usage[n].day = (int64_t)day;
+        usage[n].period = (int64_t)period;
         usage[n].used = (uint64_t)used;
         n++;
     }
@@ -325,9 +423,4 @@ uint64_t policy_now_ms(void)
     return (uint64_t)ts.tv_sec * 1000u +
            ((uint64_t)ts.tv_nsec / 1000000u);
 #endif
-}
-
-int policy_day(time_t now)
-{
-    return (int)((int64_t)now / 86400);
 }

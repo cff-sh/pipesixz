@@ -5,11 +5,11 @@
  * data path:
  *
  *   - a token bucket that caps a client's rate in bytes per second;
- *   - a UTC-day byte quota shared by both directions.
+ *   - a byte quota for a UTC day or a UTC calendar month.
  *
  * Every configured client is accounted for, with or without a quota, so
- * 'pipesix --usage' can report the bytes a client moved today and a limit
- * added later does not start from zero.
+ * 'pipesix --usage' can report the bytes a client moved this period and a
+ * limit added later does not start from zero.
  *
  * Neither structure knows about clients, sockets or configuration, and
  * the time is passed in rather than read, so both can be unit-tested
@@ -29,6 +29,10 @@
 
 /* Longest client id accepted by the state file, including the NUL. */
 #define POLICY_MAX_ID 33
+
+/* Quota period selectors, matching the 'quota_period' configuration key. */
+#define POLICY_PERIOD_DAILY   0
+#define POLICY_PERIOD_MONTHLY 1
 
 /*
  * Token bucket. A rate of 0 means unlimited, and the bucket functions
@@ -60,50 +64,50 @@ int policy_bucket_allow(pipesix_bucket_t *bucket, size_t bytes,
                         uint64_t now_ms);
 
 /*
- * Per-client daily usage, and the quota that may cap it.
+ * Per-client usage for the current period, and the quota that may cap it.
  *
- * 'used' and 'day' are atomic because the receiver charges traffic the
+ * 'used' and 'period' are atomic because the receiver charges traffic the
  * client sent and the sender charges traffic the client received, and
  * those run in different threads.
  */
 typedef struct {
-    uint64_t limit;         /* bytes per UTC day, 0 = unlimited */
-    _Atomic uint64_t used;  /* bytes charged for 'day' */
-    _Atomic int      day;   /* UTC day the counter belongs to, -1 = unset */
+    uint64_t limit;          /* bytes per period, 0 = unlimited */
+    _Atomic uint64_t used;   /* bytes charged for 'period' */
+    _Atomic int      period; /* period index, -1 = unset */
 } pipesix_quota_t;
 
 void policy_quota_init(pipesix_quota_t *quota, uint64_t limit_bytes);
 
 /*
- * Charge bytes against the quota for 'day'.
+ * Charge bytes against the quota for 'period'.
  *
  * Returns 1 while the client is within its budget, 0 once it is not.
  * The bytes are charged either way, so exceeding the quota does not let
  * the next packet through, and a quota of 0 still counts usage instead of
- * letting it pass unseen. The counter resets when 'day' changes; two
- * threads racing across midnight may lose a handful of bytes from the
- * count, which is deliberate: the data path must not take a lock to
+ * letting it pass unseen. The counter resets when 'period' changes; two
+ * threads racing across a period boundary may lose a handful of bytes from
+ * the count, which is deliberate: the data path must not take a lock to
  * account for a policy.
  */
-int policy_quota_charge(pipesix_quota_t *quota, size_t bytes, int day);
+int policy_quota_charge(pipesix_quota_t *quota, size_t bytes, int period);
 
 /*
- * Bytes still available in the quota for 'day'.
+ * Bytes still available in the quota for 'period'.
  *
  * Returns 0 when the client has no quota or has used it all. Read-only:
- * a scrape must not reset the counter, so a new day is reported as a full
- * budget without storing anything.
+ * a scrape must not reset the counter, so a new period is reported as a
+ * full budget without storing anything.
  */
-uint64_t policy_quota_remaining(const pipesix_quota_t *quota, int day);
+uint64_t policy_quota_remaining(const pipesix_quota_t *quota, int period);
 
 /*
- * Bytes charged for 'day'.
+ * Bytes charged for 'period'.
  *
- * Returns 0 when the counter belongs to another day. Unlike
+ * Returns 0 when the counter belongs to another period. Unlike
  * policy_quota_remaining() this works for a client without a quota, which
  * is what 'pipesix --usage' reports.
  */
-uint64_t policy_quota_used(const pipesix_quota_t *quota, int day);
+uint64_t policy_quota_used(const pipesix_quota_t *quota, int period);
 
 /*
  * Put a counter back to a value read from the state file.
@@ -111,43 +115,63 @@ uint64_t policy_quota_used(const pipesix_quota_t *quota, int day);
  * Only meaningful at startup or under the server's session lock: it
  * replaces the counter without charging anything.
  */
-void policy_quota_restore(pipesix_quota_t *quota, uint64_t used, int day);
+void policy_quota_restore(pipesix_quota_t *quota, uint64_t used, int period);
 
 /*
- * One client's persisted usage line.
+ * Index of the quota period that contains 'now'.
+ *
+ * Daily periods count days since the epoch; monthly periods count calendar
+ * months since January 1970 (year * 12 + month - 1). Both are pure
+ * arithmetic, so the data path can call this from several threads without
+ * touching gmtime()'s shared state.
+ */
+int policy_period(time_t now, int monthly);
+
+/* Unix timestamp of the first second of 'period'. */
+time_t policy_period_start(int period, int monthly);
+
+/* Unix timestamp of the first second after 'period'. */
+time_t policy_period_end(int period, int monthly);
+
+/*
+ * One client's persisted usage.
  */
 typedef struct {
     char     id[POLICY_MAX_ID];
-    int64_t  day;   /* UTC day number, as policy_day() */
-    uint64_t used;  /* bytes charged that day */
+    int64_t  period; /* period index, as policy_period() */
+    uint64_t used;   /* bytes charged that period */
 } policy_usage_t;
 
 /*
  * Write usage to 'path', replacing it atomically.
  *
- * The file is written to '<path>.tmp', flushed, and renamed over the
- * destination, so a crash mid-write leaves the previous state file intact.
- * It is created with mode 0600.
+ * The file carries the period kind, so state saved under a daily quota is
+ * not mistaken for monthly usage (or the other way round). It is written
+ * to '<path>.tmp', flushed, and renamed over the destination, so a crash
+ * mid-write leaves the previous state file intact. It is created with
+ * mode 0600.
  *
  * Returns:
  *   0 on success, -1 on failure (the previous file is left alone)
  */
-int policy_state_save(const char *path, const policy_usage_t *usage,
-                      int count);
+int policy_state_save(const char *path, int monthly,
+                      const policy_usage_t *usage, int count);
 
 /*
  * Read usage lines from 'path'.
  *
  * A missing file is not an error: it means the server has not saved any
- * state yet, so *count is 0 and the call returns 0. Malformed or
- * overlong lines are skipped, and at most max entries are stored.
+ * state yet, so *count is 0 and the call returns 0. *monthly reports the
+ * period kind the file was written with (daily when the file predates the
+ * period support). Malformed or overlong lines are skipped, and at most
+ * max entries are stored.
  *
  * Returns:
  *   0 on success (including a missing file), -1 when the file exists but
  *   cannot be read
  */
-int policy_state_load(const char *path, policy_usage_t *usage, int max,
-                      int *count);
+int policy_state_load(const char *path, int *monthly,
+                      policy_usage_t *usage, int max, int *count);
 
 /*
  * Monotonic milliseconds, for the token buckets. Monotonic matters: a
@@ -155,8 +179,5 @@ int policy_state_load(const char *path, policy_usage_t *usage, int max,
  * did not earn.
  */
 uint64_t policy_now_ms(void);
-
-/* UTC day number (days since the epoch) for a Unix timestamp. */
-int policy_day(time_t now);
 
 #endif /* PIPESIX_POLICY_H */

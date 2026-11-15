@@ -92,17 +92,23 @@ secret    = replace-this-with-pipesix-genkey-output
 # directions, take the client id first, and are reloaded on SIGHUP.
 # 0 means unlimited and the default is no entry at all.
 #
-#   client_rate_limit = <id> <kbit/s>    e.g. 50000 = 50 Mbit/s
-#   client_quota      = <id> <MiB/day>   e.g. 10240 = 10 GiB per day
+# quota_period selects the quota window: daily (default) or monthly.
+# It is read at startup, so changing it needs a restart.
 #
+#   client_rate_limit = <id> <kbit/s>    e.g. 50000 = 50 Mbit/s
+#   client_quota      = <id> <MiB>       e.g. 10240 = 10 GiB per period
+#   client_quota_warn = <id> <percent>   e.g. 90 = warn at 90%
+#
+#quota_period      = daily
 #client_rate_limit = client1 50000
 #client_quota      = client1 10240
+#client_quota_warn = client1 90
 #
-# quota_state: file that keeps the per-client daily usage across a restart
-# (server mode, optional). Today's counters are restored at startup and the
-# file is rewritten every 30 seconds and on shutdown. Empty (default) keeps
-# the counters in memory only, so they start at zero with the process. The
-# directory must exist and be writable by the server.
+# quota_state: file that keeps the per-client usage across a restart
+# (server mode, optional). The current period's counters are restored at
+# startup and the file is rewritten every 30 seconds and on shutdown. Empty
+# (default) keeps the counters in memory only, so they start at zero with
+# the process. The directory must exist and be writable by the server.
 #
 #quota_state = /var/lib/pipesix/quota.state
 

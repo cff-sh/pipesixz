@@ -151,8 +151,8 @@ sudo pipesix --rotate-all         # new client keys, printed and reloaded
 `peer_timeout`, `session_timeout`, `stats_interval`, the credentials (the
 `client`/`client_route` table on a server, the `secret` and `client_id` on a
 client) and the per-client limits, so a cap can be changed on a live tunnel.
-Interface, endpoint, mode, allow-list, `metrics_*` and `quota_state` changes
-require a restart.
+Interface, endpoint, mode, allow-list, `metrics_*`, `quota_state` and
+`quota_period` changes require a restart.
 
 ### Control channel
 
@@ -170,7 +170,7 @@ sudo pipesix --kick client1 -c /etc/pipesix/pipesix.conf
 `--status` prints the mode, configuration path, uptime, the tun and
 listen addresses, one line per session (client id, peer, bytes in and
 out, frames, idle time, return route, and — when the client has them —
-its rate limit and daily quota with the bytes left today) and the
+its rate limit and quota with the bytes left this period) and the
 traffic counters. On a
 client it reports the client id, remote endpoint and its own counters in
 the same shape, so one command works on both ends.
@@ -213,8 +213,9 @@ client with `client_id`, `peer`, `rx_bytes`, `tx_bytes`, `frames`,
 `client_id`, `remote`, `session` and the same `stats` object. `route` is
 `null` when the client has no `client_route`, and `limits` is `null` unless
 the client has a `client_rate_limit` or `client_quota`; otherwise it is an
-object with `rate_kbps`, `quota_mib` and `quota_remaining_bytes` (the last
-is the budget left for the current UTC day, or `0` without a quota).
+object with `rate_kbps`, `quota_mib`, `quota_period` and
+`quota_remaining_bytes` (the last is the budget left for the current period,
+or `0` without a quota).
 `--json` is only valid with `--status`.
 
 ### Prometheus metrics
@@ -274,7 +275,7 @@ and per-client `pipesix_session_rx_bytes`, `_tx_bytes`, `_frames`,
 client's limits since it connected). For a client with a `client_quota` the
 scrape also carries `pipesix_session_quota_limit_bytes` and
 `pipesix_session_quota_remaining_bytes`; both are gauges, and the remaining
-figure is the budget for the current UTC day. A client adds
+figure is the budget for the current period. A client adds
 `pipesix_session_open`.
 
 `pipesix_handshakes_total` counts handshakes that produced a session,
@@ -301,29 +302,61 @@ A server can cap what one client may use without touching the others. Both
 limits are optional, apply in both directions, and are reloaded on SIGHUP:
 
 ```ini
-client_rate_limit = mac1 50000   # 50 Mbit/s
-client_quota      = mac1 10240   # 10 GiB per UTC day
+quota_period      = monthly       # or daily (the default)
+client_rate_limit = mac1 50000    # 50 Mbit/s
+client_quota      = mac1 10240    # 10 GiB per period
+client_quota_warn = mac1 90       # tell the client at 90% of the quota
 ```
 
 `client_rate_limit` is in **kilobits per second**, enforced with a token
 bucket that allows a one-second burst (or one full packet, when the cap is
-slower than that). `client_quota` is in **MiB per UTC day** and counts the
-bytes the client sent and received. The quota is tracked per client id, so a
-reconnect or a key rotation does not clear it. `0` means unlimited in both
-keys, and a client without either line is unlimited.
+slower than that). `client_quota` is in **MiB per UTC period**, where
+`quota_period` selects a calendar day (the default) or a calendar month, and
+counts the bytes the client sent and received. The quota is tracked per
+client id, so a reconnect or a key rotation does not clear it. `0` means
+unlimited in both keys, and a client without either line is unlimited.
+`quota_period` is read at startup, so switching it needs a restart.
 
 Over-limit traffic is dropped and counted as `throttled` in `--status` and
 `pipesix_throttled_total` in the metrics. The first drop in a session is
 logged with the configured numbers, so a client that suddenly stops passing
 traffic explains itself. Keepalives bypass the limits.
 
+When a client reaches `client_quota_warn` percent of its quota, and again on
+the first packet dropped because the quota is used up, the server sends an
+authenticated notice inside that session. The client logs it, so a tunnel
+that goes quiet at the end of the month says why instead of looking dead.
+Each notice is sent once per session, state and period. A client from an
+older release drops the notice as an unknown frame and keeps working; the
+visible warning needs both ends updated.
+
 Limits follow the `client` line that names them, like `client_route`, and
 `--remove-client` removes them along with the client.
 
 A reload applies the limits to the live session table: a changed or removed
 rate resets that client's bucket, and a changed or removed quota applies to
-the current day's counter immediately, so raising a cap takes effect without
-a disconnect. `--status` shows the values a session is running with.
+the current period's counter immediately, so raising a cap takes effect
+without a disconnect. `--status` shows the values a session is running with.
+
+Changing a limit means editing the file and reloading, or using the CLI,
+which rewrites the file atomically and reloads it:
+
+```bash
+sudo pipesix --set-limit mac1 --rate 100000 --quota 51200 --quota-warn 90 \
+    -c /etc/pipesix/pipesix.conf
+sudo pipesix --clear-limit mac1 -c /etc/pipesix/pipesix.conf
+```
+
+`--set-limit` replaces the limits it is given and leaves the others alone
+(an omitted `--rate` keeps the current rate). `0` means unlimited.
+`--clear-limit` removes all three lines. `--add-client` accepts the same
+options, so a metered client can be provisioned in one step:
+
+```bash
+sudo pipesix --add-client bob --route 2a01:d0:a33f::3/128 \
+    --rate 50000 --quota 10240 --quota-warn 90 \
+    -c /etc/pipesix/pipesix.conf
+```
 
 Usage is counted for every configured client, with or without a quota, and it
 survives a restart when `quota_state` names a file:
@@ -332,8 +365,10 @@ survives a restart when `quota_state` names a file:
 quota_state = /var/lib/pipesix/quota.state
 ```
 
-The server restores the current UTC day's counters at startup and rewrites
-the file atomically every 30 seconds and on shutdown. The directory must
+The server restores the current period's counters at startup and rewrites
+the file atomically every 30 seconds and on shutdown; the file records
+whether it holds daily or monthly counters, so switching `quota_period`
+starts the new period at zero instead of misreading the old numbers. The directory must
 exist and be writable by the server; the file is created with mode `0600`.
 Changing the path needs a restart. Without it the counters stay in memory and
 start at zero with each process.
@@ -355,16 +390,17 @@ $ sudo pipesix --usage
 OK
 mode: server
 config: /etc/pipesix/pipesix.conf
-utc_day: 2026-11-15
+period: monthly 2026-11-01..2026-12-01 UTC
 usage: 2 client(s)
   alice used=734003200 B quota=10737418240 B left=10003415040 B rate=50000 kbit/s connected=yes
   bob used=131072 B quota=unlimited rate=unlimited connected=no
 ```
 
-`--json` emits one object with `utc_day`, `day_start_unix` and a `clients`
-array (`client_id`, `used_bytes`, `quota_bytes`, `quota_remaining_bytes`,
-`rate_kbps`, `connected`); `--csv` emits the same table with the header
-`client_id,utc_day,used_bytes,quota_bytes,quota_remaining_bytes,rate_kbps,connected`.
+`--json` emits one object with a `period` object (`kind`, `start_unix`,
+`end_unix`) and a `clients` array (`client_id`, `used_bytes`, `quota_bytes`,
+`quota_remaining_bytes`, `rate_kbps`, `connected`); `--csv` emits the same
+table with the header
+`client_id,period_start,period_end,used_bytes,quota_bytes,quota_remaining_bytes,rate_kbps,connected`.
 Both strip the `OK` line, so the output pipes straight into `jq` or a
 spreadsheet.
 

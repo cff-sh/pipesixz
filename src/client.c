@@ -449,6 +449,17 @@ static void *reverse_loop(void *arg)
             continue;
         }
 
+        if ((frame.flags & PIPESIX_FLAG_QUOTA_EXHAUSTED) != 0) {
+            log_error("Server reports the quota is exhausted; traffic is "
+                      "dropped until the period resets");
+            continue;
+        }
+
+        if ((frame.flags & PIPESIX_FLAG_QUOTA_WARNING) != 0) {
+            log_warn("Server reports the quota is nearly exhausted");
+            continue;
+        }
+
         if (ipv6_validate_packet(frame.payload, frame.payload_len) != 0) {
             log_debug("Dropping frame with invalid IPv6 payload");
             stats_add_invalid(&ctx->stats);
