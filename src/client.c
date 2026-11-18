@@ -620,10 +620,10 @@ static psix_socket_t connect_server(const pipesix_config_t *config,
             if (getnameinfo(rp->ai_addr, rp->ai_addrlen,
                             host, sizeof(host), serv, sizeof(serv),
                             NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
-                log_info("UDP connected to %s:%s (%s, endpoint %zu)", host,
+                log_info("UDP connected to %s:%s (%s, endpoint %llu)", host,
                          serv,
                          rp->ai_family == AF_INET6 ? "AF_INET6" : "AF_INET",
-                         endpoint_index + 1);
+                         (unsigned long long)(endpoint_index + 1));
             }
             if (chosen != NULL && chosen_size > 0) {
                 size_t name_len = strlen(host_name);
@@ -682,8 +682,8 @@ static int reconnect_peer(client_context_t *ctx)
         }
 
         if (count > 1) {
-            log_warn("All %zu relay endpoints failed; retrying in %u "
-                     "seconds", count, delay);
+            log_warn("All %llu relay endpoints failed; retrying in %u "
+                     "seconds", (unsigned long long)count, delay);
         } else {
             log_warn("Reconnect failed; retrying in %u seconds", delay);
         }
