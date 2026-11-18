@@ -905,6 +905,17 @@ static int config_set_value(pipesix_config_t *config, const char *key,
         config->log_level = level;
         return 0;
     }
+    if (strcmp(key, "log_format") == 0) {
+        if (strcasecmp(value, "text") == 0) {
+            config->log_json = 0;
+            return 0;
+        }
+        if (strcasecmp(value, "json") == 0) {
+            config->log_json = 1;
+            return 0;
+        }
+        return -1;
+    }
 
     log_warn("Configuration: ignoring unknown key '%s'", key);
     return 0;
@@ -1443,6 +1454,7 @@ void config_dump(const pipesix_config_t *config)
         }
     }
     log_info("  log_level       = %s", level_str);
+    log_info("  log_format      = %s", config->log_json ? "json" : "text");
 }
 
 int config_reload_runtime(pipesix_config_t *config)
@@ -1467,6 +1479,7 @@ int config_reload_runtime(pipesix_config_t *config)
     }
 
     config->log_level       = fresh.log_level;
+    config->log_json        = fresh.log_json;
     config->keepalive       = fresh.keepalive;
     config->peer_timeout    = fresh.peer_timeout;
     config->session_timeout = fresh.session_timeout;

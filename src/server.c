@@ -1273,6 +1273,7 @@ static void reload_config(server_context_t *ctx)
     }
 
     logger_set_level(ctx->config->log_level);
+    logger_set_json(ctx->config->log_json);
     atomic_store(&ctx->session_timeout, ctx->config->session_timeout);
 
     pthread_mutex_lock(&ctx->lock);

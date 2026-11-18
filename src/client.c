@@ -1060,6 +1060,7 @@ int client_start(pipesix_config_t *config)
 
                 if (config_reload_runtime(config) == 0) {
                     logger_set_level(config->log_level);
+                    logger_set_json(config->log_json);
                     atomic_store(&ctx.keepalive, config->keepalive);
                     log_info("Configuration reloaded (log_level, keepalive, "
                              "peer_timeout, stats_interval)");

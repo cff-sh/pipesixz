@@ -297,6 +297,7 @@ static void print_usage(const char *progname)
             "  metrics_port    Metrics endpoint port (default: 9100)\n"
             "  metrics_token   Bearer token for /metrics (empty = open)\n"
             "  log_level       debug | info | warn | error | fatal\n"
+            "  log_format      text | json (default: text)\n"
             "\n"
             "Examples:\n"
             "  sudo pipesix\n"
@@ -994,6 +995,7 @@ int main(int argc, char *argv[])
         config.log_level = cli_level;
     }
     logger_set_level(config.log_level);
+    logger_set_json(config.log_json);
 
     if (config_validate(&config) != 0) {
         log_error("Configuration validation failed");

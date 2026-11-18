@@ -49,6 +49,7 @@ typedef struct {
     log_level_t min_level;       /* Minimum level to log (inclusive) */
     int         use_color;       /* Non-zero for colorized output */
     int         use_timestamp;   /* Non-zero to include timestamps */
+    int         use_json;        /* Non-zero for one JSON object per line */
 } logger_config_t;
 
 /*
@@ -76,6 +77,15 @@ int logger_init(const logger_config_t *config);
  *   level - New minimum log level
  */
 void logger_set_level(log_level_t level);
+
+/*
+ * Switch between human-readable and JSON output at runtime.
+ *
+ * JSON output is one object per line, with the timestamp, level, source
+ * location and formatted message. It is intended for journald/agent
+ * ingestion and is safe to change from SIGHUP.
+ */
+void logger_set_json(int enabled);
 
 /*
  * Core logging function.

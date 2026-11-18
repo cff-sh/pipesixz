@@ -56,6 +56,7 @@
  *   metrics_token    - Bearer token required by GET /metrics
  *                      (empty leaves the endpoint open)
  *   log_level        - debug, info, warn, error, fatal
+ *   log_format       - text (default) or json
  *
  * SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout,
  * stats_interval, strict_source, the quota action/grace/throttle rate,
@@ -204,6 +205,7 @@ typedef struct {
     /* Observability */
     int  stats_interval;                     /* Periodic stats interval */
     log_level_t log_level;                   /* Minimum log level */
+    int  log_json;                           /* 1 = one JSON object per line */
 
     /*
      * Prometheus endpoint. An empty metrics_address disables it; the
@@ -279,7 +281,7 @@ void config_dump(const pipesix_config_t *config);
 /*
  * Re-read runtime-tunable settings from config->config_path.
  *
- * Applies log_level, keepalive, peer_timeout, session_timeout,
+ * Applies log_level, log_format, keepalive, peer_timeout, session_timeout,
  * stats_interval, the per-client limits and the credentials: the
  * per-client table in server mode, this client's own client_id and secret
  * in client mode (so a key can be rotated on either end without a

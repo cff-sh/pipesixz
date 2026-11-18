@@ -324,6 +324,22 @@ sudo pipesix --metrics -c /etc/pipesix/pipesix.conf | grep pipesix_sessions
 Changing `metrics_address`, `metrics_port` or `metrics_token` needs a restart,
 like `bind_address`; the rest of the settings keep reloading over SIGHUP.
 
+### Structured logs
+
+`log_format = json` makes every log line one JSON object, with `time`,
+`level`, `file`, `line`, `func` and `msg` fields. It is reloadable with
+SIGHUP, so a temporary debug session can switch to readable text and back:
+
+```bash
+pipesix --status --json -c /etc/pipesix/pipesix.conf | jq .sessions.active
+```
+
+A JSON line looks like:
+
+```json
+{"time":"2026-11-18T12:00:00Z","level":"info","file":"server.c","line":1234,"func":"receiver_loop","msg":"Client 'alice' handshake from 203.0.113.5:41622"}
+```
+
 ### Per-client limits
 
 A server can cap what one client may use without touching the others. The
