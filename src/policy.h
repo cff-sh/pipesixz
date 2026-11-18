@@ -30,9 +30,20 @@
 /* Longest client id accepted by the state file, including the NUL. */
 #define POLICY_MAX_ID 33
 
-/* Quota period selectors, matching the 'quota_period' configuration key. */
+/*
+ * Quota period selectors, matching the 'quota_period' configuration key.
+ * A negative selector means a custom period of that many UTC days, so
+ * -14 is a fortnight. The data path passes the selector through unchanged.
+ */
 #define POLICY_PERIOD_DAILY   0
 #define POLICY_PERIOD_MONTHLY 1
+#define POLICY_PERIOD_WEEKLY  2
+
+/*
+ * Format a selector as 'daily', 'monthly', 'weekly' or 'custom-N'.
+ * out is always NUL-terminated when out_size is non-zero.
+ */
+void policy_period_name(int period_kind, char *out, size_t out_size);
 
 /*
  * Token bucket. A rate of 0 means unlimited, and the bucket functions
@@ -120,18 +131,19 @@ void policy_quota_restore(pipesix_quota_t *quota, uint64_t used, int period);
 /*
  * Index of the quota period that contains 'now'.
  *
- * Daily periods count days since the epoch; monthly periods count calendar
- * months since January 1970 (year * 12 + month - 1). Both are pure
- * arithmetic, so the data path can call this from several threads without
- * touching gmtime()'s shared state.
+ * Daily, weekly and custom periods count fixed-length blocks since the
+ * epoch; monthly periods count calendar months since January 1970
+ * (year * 12 + month - 1). All are pure arithmetic, so the data path can
+ * call this from several threads without touching gmtime()'s shared
+ * state.
  */
-int policy_period(time_t now, int monthly);
+int policy_period(time_t now, int period_kind);
 
 /* Unix timestamp of the first second of 'period'. */
-time_t policy_period_start(int period, int monthly);
+time_t policy_period_start(int period, int period_kind);
 
 /* Unix timestamp of the first second after 'period'. */
-time_t policy_period_end(int period, int monthly);
+time_t policy_period_end(int period, int period_kind);
 
 /*
  * One client's persisted usage.
@@ -152,7 +164,8 @@ typedef struct {
     char     id[POLICY_MAX_ID];
     int64_t  start_unix;
     int64_t  end_unix;
-    int      monthly;  /* period kind the record was written under */
+    int      kind;     /* selector the record was written under */
+    int      monthly;  /* kept for callers that only care about monthly */
     uint64_t used;
 } policy_history_t;
 
@@ -167,7 +180,7 @@ typedef struct {
  * Returns:
  *   0 on success (including count 0), -1 on failure
  */
-int policy_history_append(const char *path, int monthly,
+int policy_history_append(const char *path, int period_kind,
                           const policy_usage_t *usage, int count);
 
 /*
@@ -207,23 +220,23 @@ int policy_format_date(time_t t, char *out, size_t size);
  * Returns:
  *   0 on success, -1 on failure (the previous file is left alone)
  */
-int policy_state_save(const char *path, int monthly,
+int policy_state_save(const char *path, int period_kind,
                       const policy_usage_t *usage, int count);
 
 /*
  * Read usage lines from 'path'.
  *
  * A missing file is not an error: it means the server has not saved any
- * state yet, so *count is 0 and the call returns 0. *monthly reports the
- * period kind the file was written with (daily when the file predates the
- * period support). Malformed or overlong lines are skipped, and at most
+ * state yet, so *count is 0 and the call returns 0. *period_kind reports
+ * the period kind the file was written with (daily when the file predates
+ * the period support). Malformed or overlong lines are skipped, and at most
  * max entries are stored.
  *
  * Returns:
  *   0 on success (including a missing file), -1 when the file exists but
  *   cannot be read
  */
-int policy_state_load(const char *path, int *monthly,
+int policy_state_load(const char *path, int *period_kind,
                       policy_usage_t *usage, int max, int *count);
 
 /*

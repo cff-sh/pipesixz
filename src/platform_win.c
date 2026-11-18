@@ -147,3 +147,11 @@ void psix_sleep(unsigned int seconds)
     /* Sleep() takes milliseconds and returns immediately on a signal. */
     Sleep(seconds * 1000u);
 }
+
+int psix_drop_privileges(const char *user, const char *group)
+{
+    (void)user;
+    (void)group;
+    errno = ENOTSUP;
+    return -1;
+}

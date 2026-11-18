@@ -35,6 +35,15 @@
 typedef int (*metrics_body_fn)(char *out, size_t out_size, void *arg);
 
 /*
+ * Report readiness for GET /readyz.
+ *
+ * Must NUL-terminate out. Returns 1 when ready (HTTP 200) and 0 when not
+ * (HTTP 503), with a short reason in out. Unlike /metrics this is never
+ * authenticated, so a probe does not need the scrape token.
+ */
+typedef int (*metrics_ready_fn)(char *out, size_t out_size, void *arg);
+
+/*
  * Start serving GET /metrics for this configuration.
  *
  * Does nothing when 'metrics_address' is empty or the endpoint is
@@ -48,7 +57,7 @@ typedef int (*metrics_body_fn)(char *out, size_t out_size, void *arg);
  *  -1  the endpoint was requested but could not be started
  */
 int metrics_start(const pipesix_config_t *config, metrics_body_fn body,
-                  void *arg);
+                  metrics_ready_fn ready, void *arg);
 
 /*
  * Stop serving and join the thread.

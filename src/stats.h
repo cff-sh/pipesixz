@@ -20,6 +20,7 @@ typedef struct {
     _Atomic uint64_t rx_bytes;
     _Atomic uint64_t dropped;
     _Atomic uint64_t throttled;
+    _Atomic uint64_t policy_denied;
     _Atomic uint64_t invalid;
     _Atomic uint64_t auth_failures;
     _Atomic uint64_t handshakes;
@@ -46,6 +47,9 @@ void stats_add_dropped(pipesix_stats_t *stats);
 
 /* Record one packet dropped by a per-client rate or quota limit. */
 void stats_add_throttled(pipesix_stats_t *stats);
+
+/* Record one packet dropped by a client ACL or isolation rule. */
+void stats_add_policy_denied(pipesix_stats_t *stats);
 
 /* Record one rejected datagram (bad header, length, flags). */
 void stats_add_invalid(pipesix_stats_t *stats);

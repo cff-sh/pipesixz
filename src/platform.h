@@ -27,6 +27,11 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+#if !defined(_WIN32)
+#include <grp.h>
+#include <pwd.h>
+#endif
+
 #if defined(_WIN32)
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -114,6 +119,7 @@ int psix_connect(psix_socket_t sock, const struct sockaddr *addr,
                  socklen_t addrlen);
 int psix_socket_wait(psix_socket_t sock, int timeout_ms);
 void psix_sleep(unsigned int seconds);
+int psix_drop_privileges(const char *user, const char *group);
 
 #else /* POSIX */
 
@@ -182,6 +188,60 @@ static inline void psix_sleep(unsigned int seconds)
     delay.tv_sec = (time_t)seconds;
     delay.tv_nsec = 0;
     (void)nanosleep(&delay, NULL);
+}
+
+/*
+ * Drop root after the TUN device and sockets are open.
+ *
+ * An empty user is a no-op. When a group is empty the user's primary
+ * group is used. The call is safe when the process already runs as the
+ * requested user; it fails rather than silently keeping root privileges.
+ */
+static inline int psix_drop_privileges(const char *user, const char *group)
+{
+    struct passwd *pw;
+    gid_t gid;
+
+    if (user == NULL || user[0] == '\0') {
+        return 0;
+    }
+
+    pw = getpwnam(user);
+    if (pw == NULL) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    gid = pw->pw_gid;
+    if (group != NULL && group[0] != '\0') {
+        struct group *gr = getgrnam(group);
+
+        if (gr == NULL) {
+            errno = ENOENT;
+            return -1;
+        }
+        gid = gr->gr_gid;
+    }
+
+    if (geteuid() != 0) {
+        if (pw->pw_uid != geteuid()) {
+            errno = EPERM;
+            return -1;
+        }
+        return 0;
+    }
+
+    if (initgroups(pw->pw_name, gid) != 0) {
+        return -1;
+    }
+    if (setgid(gid) != 0) {
+        return -1;
+    }
+    if (setuid(pw->pw_uid) != 0) {
+        return -1;
+    }
+
+    return 0;
 }
 
 #endif /* _WIN32 */

@@ -759,6 +759,20 @@ static int renegotiate(client_context_t *ctx)
  * whether this client currently holds a session, which is what an alert
  * on "tunnel down" actually wants.
  */
+static int client_ready(char *out, size_t size, void *arg)
+{
+    client_context_t *ctx = (client_context_t *)arg;
+
+    if (ctx->udp_fd == PSIX_INVALID_SOCKET) {
+        snprintf(out, size, "not ready: no server socket\n");
+        return 0;
+    }
+
+    snprintf(out, size, "ready: session=%s\n",
+             atomic_load(&ctx->last_rx) == 0 ? "idle" : "open");
+    return 1;
+}
+
 static int client_metrics_body(char *out, size_t size, void *arg)
 {
     client_context_t *ctx = (client_context_t *)arg;
@@ -1014,6 +1028,24 @@ int client_start(pipesix_config_t *config)
 
     reset_session(&ctx);
 
+    /*
+     * Creating the TUN device and binding the socket needed root; the
+     * tunnel itself does not. Drop before the handshake so no packet or
+     * credential is processed with elevated privileges.
+     */
+    if (psix_drop_privileges(config->user, config->group) != 0) {
+        log_error("Cannot drop privileges to user '%s' group '%s': %s",
+                  config->user, config->group, strerror(errno));
+        psix_close(ctx.udp_fd);
+        tun_close(&tun);
+        return -1;
+    }
+    if (config->user[0] != '\0') {
+        log_info("Dropped privileges to user '%s'%s%s", config->user,
+                 config->group[0] != '\0' ? " group '" : "",
+                 config->group[0] != '\0' ? config->group : "");
+    }
+
     if (handshake(&ctx) != 0) {
         log_info("Shutdown requested before the handshake completed");
         psix_close(ctx.udp_fd);
@@ -1029,7 +1061,7 @@ int client_start(pipesix_config_t *config)
     workers_running = 1;
 
     control_set_handler(client_control_handler, &ctx);
-    metrics_start(config, client_metrics_body, &ctx);
+    metrics_start(config, client_metrics_body, client_ready, &ctx);
 
     log_info("Client tunnel ready (crypto=chacha20-poly1305, client_id=%s, "
              "endpoint=%s, keepalive=%ds, peer_timeout=%ds)",
@@ -1047,6 +1079,7 @@ int client_start(pipesix_config_t *config)
             time_t now;
             int keepalive;
             int rotate = 0;
+            int remote_changed = 0;
 
             psix_sleep(1);
             now = time(NULL);
@@ -1054,16 +1087,46 @@ int client_start(pipesix_config_t *config)
             if (runtime_take_reload_request()) {
                 char old_id[CONFIG_MAX_CLIENT_ID];
                 char old_secret[CONFIG_MAX_SECRET];
+                char old_remote[CONFIG_MAX_REMOTE_LIST];
+                char old_metrics_address[CONFIG_MAX_ADDRESS];
+                char old_metrics_token[CONFIG_MAX_SECRET];
+                int old_remote_port = config->remote_port;
+                int old_metrics_port = config->metrics_port;
 
                 memcpy(old_id, config->client_id, sizeof(old_id));
                 memcpy(old_secret, config->secret, sizeof(old_secret));
+                snprintf(old_remote, sizeof(old_remote), "%s",
+                         config->remote_address);
+                snprintf(old_metrics_address, sizeof(old_metrics_address),
+                         "%s", config->metrics_address);
+                snprintf(old_metrics_token, sizeof(old_metrics_token), "%s",
+                         config->metrics_token);
 
                 if (config_reload_runtime(config) == 0) {
                     logger_set_level(config->log_level);
                     logger_set_json(config->log_json);
                     atomic_store(&ctx.keepalive, config->keepalive);
-                    log_info("Configuration reloaded (log_level, keepalive, "
-                             "peer_timeout, stats_interval)");
+
+                    remote_changed =
+                        strcmp(old_remote, config->remote_address) != 0 ||
+                        old_remote_port != config->remote_port;
+
+                    if (strcmp(old_metrics_address,
+                               config->metrics_address) != 0 ||
+                        old_metrics_port != config->metrics_port ||
+                        strcmp(old_metrics_token,
+                               config->metrics_token) != 0) {
+                        metrics_stop();
+                        if (metrics_start(config, client_metrics_body,
+                                          client_ready, &ctx) != 0) {
+                            log_warn("The new metrics settings could not "
+                                     "be applied");
+                        }
+                    }
+
+                    log_info("Configuration reloaded (log_level, log_format, "
+                             "keepalive, peer_timeout, stats_interval, "
+                             "endpoints, metrics)");
 
                     /*
                      * Our own key or identity changed, so the server will
@@ -1094,18 +1157,30 @@ int client_start(pipesix_config_t *config)
                 last_report = now;
             }
 
-            if (rotate) {
+            if (rotate || remote_changed) {
                 /* The workers encrypt with tx_key/rx_key: stop them first. */
                 if (workers_running) {
                     stop_workers(&ctx, &forward_thread, &reverse_thread);
                     workers_running = 0;
                 }
 
-                memset(ctx.psk, 0, sizeof(ctx.psk));
-                memset(ctx.tx_key, 0, sizeof(ctx.tx_key));
-                memset(ctx.rx_key, 0, sizeof(ctx.rx_key));
-                memcpy(ctx.psk, new_psk, sizeof(ctx.psk));
-                memset(new_psk, 0, sizeof(new_psk));
+                if (rotate) {
+                    memset(ctx.psk, 0, sizeof(ctx.psk));
+                    memset(ctx.tx_key, 0, sizeof(ctx.tx_key));
+                    memset(ctx.rx_key, 0, sizeof(ctx.rx_key));
+                    memcpy(ctx.psk, new_psk, sizeof(ctx.psk));
+                    memset(new_psk, 0, sizeof(new_psk));
+                }
+
+                if (remote_changed) {
+                    psix_close(ctx.udp_fd);
+                    ctx.udp_fd = PSIX_INVALID_SOCKET;
+                    ctx.endpoint_index =
+                        remote_endpoint_count(config) - 1;
+                    if (reconnect_peer(&ctx) != 0) {
+                        break;
+                    }
+                }
 
                 if (renegotiate(&ctx) != 0) {
                     break;

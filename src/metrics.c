@@ -26,10 +26,11 @@
  * events in control.c already cover reload and statistics.
  */
 int metrics_start(const pipesix_config_t *config, metrics_body_fn body,
-                  void *arg)
+                  metrics_ready_fn ready, void *arg)
 {
     (void)config;
     (void)body;
+    (void)ready;
     (void)arg;
     return 0;
 }
@@ -64,6 +65,7 @@ static pthread_t      s_thread;
 static atomic_int     s_stopping;
 static int            s_started;
 static metrics_body_fn s_body;
+static metrics_ready_fn s_ready;
 static void           *s_body_arg;
 static char           s_token[CONFIG_MAX_SECRET];
 
@@ -287,12 +289,26 @@ static void metrics_serve_connection(int fd)
     }
 
     /*
-     * A liveness probe wants a status code and nothing else, so it stays
-     * cheap and never requires the token.
+     * Liveness only proves the process is running. Readiness is separate:
+     * a relay with a closed TUN or socket is alive but cannot forward.
+     * Neither probe requires the scrape token.
      */
     if (strncmp(method + 4, "/healthz", 8) == 0 &&
         path_delimiter(method[12])) {
         metrics_respond(fd, "200 OK", NULL, "ok\n");
+        return;
+    }
+
+    if (strncmp(method + 4, "/readyz", 7) == 0 &&
+        path_delimiter(method[11])) {
+        char reason[256] = "ready\n";
+        int ready = 1;
+
+        if (s_ready != NULL) {
+            ready = s_ready(reason, sizeof(reason), s_body_arg);
+        }
+        metrics_respond(fd, ready ? "200 OK" : "503 Service Unavailable",
+                        NULL, reason);
         return;
     }
 
@@ -366,7 +382,7 @@ static void *metrics_loop(void *arg)
 }
 
 int metrics_start(const pipesix_config_t *config, metrics_body_fn body,
-                  void *arg)
+                  metrics_ready_fn ready, void *arg)
 {
     struct addrinfo hints;
     struct addrinfo *result = NULL;
@@ -442,6 +458,7 @@ int metrics_start(const pipesix_config_t *config, metrics_body_fn body,
 
     s_listen_fd = fd;
     s_body = body;
+    s_ready = ready;
     s_body_arg = arg;
     snprintf(s_token, sizeof(s_token), "%s", config->metrics_token);
     atomic_store(&s_stopping, 0);
@@ -451,6 +468,7 @@ int metrics_start(const pipesix_config_t *config, metrics_body_fn body,
         close(fd);
         s_listen_fd = -1;
         s_body = NULL;
+        s_ready = NULL;
         s_body_arg = NULL;
         return -1;
     }
@@ -479,6 +497,7 @@ void metrics_stop(void)
     }
 
     s_body = NULL;
+    s_ready = NULL;
     s_body_arg = NULL;
     memset(s_token, 0, sizeof(s_token));
 }

@@ -24,6 +24,11 @@
  *   bind_address     - Bind address for server mode
  *   bind_port        - Bind port for server mode
  *   secret           - This client's pre-shared key (client mode)
+ *   secret_file      - File holding this client's pre-shared key; wins
+ *                      over 'secret' when both are set (client mode)
+ *   include          - Read another configuration file at this point
+ *   user / group     - POSIX account to drop to after opening the TUN
+ *                      device and sockets
  *   client_id        - This client's identity (client mode)
  *   client           - <id>: <secret> credential (server mode, repeatable)
  *   client_route     - <id> <ipv6[/len]> inner prefix for return traffic
@@ -32,9 +37,16 @@
  *   client_quota     - <id> <MiB> bytes per UTC period (server, repeatable)
  *   client_quota_warn - <id> <percent> warn the client at this usage
  *                      (server, repeatable)
+ *   client_allow     - <id> <prefix> destination allowed for that client
+ *                      (server, repeatable; an allow list is closed)
+ *   client_deny      - <id> <prefix> destination denied for that client
+ *                      (server, repeatable)
+ *   client_isolation - Drop traffic to every other client's route
+ *                      (server mode, default off)
  *   strict_source    - Drop data whose inner source is outside the
  *                      client's 'client_route' (server mode, default off)
- *   quota_period     - daily (default) or monthly
+ *   quota_period     - daily (default), weekly, monthly or custom
+ *   quota_period_days - custom period length in UTC days (1-365)
  *   quota_action     - drop (default) or throttle when a quota is used up
  *   quota_grace      - Extra MiB a client may use before that action
  *   quota_throttle_kbps - Over-quota rate in kbit/s when throttling
@@ -61,10 +73,9 @@
  * SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout,
  * stats_interval, strict_source, the quota action/grace/throttle rate,
  * the credentials and the per-client limits from the original
- * configuration file: the client table in server mode, this client's own
- * client_id and secret in client mode. Changes to the interface,
- * remote endpoints, mode, allow_client, metrics_* or quota_state require
- * a restart.
+ * configuration file: the client table, ACLs, limits and runtime paths in
+ * server mode, this client's own client_id/secret and endpoints in client
+ * mode. Changes to the interface, mode or user/group require a restart.
  */
 
 #ifndef PIPESIX_CONFIG_H
@@ -90,6 +101,10 @@
 #define CONFIG_MAX_CLIENT_ID 32
 #define CONFIG_MAX_REMOTE_ENDPOINTS 8
 #define CONFIG_MAX_REMOTE_LIST      512
+#define CONFIG_MAX_USER             64
+#define CONFIG_MAX_GROUP            64
+#define CONFIG_MAX_INCLUDE_DEPTH    8
+#define CONFIG_MAX_ACL_PREFIXES     8
 
 /*
  * Default Configuration Values
@@ -118,6 +133,13 @@ typedef struct {
     char    secret[CONFIG_MAX_SECRET];
     uint8_t prefix[16];
     int     prefix_len;
+    /* Optional destination policy, checked after authenticating a packet. */
+    uint8_t allow[CONFIG_MAX_ACL_PREFIXES][16];
+    int     allow_len[CONFIG_MAX_ACL_PREFIXES];
+    int     allow_count;
+    uint8_t deny[CONFIG_MAX_ACL_PREFIXES][16];
+    int     deny_len[CONFIG_MAX_ACL_PREFIXES];
+    int     deny_count;
 } pipesix_client_cred_t;
 
 /*
@@ -166,6 +188,9 @@ typedef struct {
 
     /* Security and session management */
     char secret[CONFIG_MAX_SECRET];         /* This client's pre-shared key */
+    char secret_file[CONFIG_PATH_MAX];      /* Or a file holding that key */
+    char user[CONFIG_MAX_USER];             /* POSIX account to drop to */
+    char group[CONFIG_MAX_GROUP];           /* POSIX group to drop to */
     int  keepalive;                          /* Client keepalive interval */
     int  session_timeout;                    /* Server idle session timeout */
 
@@ -194,8 +219,16 @@ typedef struct {
      */
     int  strict_source;
 
-    /* Quota period: 0 = UTC day, 1 = UTC calendar month. */
+    /* Drop traffic to every other configured client's return prefix. */
+    int  client_isolation;
+
+    /*
+     * Quota period: 0 = UTC day, 1 = UTC calendar month, 2 = UTC week,
+     * negative = a custom number of UTC days. config_load() resolves the
+     * 'custom' keyword plus 'quota_period_days' to the negative form.
+     */
     int  quota_period;
+    int  quota_period_days;
 
     /* Quota action: 0 = drop over-quota traffic, 1 = throttle it. */
     int      quota_throttle;

@@ -41,7 +41,8 @@ tun_mtu       = 1500
 # remote_address:  IP address(es) or hostname(s) of the VPS relay. A
 #                  comma-separated list is tried in order; when one stops
 #                  answering, the client moves to the next one. Up to 8
-#                  endpoints, all on remote_port.
+#                  endpoints, all on remote_port. A changed list is applied
+#                  on SIGHUP: the client reconnects and re-handshakes.
 # remote_port:     UDP port of the VPS server (default: 8899)
 #
 remote_address = 203.0.113.1
@@ -75,6 +76,19 @@ remote_port    = 8899
 #
 client_id = client1
 secret    = replace-this-with-pipesix-genkey-output
+# secret_file: read the key from a separate 0600 file instead. It wins
+# over 'secret' when both are set, and is re-read on SIGHUP.
+#secret_file = /etc/pipesix/client.secret
+#
+# user/group: after opening the TUN device and sockets, drop root to this
+# POSIX account (server and client). Empty leaves the process as it is.
+# The account must be able to read the configuration and any state files.
+#user  = pipesix
+#group = pipesix
+#
+# include: read another configuration file at this point, relative to this
+# file's directory. Includes can nest up to 8 levels.
+#include = /etc/pipesix/clients.conf
 #
 # Server mode: one 'client' line per admitted peer (up to 64). The id
 # must match the client's client_id, and the secret is that client's
@@ -92,6 +106,16 @@ secret    = replace-this-with-pipesix-genkey-output
 #client_route = client1 2001:db8:1::2/128  # keep it inside tun_address' prefix
 #client_route = client2 2001:db8:1:2::/64
 #
+# Per-client destination policy (server mode, optional). A deny always
+# wins. Once a client has any client_allow entry its allow list is closed:
+# destinations outside it are dropped. client_isolation additionally drops
+# traffic to every other configured client's client_route. Both apply to
+# client-to-server traffic and are reloaded on SIGHUP.
+#
+#client_allow = client1 2001:db8:100::/48
+#client_deny  = client1 2001:db8:100:dead::/48
+#client_isolation = off
+#
 # client_prefix_pool: a /64 delegation pool (server mode, optional).
 # 'pipesix --add-client <id> --delegate' takes the lowest /64 that no
 # client_route covers and writes it as that client's client_route, so the
@@ -104,8 +128,10 @@ secret    = replace-this-with-pipesix-genkey-output
 # directions, take the client id first, and are reloaded on SIGHUP.
 # 0 means unlimited and the default is no entry at all.
 #
-# quota_period selects the quota window: daily (default) or monthly.
-# It is read at startup, so changing it needs a restart.
+# quota_period selects the quota window: daily (default), weekly, monthly
+# or custom. With custom, quota_period_days sets a length from 1 to 365
+# UTC days. The period is reloadable, but keep it consistent across a restart
+# when quota_state is enabled (the state file records the period kind).
 #
 #   client_rate_limit = <id> <kbit/s>    e.g. 50000 = 50 Mbit/s
 #   client_quota      = <id> <MiB>       e.g. 10240 = 10 GiB per period
@@ -116,6 +142,7 @@ secret    = replace-this-with-pipesix-genkey-output
 # quota_grace is extra MiB allowed before that action starts.
 #
 #quota_period        = daily
+#quota_period_days   = 14        # with quota_period = custom
 #quota_action        = drop
 #quota_grace         = 0
 #quota_throttle_kbps = 64
@@ -133,16 +160,17 @@ secret    = replace-this-with-pipesix-genkey-output
 # (server mode, optional). The current period's counters are restored at
 # startup and the file is rewritten every 30 seconds and on shutdown. Empty
 # (default) keeps the counters in memory only, so they start at zero with
-# the process. The directory must exist and be writable by the server.
+# the process. The directory must exist and be writable by the server; the
+# file is created with mode 0600. A changed path takes effect on SIGHUP.
 #
 #quota_state = /var/lib/pipesix/quota.state
 #
 # usage_history: append-only CSV of completed quota periods (server mode,
 # optional). One row per client is written when a day or month ends, and
-# at startup when the relay was down across a boundary. Query it with
+# at each configured period boundary. Query it with
 # 'pipesix --usage --history' (add --json or --csv). The directory must
 # exist and be writable; the file is created with mode 0600. Changing the
-# path needs a restart.
+# path takes effect on SIGHUP.
 #
 #usage_history = /var/lib/pipesix/usage.csv
 
@@ -176,6 +204,9 @@ stats_interval  = 60
 #
 # The endpoint exposes client ids and traffic counters, so keep it on
 # localhost or a private interface unless metrics_token is set.
+# GET /healthz reports process liveness; GET /readyz returns 503 until the
+# TUN device and socket are usable. Neither needs the token. Changing any
+# metrics_* setting is applied on SIGHUP.
 #
 #metrics_address = 127.0.0.1
 #metrics_port    = 9100
@@ -189,13 +220,14 @@ stats_interval  = 60
 #             time, level, file, line, func and msg fields, for journald or
 #             a log agent.
 #
-# SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout,
-# stats_interval, strict_source, quota_action/quota_grace/
-# quota_throttle_kbps, the per-client limits and the credentials: the
-# 'client'/'client_route' table on a server, this client's own 'secret' and
-# 'client_id' in client mode, so a key can be rotated without a restart.
-# Interface, remote endpoint list, mode, allow_client, metrics_*, quota_period
-# and quota_state changes take effect after a restart.
+# SIGHUP reloads log_level/log_format, keepalive, peer_timeout,
+# session_timeout, stats_interval, strict_source, client_isolation,
+# allow_client, quota_period/quota_action/quota_grace/quota_throttle_kbps,
+# quota_state, usage_history, metrics_*, the remote endpoint list on a
+# client, and the credentials/ACLs/limits: the 'client'/'client_route' table
+# on a server, this client's own 'secret' and 'client_id' in client mode, so
+# a key can be rotated without a restart. Interface, mode, user/group and
+# bind_address changes take effect after a restart.
 #
 log_level  = info
 log_format = text

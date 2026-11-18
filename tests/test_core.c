@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int g_checks = 0;
@@ -1905,6 +1906,113 @@ static void test_usage_history(void)
           "a missing history file is not an error");
 }
 
+static void test_config_sources_and_acl(void)
+{
+    char dir[] = "/tmp/pipesix_src_XXXXXX";
+    char main_path[128];
+    char inc_path[128];
+    char key_path[128];
+    char conf[2048];
+    pipesix_config_t config;
+    const pipesix_client_cred_t *cred;
+
+    if (mkdtemp(dir) == NULL) {
+        check(0, "create the config sources fixture directory");
+        return;
+    }
+
+    snprintf(main_path, sizeof(main_path), "%s/main.conf", dir);
+    snprintf(inc_path, sizeof(inc_path), "%s/clients.conf", dir);
+    snprintf(key_path, sizeof(key_path), "%s/client.secret", dir);
+
+    check(write_file(inc_path,
+                     "client = bob: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+                     "client_route = bob fd00:2::/64\n") == 0,
+          "write the included credential file");
+    check(write_file(key_path,
+                     "cccccccccccccccccccccccccccccccc\n") == 0,
+          "write the client secret file");
+    chmod(key_path, 0600);
+
+    snprintf(conf, sizeof(conf),
+             "mode = server\n"
+             "tun_address = fd00::1/64\n"
+             "include = %s\n"
+             "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+             "client_route = alice fd00:1::/64\n",
+             inc_path);
+    check(write_file(main_path, conf) == 0,
+          "write the included server configuration");
+    check(config_load(main_path, &config) == 0,
+          "load a configuration with an include");
+    check(config.client_count == 2 &&
+              config_find_client(&config, "bob") != NULL,
+          "an include contributes credentials");
+    check(config_validate(&config) == 0,
+          "the included server configuration validates");
+
+    snprintf(conf, sizeof(conf),
+             "mode = client\n"
+             "tun_address = fd00::2/64\n"
+             "remote_address = 203.0.113.1\n"
+             "client_id = alice\n"
+             "secret_file = %s\n",
+             key_path);
+    check(write_file(main_path, conf) == 0,
+          "write the secret-file client configuration");
+    check(config_load(main_path, &config) == 0,
+          "load a client secret from a file");
+    check(strcmp(config.secret, "cccccccccccccccccccccccccccccccc") == 0,
+          "secret_file supplies the pre-shared key");
+
+    unlink(key_path);
+    check(config_load(main_path, &config) != 0,
+          "a missing secret_file is rejected");
+
+    snprintf(conf, sizeof(conf),
+             "mode = server\n"
+             "tun_address = fd00::1/64\n"
+             "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+             "client = bob: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+             "client_route = alice fd00:1::/64\n"
+             "client_route = bob fd00:2::/64\n"
+             "client_allow = alice 2001:db8:100::/48\n"
+             "client_deny = alice 2001:db8:100:dead::/48\n"
+             "client_isolation = on\n");
+    check(write_file(main_path, conf) == 0, "write the ACL configuration");
+    check(config_load(main_path, &config) == 0,
+          "load per-client ACLs and isolation");
+    cred = config_find_client(&config, "alice");
+    check(cred != NULL && cred->allow_count == 1 && cred->deny_count == 1,
+          "client_allow and client_deny are parsed");
+    check(config.client_isolation == 1, "client_isolation is parsed");
+    check(config_validate(&config) == 0, "the ACL configuration validates");
+
+    snprintf(conf, sizeof(conf),
+             "mode = server\n"
+             "tun_address = fd00::1/64\n"
+             "quota_period = weekly\n"
+             "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    check(write_file(main_path, conf) == 0, "write the weekly period");
+    check(config_load(main_path, &config) == 0 && config.quota_period == 2,
+          "a weekly quota period is parsed");
+
+    snprintf(conf, sizeof(conf),
+             "mode = server\n"
+             "tun_address = fd00::1/64\n"
+             "quota_period = custom\n"
+             "quota_period_days = 14\n"
+             "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    check(write_file(main_path, conf) == 0, "write the custom period");
+    check(config_load(main_path, &config) == 0 &&
+              config.quota_period == -14 && config.quota_period_days == 14,
+          "a custom quota period resolves to its day count");
+
+    unlink(main_path);
+    unlink(inc_path);
+    rmdir(dir);
+}
+
 static void test_usage_history_config(void)
 {
     static const char server_conf[] =
@@ -2443,6 +2551,7 @@ int main(void)
     test_quota_state_frames();
     test_usage_history();
     test_usage_history_config();
+    test_config_sources_and_acl();
     test_stats_json();
     test_stats_prometheus();
     test_packet_too_big();

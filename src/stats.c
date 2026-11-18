@@ -20,6 +20,7 @@ void stats_init(pipesix_stats_t *stats)
     atomic_store(&stats->rx_bytes, 0);
     atomic_store(&stats->dropped, 0);
     atomic_store(&stats->throttled, 0);
+    atomic_store(&stats->policy_denied, 0);
     atomic_store(&stats->invalid, 0);
     atomic_store(&stats->auth_failures, 0);
     atomic_store(&stats->handshakes, 0);
@@ -60,6 +61,13 @@ void stats_add_throttled(pipesix_stats_t *stats)
 {
     if (stats == NULL) return;
     atomic_fetch_add_explicit(&stats->throttled, 1, memory_order_relaxed);
+}
+
+void stats_add_policy_denied(pipesix_stats_t *stats)
+{
+    if (stats == NULL) return;
+    atomic_fetch_add_explicit(&stats->policy_denied, 1,
+                              memory_order_relaxed);
 }
 
 void stats_add_invalid(pipesix_stats_t *stats)
@@ -148,7 +156,8 @@ void stats_format(const pipesix_stats_t *stats, const char *role,
     snprintf(out, out_size,
              "stats[%s]: uptime=%lus tx=%" PRIu64 " pkts/%s "
              "rx=%" PRIu64 " pkts/%s dropped=%" PRIu64
-             " throttled=%" PRIu64 " invalid=%" PRIu64
+             " throttled=%" PRIu64 " denied=%" PRIu64
+             " invalid=%" PRIu64
              " auth_fail=%" PRIu64 " handshakes=%" PRIu64
              " handshake_fail=%" PRIu64 " rekeys=%" PRIu64
              " replayed=%" PRIu64 " errors=%" PRIu64
@@ -160,6 +169,8 @@ void stats_format(const pipesix_stats_t *stats, const char *role,
              rx_str,
              atomic_load_explicit(&stats->dropped, memory_order_relaxed),
              atomic_load_explicit(&stats->throttled, memory_order_relaxed),
+             atomic_load_explicit(&stats->policy_denied,
+                                  memory_order_relaxed),
              atomic_load_explicit(&stats->invalid, memory_order_relaxed),
              atomic_load_explicit(&stats->auth_failures, memory_order_relaxed),
              atomic_load_explicit(&stats->handshakes, memory_order_relaxed),
@@ -190,6 +201,7 @@ void stats_format_json(const pipesix_stats_t *stats, const char *role,
              "\"tx_packets\":%" PRIu64 ",\"tx_bytes\":%" PRIu64 ","
              "\"rx_packets\":%" PRIu64 ",\"rx_bytes\":%" PRIu64 ","
              "\"dropped\":%" PRIu64 ",\"throttled\":%" PRIu64 ","
+             "\"policy_denied\":%" PRIu64 ","
              "\"invalid\":%" PRIu64 ","
              "\"auth_failures\":%" PRIu64 ",\"handshakes\":%" PRIu64 ","
              "\"handshake_failures\":%" PRIu64 ",\"rekeys\":%" PRIu64 ","
@@ -203,6 +215,8 @@ void stats_format_json(const pipesix_stats_t *stats, const char *role,
              atomic_load_explicit(&stats->rx_bytes, memory_order_relaxed),
              atomic_load_explicit(&stats->dropped, memory_order_relaxed),
              atomic_load_explicit(&stats->throttled, memory_order_relaxed),
+             atomic_load_explicit(&stats->policy_denied,
+                                  memory_order_relaxed),
              atomic_load_explicit(&stats->invalid, memory_order_relaxed),
              atomic_load_explicit(&stats->auth_failures, memory_order_relaxed),
              atomic_load_explicit(&stats->handshakes, memory_order_relaxed),
@@ -325,6 +339,14 @@ int stats_format_prometheus(const pipesix_stats_t *stats, const char *role,
                  atomic_load_explicit(&stats->throttled,
                                       memory_order_relaxed));
 
+    PROM_APPEND("# HELP pipesix_policy_denied_total Packets dropped by a "
+                 "client ACL or isolation rule.\n"
+                 "# TYPE pipesix_policy_denied_total counter\n"
+                 "pipesix_policy_denied_total{mode=\"%s\"} %" PRIu64 "\n",
+                 mode,
+                 atomic_load_explicit(&stats->policy_denied,
+                                      memory_order_relaxed));
+
     PROM_APPEND("# HELP pipesix_invalid_total Rejected datagrams: bad "
                  "header, length, flags or payload.\n"
                  "# TYPE pipesix_invalid_total counter\n"
@@ -375,6 +397,22 @@ int stats_format_prometheus(const pipesix_stats_t *stats, const char *role,
                  mode,
                  atomic_load_explicit(&stats->last_handshake,
                                       memory_order_relaxed));
+
+    {
+        uint64_t last_handshake = atomic_load_explicit(
+            &stats->last_handshake, memory_order_relaxed);
+        uint64_t age = (last_handshake == 0)
+                           ? 0
+                           : (uint64_t)(now - (time_t)last_handshake);
+
+        PROM_APPEND("# HELP pipesix_last_handshake_age_seconds Seconds "
+                     "since the last completed handshake, 0 while none has "
+                     "completed.\n"
+                     "# TYPE pipesix_last_handshake_age_seconds gauge\n"
+                     "pipesix_last_handshake_age_seconds{mode=\"%s\"} "
+                     "%" PRIu64 "\n",
+                     mode, age);
+    }
 
     PROM_APPEND("# HELP pipesix_replayed_total Frames rejected by the "
                  "anti-replay window.\n# TYPE pipesix_replayed_total counter\n"

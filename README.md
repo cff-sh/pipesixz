@@ -29,13 +29,20 @@ Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] �
   it to or after reconnecting, so a restart on either side never leaves a
   stale session blocking the tunnel
 - Server client allow-list (`allow_client`, up to 64 entries)
+- Per-client destination ACLs (`client_allow` / `client_deny`) and
+  `client_isolation`, which stops one client from reaching another's
+  return prefix unless its rules allow it
 - Optional strict source enforcement: `strict_source` drops data whose
   inner source is outside the client's `client_route`, so a delegated
   prefix is also a security boundary
-- SIGHUP reload of log level, timing settings and keys on both ends, so a
-  credential can be rotated without restarting a process
+- SIGHUP reload of log level and format, timing settings, keys, remote
+  endpoints, the allow-list, metrics settings, quota windows and paths on
+  both ends, so most changes need no restart
 - Runtime client provisioning: `--add-client` and `--remove-client` rewrite
-  the configuration atomically and make a running server reload it
+  the configuration atomically and make a running server reload it; a
+  generated client configuration can be written for hand-off
+- Liveness and readiness probes: `/healthz` proves the process is running,
+  while `/readyz` fails until the TUN device and socket can forward
 - Prefix delegation: `--add-client <id> --delegate` hands a client a whole
   /64 from `client_prefix_pool`, so it can route a LAN instead of one address
 - Completed quota periods are kept in an append-only history
@@ -157,13 +164,17 @@ sudo kill -USR1 $(pidof pipesix)  # dump statistics now
 sudo pipesix --rotate-all         # new client keys, printed and reloaded
 ```
 
-`systemctl reload` sends SIGHUP. It applies `log_level`, `keepalive`,
-`peer_timeout`, `session_timeout`, `stats_interval`, `strict_source`,
-`quota_action`, `quota_grace`, `quota_throttle_kbps`, the credentials (the
-`client`/`client_route` table on a server, the `secret` and `client_id` on a
-client) and the per-client limits, so a cap can be changed on a live tunnel.
-Interface, `remote_address`, mode, allow-list, `metrics_*`, `quota_state` and
-`quota_period` changes require a restart.
+`systemctl reload` sends SIGHUP. It applies `log_level`, `log_format`,
+`keepalive`, `peer_timeout`, `session_timeout`, `stats_interval`,
+`strict_source`, `client_isolation`, `allow_client`, `quota_period`,
+`quota_action`, `quota_grace`, `quota_throttle_kbps`, `quota_state`,
+`usage_history`, `metrics_*`, the credentials (the `client`/`client_route`
+table, ACLs and limits on a server; the `secret` and `client_id` on a
+client), and a client's `remote_address`/`remote_port`. A client that sees
+new endpoints drains its workers, reconnects and re-handshakes; a server
+restarts the metrics listener if its address, port or token changed.
+Interface, `mode`, `user`/`group` and `bind_address` changes still require a
+restart.
 
 ### Control channel
 
@@ -243,8 +254,8 @@ client resolves and tries them at startup; when a relay stops answering, or
 answers the handshake but never completes it, the client moves on to the
 next one. Every reconnect attempt re-resolves DNS. It does not fail back
 automatically once a later endpoint works, and `--status` reports the
-endpoint currently in use. Editing the list needs a restart, like the rest
-of the endpoint settings.
+endpoint currently in use. Editing the list and sending SIGHUP makes a
+running client reconnect to the new list without restarting.
 
 ### Prometheus metrics
 
@@ -270,11 +281,18 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9100/metrics
 
 Without the header, or with the wrong token, the scrape gets
 `401 Unauthorized` (the same answer for both, so a probe cannot tell a missing
-header from a bad one). `GET /healthz` answers `200 ok` without a token, so a
-load balancer or systemd probe never has to hold the scrape secret:
+header from a bad one). Two probes need no token, so a load balancer or
+systemd never has to hold the scrape secret:
+
+- `GET /healthz` answers `200 ok` whenever the process is alive.
+- `GET /readyz` answers `200 ready` only when the TUN device and socket are
+  usable; otherwise it returns `503` with a reason such as `tun closed` or
+  `socket closed`. Use it to gate traffic, and `/healthz` to decide whether
+  to restart the process.
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9100/healthz
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9100/readyz
 ```
 
 ```bash
@@ -294,10 +312,12 @@ pipesix_session_rx_bytes{client="mac1"} 35651
 ```
 
 Both roles export the shared counters (`tx`/`rx` packets and bytes, `dropped`,
-`throttled`, `invalid`, `auth_failures`, `handshakes`,
+`throttled`, `policy_denied`, `invalid`, `auth_failures`, `handshakes`,
 `handshake_failures`, `rekeys`, `replayed`, `errors`, `uptime_seconds`,
-`last_rx_timestamp_seconds`, `last_handshake_timestamp_seconds`) with a `mode`
-label. A server adds `pipesix_sessions_active`, `pipesix_sessions_capacity`
+`last_rx_timestamp_seconds`, `last_handshake_timestamp_seconds` and
+`last_handshake_age_seconds`) with a `mode` label. `policy_denied` counts
+packets dropped by a per-client ACL or by `client_isolation`. A server adds
+`pipesix_sessions_active`, `pipesix_sessions_capacity`
 and per-client `pipesix_session_rx_bytes`, `_tx_bytes`, `_frames`,
 `_idle_seconds` and `pipesix_session_throttled` (packets dropped by that
 client's limits since it connected). For a client with a `client_quota` the
@@ -321,8 +341,10 @@ control channel, without a listening port:
 sudo pipesix --metrics -c /etc/pipesix/pipesix.conf | grep pipesix_sessions
 ```
 
-Changing `metrics_address`, `metrics_port` or `metrics_token` needs a restart,
-like `bind_address`; the rest of the settings keep reloading over SIGHUP.
+Changing `metrics_address`, `metrics_port` or `metrics_token` is applied on
+SIGHUP: the listener is closed and reopened with the new settings. If the new
+address cannot be bound, the old listener is gone and the warning in the log
+says why; fix the setting and reload again.
 
 ### Structured logs
 
@@ -346,7 +368,8 @@ A server can cap what one client may use without touching the others. The
 limits are optional, apply in both directions, and are reloaded on SIGHUP:
 
 ```ini
-quota_period        = monthly     # or daily (the default)
+quota_period        = monthly     # daily (default), weekly, monthly or custom
+#quota_period_days  = 14          # with quota_period = custom
 quota_action        = drop        # or throttle
 quota_grace         = 0           # extra MiB before the action
 quota_throttle_kbps = 64          # over-quota rate when throttling
@@ -358,11 +381,15 @@ client_quota_warn   = mac1 90     # tell the client at 90% of the quota
 `client_rate_limit` is in **kilobits per second**, enforced with a token
 bucket that allows a one-second burst (or one full packet, when the cap is
 slower than that). `client_quota` is in **MiB per UTC period**, where
-`quota_period` selects a calendar day (the default) or a calendar month, and
-counts the bytes the client sent and received. The quota is tracked per
-client id, so a reconnect or a key rotation does not clear it. `0` means
-unlimited in both keys, and a client without either line is unlimited.
-`quota_period` is read at startup, so switching it needs a restart.
+`quota_period` selects a UTC day (the default), UTC calendar week, UTC
+calendar month, or a custom number of UTC days (`quota_period = custom` plus
+`quota_period_days`, 1-365). It counts the bytes the client sent and
+received. The quota is tracked per client id, so a reconnect or a key
+rotation does not clear it. `0` means unlimited in both keys, and a client
+without either line is unlimited. The period is reloadable, but use one
+consistent kind across restarts when `quota_state` is enabled: the state
+file records the period kind and resets counters when it does not match.
+All period counters are UTC, so local time changes do not move a boundary.
 
 With the default `quota_action = drop`, over-limit traffic is dropped. With
 `quota_action = throttle`, it is instead shaped to `quota_throttle_kbps` in
@@ -439,12 +466,28 @@ quota_state = /var/lib/pipesix/quota.state
 ```
 
 The server restores the current period's counters at startup and rewrites
-the file atomically every 30 seconds and on shutdown; the file records
-whether it holds daily or monthly counters, so switching `quota_period`
-starts the new period at zero instead of misreading the old numbers. The directory must
-exist and be writable by the server; the file is created with mode `0600`.
-Changing the path needs a restart. Without it the counters stay in memory and
-start at zero with each process.
+the file atomically every 30 seconds and on shutdown; the file records the
+period kind, so switching `quota_period` starts the new period at zero
+instead of misreading the old numbers. The directory must exist and be
+writable by the server; the file is created with mode `0600`. Changing the
+path takes effect on SIGHUP: the new file is used from then on, and the old
+one is left untouched. Without it the counters stay in memory and start at
+zero with each process.
+
+Usage can be adjusted without editing the file. This is useful after a
+billing correction, when granting a credit, or to clear a test session:
+
+```bash
+sudo pipesix --reset-usage mac1 -c /etc/pipesix/pipesix.conf
+sudo pipesix --credit-usage mac1 --mib 512 -c /etc/pipesix/pipesix.conf
+sudo pipesix --add-usage mac1 --mib 100 -c /etc/pipesix/pipesix.conf
+```
+
+`--reset-usage` restores the full quota. `--credit-usage` subtracts from the
+current usage (the quota goes up by that much), while `--add-usage` counts
+more usage; both need `--mib` and refuse to take the counter below zero.
+The change is applied to the live table and persisted with the next
+`quota_state` write.
 
 ### Usage report
 
@@ -485,9 +528,9 @@ Set `usage_history` to keep completed periods, not just the current one:
 usage_history = /var/lib/pipesix/usage.csv
 ```
 
-The server appends one row per client when a day or month ends, and also
-at startup when it was down across a boundary and the state file still
-holds the old period. Records are never rewritten, so a restart cannot
+The server appends one row per client when the configured day, week, month
+or custom period ends, and also at startup when it was down across a
+boundary and the state file still holds the old period. Records are never rewritten, so a restart cannot
 lose or duplicate an earlier period. The file is created with mode `0600`,
 and its directory must exist.
 
@@ -513,8 +556,8 @@ server is stopped and does not need the control socket. `--json` emits
 "period_end_unix","period","used_bytes"}]}`; `--csv` emits
 `client_id,period_start,period_end,period,used_bytes`. At most 8192 records
 are loaded; the text report says how many older rows were not shown.
-Rotate the file yourself when it grows; changing `usage_history` needs a
-restart, like `quota_state`.
+Rotate the file yourself when it grows; changing `usage_history` takes
+SIGHUP, like `quota_state`.
 
 ### Provisioning clients
 
@@ -536,6 +579,44 @@ server needs at least one credential.
 
 Without `--route` the client is admitted but only receives return traffic
 while it is the single connected session.
+
+### Exporting a client configuration
+
+Writing the server entry is only half of provisioning. To hand the client a
+ready-to-run file, ask for it while adding the client:
+
+```bash
+sudo mkdir -p /root/pipesix-clients
+sudo chmod 700 /root/pipesix-clients
+sudo pipesix --add-client bob --delegate \
+    --server-address relay.example.net --export-dir /root/pipesix-clients \
+    -c /etc/pipesix/pipesix.conf
+```
+
+That writes `/root/pipesix-clients/bob.conf`, containing `mode = client`,
+`client_id`, the generated `secret`, the relay address and port, a
+`tun_address` inside the client's route (`.::1` for a delegated /64), and
+comments about routing the prefix and matching `tun_mtu`. The file is created
+with mode `0600` on POSIX. `--server-address` defaults to the server's
+`bind_address` (or its `tun_address` when bound to `0.0.0.0`), and the
+client-side `tun_name`, `tun_mtu` and `log_level` are copied from the server
+configuration. If the server uses `metrics_*`, those settings are not copied.
+
+Existing clients can be exported at any time without rotating their keys:
+
+```bash
+sudo pipesix --export-client bob --server-address relay.example.net \
+    --write-client-config /root/pipesix-clients/bob.conf \
+    -c /etc/pipesix/pipesix.conf
+sudo pipesix --rotate-all --export-dir /root/pipesix-clients \
+    -c /etc/pipesix/pipesix.conf
+```
+
+`--rotate-all --export-dir` writes one bundle per client after rotating the
+whole table, which is the easiest way to refresh every client file. The
+exported files contain secrets: move them over a secure channel, keep the
+directory mode `0700`, and remove them from the server once delivered.
+Exporting does not change the server configuration.
 
 ### Delegated prefixes
 
@@ -669,6 +750,73 @@ trip; the feedback only guarantees the tunnel recovers on its own.
 
 Every client has its own pre-shared key. No key is shared between peers, so
 compromising one client does not expose another client's traffic.
+
+A client can keep its key out of the main file with `secret_file`, and a
+server can split its configuration with `include`:
+
+```ini
+# client
+secret_file = /etc/pipesix/client.secret
+
+# server
+include = /etc/pipesix/clients.conf
+```
+
+Set `user` (and optionally `group`) to drop root after the TUN device and
+sockets are open. The TUN file descriptor and bound ports keep working after
+the switch, while the data path, control socket and metrics endpoint run as
+the unprivileged account:
+
+```ini
+user  = pipesix
+group = pipesix
+```
+
+The included file and the secret file are re-read with the rest of the
+configuration on SIGHUP. `--add-client`, `--rotate-all` and `--remove-client`
+rewrite the main file, so keep credentials that those commands manage in the
+main file; put read-only credentials in an include. The systemd unit also
+sets `NoNewPrivileges`, a private `/tmp`, a read-only system and a restricted
+address-family set.
+
+### Client isolation and destination ACLs
+
+`strict_source` protects the relay from a client forging another client's
+source address. `client_allow` and `client_deny` protect the other
+direction: which destinations one client may reach through the relay. They
+are optional and only apply to server mode:
+
+```ini
+client = alice: <alice's key>
+client = bob:   <bob's key>
+client_route = alice 2001:db8:1::/64
+client_route = bob   2001:db8:2::/64
+
+# Alice may reach only the documentation network and the DNS resolver.
+client_allow = alice 2001:db8:100::/48
+client_allow = alice 2001:db8:53::/128
+# A deny always wins, including inside an allowed prefix.
+client_deny  = alice 2001:db8:100:dead::/48
+
+# Optional: block every other configured client's return prefix.
+client_isolation = on
+```
+
+A client with at least one `client_allow` entry is closed: traffic to any
+destination not covered by its allow list is dropped. A client with no allow
+entries is open except for its deny entries. `client_deny` is checked first,
+so it can carve a management or sensitive prefix out of a broad allow.
+`client_isolation = on` additionally drops every destination inside another
+configured client's `client_route`; the isolation rule is checked after the
+allow list, so it cannot be overridden by naming that prefix in
+`client_allow`. The rules are checked after authentication and before the
+packet reaches `tun0`, apply in the client-to-server direction only, and
+count in `pipesix_policy_denied_total`; each drop is logged.
+
+ACLs and isolation are reloadable, like the credential table. Keep ACL lines
+after the `client` line they refer to. `client_allow`/`client_deny` are not
+propagated to clients: a blocked packet is dropped at the relay, and the
+client sees the same timeout it would see for any filtered destination.
 
 1. Generate a key per client: `pipesix --genkey`
 2. On the server, add one line per client:

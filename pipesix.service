@@ -11,6 +11,15 @@ ExecStartPost=-/bin/sh -c 'sleep 1 && /etc/pipesix/route-up.sh'
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
+# pipesix can drop to 'user'/'group' itself after opening the TUN device.
+# These settings limit what a compromised process could reach either way.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
 WantedBy=multi-user.target

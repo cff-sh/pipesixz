@@ -28,6 +28,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Suffix of the temporary file policy_state_save() renames into place. */
@@ -220,12 +221,41 @@ static void civil_from_days(int64_t z, int *y, unsigned *m, unsigned *d)
     *y = (int)(yr + (*m <= 2u));
 }
 
-int policy_period(time_t now, int monthly)
+/* Length of a fixed-size period, in seconds. Monthly is handled separately. */
+static int64_t fixed_period_seconds(int period_kind)
+{
+    if (period_kind == POLICY_PERIOD_WEEKLY) {
+        return 7 * 86400;
+    }
+    if (period_kind < 0) {
+        return -(int64_t)period_kind * 86400;
+    }
+    return 86400;
+}
+
+void policy_period_name(int period_kind, char *out, size_t out_size)
+{
+    if (out == NULL || out_size == 0) {
+        return;
+    }
+
+    if (period_kind == POLICY_PERIOD_MONTHLY) {
+        snprintf(out, out_size, "monthly");
+    } else if (period_kind == POLICY_PERIOD_WEEKLY) {
+        snprintf(out, out_size, "weekly");
+    } else if (period_kind < 0) {
+        snprintf(out, out_size, "custom-%d", -period_kind);
+    } else {
+        snprintf(out, out_size, "daily");
+    }
+}
+
+int policy_period(time_t now, int period_kind)
 {
     int64_t days = (int64_t)now / 86400;
 
-    if (!monthly) {
-        return (int)days;
+    if (period_kind != POLICY_PERIOD_MONTHLY) {
+        return (int)((int64_t)now / fixed_period_seconds(period_kind));
     }
 
     {
@@ -238,10 +268,11 @@ int policy_period(time_t now, int monthly)
     }
 }
 
-time_t policy_period_start(int period, int monthly)
+time_t policy_period_start(int period, int period_kind)
 {
-    if (!monthly) {
-        return (time_t)((int64_t)period * 86400);
+    if (period_kind != POLICY_PERIOD_MONTHLY) {
+        return (time_t)((int64_t)period *
+                        fixed_period_seconds(period_kind));
     }
 
     {
@@ -259,9 +290,9 @@ time_t policy_period_start(int period, int monthly)
     }
 }
 
-time_t policy_period_end(int period, int monthly)
+time_t policy_period_end(int period, int period_kind)
 {
-    return policy_period_start(period + 1, monthly);
+    return policy_period_start(period + 1, period_kind);
 }
 
 int policy_format_date(time_t t, char *out, size_t size)
@@ -285,17 +316,20 @@ int policy_format_date(time_t t, char *out, size_t size)
 #define POLICY_HISTORY_HEADER \
     "client_id,period_start,period_end,period_kind,used_bytes\n"
 
-int policy_history_append(const char *path, int monthly,
+int policy_history_append(const char *path, int period_kind,
                           const policy_usage_t *usage, int count)
 {
     FILE *fp;
     long size;
+    char kind[24];
     int i;
 
     if (path == NULL || path[0] == '\0' || usage == NULL || count < 0) {
         errno = EINVAL;
         return -1;
     }
+
+    policy_period_name(period_kind, kind, sizeof(kind));
 
     if (count == 0) {
         return 0;
@@ -321,12 +355,11 @@ int policy_history_append(const char *path, int monthly,
     }
 
     for (i = 0; i < count; i++) {
-        time_t start = policy_period_start((int)usage[i].period, monthly);
-        time_t end = policy_period_end((int)usage[i].period, monthly);
+        time_t start = policy_period_start((int)usage[i].period, period_kind);
+        time_t end = policy_period_end((int)usage[i].period, period_kind);
 
         if (fprintf(fp, "%s,%lld,%lld,%s,%llu\n", usage[i].id,
-                    (long long)start, (long long)end,
-                    monthly ? "monthly" : "daily",
+                    (long long)start, (long long)end, kind,
                     (unsigned long long)usage[i].used) < 0) {
             fclose(fp);
             return -1;
@@ -393,7 +426,18 @@ int policy_history_load(const char *path, policy_history_t *out, int max,
         snprintf(out[n].id, sizeof(out[n].id), "%s", id);
         out[n].start_unix = (int64_t)start;
         out[n].end_unix = (int64_t)end;
-        out[n].monthly = (strcmp(kind, "monthly") == 0);
+        if (strcmp(kind, "monthly") == 0) {
+            out[n].kind = POLICY_PERIOD_MONTHLY;
+        } else if (strcmp(kind, "weekly") == 0) {
+            out[n].kind = POLICY_PERIOD_WEEKLY;
+        } else if (strncmp(kind, "custom-", 7) == 0) {
+            int days = atoi(kind + 7);
+
+            out[n].kind = (days > 0) ? -days : POLICY_PERIOD_DAILY;
+        } else {
+            out[n].kind = POLICY_PERIOD_DAILY;
+        }
+        out[n].monthly = (out[n].kind == POLICY_PERIOD_MONTHLY);
         out[n].used = (uint64_t)used;
         n++;
     }
@@ -411,10 +455,11 @@ int policy_history_load(const char *path, policy_history_t *out, int max,
     return 0;
 }
 
-int policy_state_save(const char *path, int monthly,
+int policy_state_save(const char *path, int period_kind,
                       const policy_usage_t *usage, int count)
 {
     char tmp_path[4096 + sizeof(POLICY_STATE_SUFFIX)];
+    char kind[24];
     FILE *fp;
     int i;
     int rc = -1;
@@ -436,8 +481,8 @@ int policy_state_save(const char *path, int monthly,
         return -1;
     }
 
-    if (fprintf(fp, "# pipesix quota state v2\nperiod %s\n",
-                monthly ? "monthly" : "daily") < 0) {
+    policy_period_name(period_kind, kind, sizeof(kind));
+    if (fprintf(fp, "# pipesix quota state v3\nperiod %s\n", kind) < 0) {
         goto close;
     }
 
@@ -487,21 +532,21 @@ fail:
     return rc;
 }
 
-int policy_state_load(const char *path, int *monthly,
+int policy_state_load(const char *path, int *period_kind,
                       policy_usage_t *usage, int max, int *count)
 {
     char line[256];
     FILE *fp;
     int n = 0;
 
-    if (path == NULL || path[0] == '\0' || monthly == NULL ||
+    if (path == NULL || path[0] == '\0' || period_kind == NULL ||
         usage == NULL || max < 0 || count == NULL) {
         errno = EINVAL;
         return -1;
     }
 
     *count = 0;
-    *monthly = 0;
+    *period_kind = POLICY_PERIOD_DAILY;
 
     fp = fopen(path, "r");
     if (fp == NULL) {
@@ -523,7 +568,22 @@ int policy_state_load(const char *path, int *monthly,
         }
 
         if (strncmp(p, "period ", 7) == 0) {
-            *monthly = (strncmp(p + 7, "monthly", 7) == 0);
+            char kind[24];
+
+            if (sscanf(p + 7, "%23s", kind) != 1) {
+                continue;
+            }
+            if (strcmp(kind, "monthly") == 0) {
+                *period_kind = POLICY_PERIOD_MONTHLY;
+            } else if (strcmp(kind, "weekly") == 0) {
+                *period_kind = POLICY_PERIOD_WEEKLY;
+            } else if (strncmp(kind, "custom-", 7) == 0) {
+                int days = atoi(kind + 7);
+
+                *period_kind = (days > 0) ? -days : POLICY_PERIOD_DAILY;
+            } else {
+                *period_kind = POLICY_PERIOD_DAILY;
+            }
             continue;
         }
 

@@ -37,6 +37,7 @@
 #include "ipv6.h"
 #include "logger.h"
 #include "metrics.h"
+#include "platform.h"
 #include "policy.h"
 #include "proto.h"
 #include "runtime.h"
@@ -201,6 +202,7 @@ static void send_session_quota_state(server_context_t *ctx,
                                      socklen_t peer_len,
                                      const uint8_t key[PIPESIX_KEY_LEN],
                                      int client_index);
+static int save_quota_state(server_context_t *ctx);
 
 /*
  * Close the live accounting period and open 'new_period'.
@@ -417,6 +419,62 @@ static int peer_allowed(const server_context_t *ctx,
     for (i = 0; i < ctx->config->allow_client_count; i++) {
         if (strcmp(host, ctx->config->allow_client[i]) == 0) {
             return 1;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Return non-zero when a client's destination policy forbids 'dest'.
+ *
+ * The deny list wins over the allow list, and an allow list is closed:
+ * once a client has one entry, a destination outside it is dropped. With
+ * 'client_isolation' on, every other configured client's return prefix is
+ * denied as well, including clients that are currently offline. Requires
+ * ctx->lock, because the credential table can be replaced by a reload.
+ */
+static int client_acl_denies(const pipesix_config_t *config,
+                             const char *client_id,
+                             const uint8_t dest[16])
+{
+    const pipesix_client_cred_t *cred = config_find_client(config, client_id);
+    int i;
+
+    if (cred == NULL) {
+        return 0;
+    }
+
+    for (i = 0; i < cred->deny_count; i++) {
+        if (ipv6_prefix_match(cred->deny[i], cred->deny_len[i], dest)) {
+            return 1;
+        }
+    }
+
+    if (cred->allow_count > 0) {
+        int allowed = 0;
+
+        for (i = 0; i < cred->allow_count; i++) {
+            if (ipv6_prefix_match(cred->allow[i], cred->allow_len[i], dest)) {
+                allowed = 1;
+                break;
+            }
+        }
+        if (!allowed) {
+            return 1;
+        }
+    }
+
+    if (config->client_isolation) {
+        for (i = 0; i < config->client_count; i++) {
+            const pipesix_client_cred_t *other = &config->clients[i];
+
+            if (other == cred || other->prefix_len <= 0) {
+                continue;
+            }
+            if (ipv6_prefix_match(other->prefix, other->prefix_len, dest)) {
+                return 1;
+            }
         }
     }
 
@@ -1230,9 +1288,15 @@ typedef struct {
  * Sessions that are not mentioned above are left alone, so rotating one
  * key does not disturb any other client.
  */
+static int server_metrics_body(char *out, size_t size, void *arg);
+static int server_ready(char *out, size_t size, void *arg);
+
 static void reload_config(server_context_t *ctx)
 {
     pipesix_client_cred_t before[CONFIG_MAX_CLIENTS];
+    char old_metrics_address[CONFIG_MAX_ADDRESS];
+    char old_metrics_token[CONFIG_MAX_SECRET];
+    int old_metrics_port = ctx->config->metrics_port;
     struct sockaddr_storage hint_addr[SERVER_MAX_CLIENTS];
     socklen_t hint_addr_len[SERVER_MAX_CLIENTS];
     char hint_ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
@@ -1247,6 +1311,10 @@ static void reload_config(server_context_t *ctx)
     int i;
 
     memcpy(before, ctx->config->clients, sizeof(before));
+    snprintf(old_metrics_address, sizeof(old_metrics_address), "%s",
+             ctx->config->metrics_address);
+    snprintf(old_metrics_token, sizeof(old_metrics_token), "%s",
+             ctx->config->metrics_token);
 
     /* Today's usage, keyed by the credential table it belongs to. */
     for (i = 0; i < before_count; i++) {
@@ -1275,6 +1343,16 @@ static void reload_config(server_context_t *ctx)
     logger_set_level(ctx->config->log_level);
     logger_set_json(ctx->config->log_json);
     atomic_store(&ctx->session_timeout, ctx->config->session_timeout);
+
+    if (strcmp(old_metrics_address, ctx->config->metrics_address) != 0 ||
+        old_metrics_port != ctx->config->metrics_port ||
+        strcmp(old_metrics_token, ctx->config->metrics_token) != 0) {
+        metrics_stop();
+        if (metrics_start(ctx->config, server_metrics_body, server_ready,
+                          ctx) != 0) {
+            log_warn("The new metrics settings could not be applied");
+        }
+    }
 
     pthread_mutex_lock(&ctx->lock);
 
@@ -1427,10 +1505,9 @@ static void reload_config(server_context_t *ctx)
                  rerouted);
     }
 
-    log_info("Configuration reloaded (log_level, keepalive, "
-             "session_timeout, stats_interval, %d credential(s), "
-             "%d limit(s)); interface, endpoint and mode changes need a "
-             "restart",
+    log_info("Configuration reloaded (keys, ACLs, limits, log settings, "
+             "timing, quotas, paths, metrics): %d credential(s), "
+             "%d limit(s); interface and mode changes need a restart",
              ctx->config->client_count, ctx->config->policy_count);
 }
 
@@ -1536,6 +1613,7 @@ static void *receiver_loop(void *arg)
     server_context_t *ctx = (server_context_t *)arg;
     uint8_t frame_buf[PIPESIX_RECV_BUF_SIZE];
     struct pollfd pfd;
+    char period_name[24];
 
     pfd.fd = ctx->udp_fd;
     pfd.events = POLLIN;
@@ -1569,6 +1647,9 @@ static void *receiver_loop(void *arg)
         int notify_warn = 0;
         int notify_gone = 0;
         int source_denied = 0;
+        int acl_denied = 0;
+        char acl_id[CONFIG_MAX_CLIENT_ID];
+        char acl_dest[INET6_ADDRSTRLEN];
 
         ready = poll(&pfd, 1, POLL_INTERVAL_MS);
         if (ready < 0) {
@@ -1728,6 +1809,8 @@ static void *receiver_loop(void *arg)
                 pthread_mutex_unlock(&ctx->lock);
 
                 if (policy_warn) {
+                    policy_period_name(ctx->config->quota_period,
+                                       period_name, sizeof(period_name));
                     log_warn("Client '%s' exceeded its per-client limits; "
                              "%s traffic (rate %llu kbit/s, quota "
                              "%llu MiB/%s)",
@@ -1735,7 +1818,7 @@ static void *receiver_loop(void *arg)
                              quota_over ? "throttling" : "dropping",
                              (unsigned long long)policy_rate,
                              (unsigned long long)policy_quota,
-                             ctx->config->quota_period ? "month" : "day");
+                             period_name);
                 }
                 if (notify_gone) {
                     send_session_control(ctx, &notify_addr, notify_len,
@@ -1753,31 +1836,46 @@ static void *receiver_loop(void *arg)
          * that address. That is what a client and server configured for
          * different upstreams look like on the wire, and it is silent
          * otherwise, so report it once per session.
+         *
+         * The same parse gives the destination ACL and isolation check,
+         * which is the boundary strict_source does not cover: a valid
+         * client must not be able to reach another tenant's route.
          */
-        if ((ctx->config->strict_source ||
-             !ctx->sessions[slot].route_warned) &&
-            ctx->sessions[slot].prefix_len > 0 &&
-            frame.payload_len >= IPV6_HEADER_LEN) {
+        if (frame.payload_len >= IPV6_HEADER_LEN) {
             const pipesix_ipv6_header_t *inner = NULL;
 
             if (ipv6_parse_header(frame.payload, frame.payload_len,
-                                  &inner) == 0 &&
-                !ipv6_prefix_match(ctx->sessions[slot].prefix,
-                                   ctx->sessions[slot].prefix_len,
-                                   inner->source_addr)) {
-                if (!ctx->sessions[slot].route_warned) {
-                    ctx->sessions[slot].route_warned = 1;
-                    mismatch = 1;
-                    memcpy(mismatch_src, inner->source_addr,
-                           sizeof(mismatch_src));
-                    memcpy(mismatch_prefix, ctx->sessions[slot].prefix,
-                           sizeof(mismatch_prefix));
-                    mismatch_prefix_len = ctx->sessions[slot].prefix_len;
-                    snprintf(mismatch_id, sizeof(mismatch_id), "%s",
+                                  &inner) == 0) {
+                if (client_acl_denies(ctx->config,
+                                      ctx->sessions[slot].client_id,
+                                      inner->dest_addr)) {
+                    acl_denied = 1;
+                    snprintf(acl_id, sizeof(acl_id), "%s",
                              ctx->sessions[slot].client_id);
+                    ipv6_addr_to_str(inner->dest_addr, acl_dest,
+                                     sizeof(acl_dest));
                 }
-                if (ctx->config->strict_source) {
-                    source_denied = 1;
+
+                if ((ctx->config->strict_source ||
+                     !ctx->sessions[slot].route_warned) &&
+                    ctx->sessions[slot].prefix_len > 0 &&
+                    !ipv6_prefix_match(ctx->sessions[slot].prefix,
+                                       ctx->sessions[slot].prefix_len,
+                                       inner->source_addr)) {
+                    if (!ctx->sessions[slot].route_warned) {
+                        ctx->sessions[slot].route_warned = 1;
+                        mismatch = 1;
+                        memcpy(mismatch_src, inner->source_addr,
+                               sizeof(mismatch_src));
+                        memcpy(mismatch_prefix, ctx->sessions[slot].prefix,
+                               sizeof(mismatch_prefix));
+                        mismatch_prefix_len = ctx->sessions[slot].prefix_len;
+                        snprintf(mismatch_id, sizeof(mismatch_id), "%s",
+                                 ctx->sessions[slot].client_id);
+                    }
+                    if (ctx->config->strict_source) {
+                        source_denied = 1;
+                    }
                 }
             }
         }
@@ -1790,6 +1888,14 @@ static void *receiver_loop(void *arg)
                                      ? PIPESIX_FLAG_QUOTA_EXHAUSTED
                                      : PIPESIX_FLAG_QUOTA_WARNING);
             memset(notify_key, 0, sizeof(notify_key));
+        }
+
+        if (acl_denied) {
+            log_warn("Client '%s' sent a packet to %s, which its "
+                     "destination policy or client_isolation forbids; "
+                     "dropping it", acl_id, acl_dest);
+            stats_add_policy_denied(&ctx->stats);
+            continue;
         }
 
         if (source_denied) {
@@ -1889,6 +1995,7 @@ static void *sender_loop(void *arg)
     uint8_t packet[PIPESIX_MAX_PACKET];
     uint8_t frame[PIPESIX_MAX_FRAME];
     struct pollfd pfd;
+    char period_name[24];
 
     pfd.fd = ctx->tun->fd;
     pfd.events = POLLIN;
@@ -2030,6 +2137,8 @@ static void *sender_loop(void *arg)
 
         if (denied) {
             if (denied_warn) {
+                policy_period_name(ctx->config->quota_period,
+                                   period_name, sizeof(period_name));
                 log_warn("Client '%s' exceeded its per-client limits; "
                          "%s traffic (rate %llu kbit/s, quota "
                          "%llu MiB/%s)",
@@ -2037,7 +2146,7 @@ static void *sender_loop(void *arg)
                          quota_over ? "throttling" : "dropping",
                          (unsigned long long)policy_rate,
                          (unsigned long long)policy_quota,
-                         ctx->config->quota_period ? "month" : "day");
+                         period_name);
             }
             stats_add_throttled(&ctx->stats);
             continue;
@@ -2198,6 +2307,7 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
     char peers[SERVER_MAX_CLIENTS][96];
     char routes[SERVER_MAX_CLIENTS][INET6_ADDRSTRLEN + 8];
     char limits[SERVER_MAX_CLIENTS][160];
+    char period_name[24];
     uint64_t frames[SERVER_MAX_CLIENTS];
     uint64_t rx_bytes[SERVER_MAX_CLIENTS];
     uint64_t tx_bytes[SERVER_MAX_CLIENTS];
@@ -2211,6 +2321,9 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
     size_t used = 0;
     int count = 0;
     int i;
+
+    policy_period_name(ctx->config->quota_period, period_name,
+                       sizeof(period_name));
 
     pthread_mutex_lock(&ctx->lock);
 
@@ -2268,7 +2381,7 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
                      "\"quota_remaining_bytes\":%llu}",
                      (unsigned long long)rate_kbps[count],
                      (unsigned long long)quota_mib[count],
-                     ctx->config->quota_period ? "monthly" : "daily",
+                     period_name,
                      (unsigned long long)quota_remaining[count]);
         }
 
@@ -2320,7 +2433,7 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
             server_control_append(reply, size, &used,
                                   " quota=%llu MiB/%s left=%llu B",
                                   (unsigned long long)quota_mib[i],
-                                  ctx->config->quota_period ? "month" : "day",
+                                  period_name,
                                   (unsigned long long)quota_remaining[i]) != 0) {
             return -1;
         }
@@ -2358,6 +2471,7 @@ static int server_status_json(server_context_t *ctx, char *reply, size_t size)
     char peers[SERVER_MAX_CLIENTS][96];
     char routes[SERVER_MAX_CLIENTS][INET6_ADDRSTRLEN + 12];
     char limits[SERVER_MAX_CLIENTS][160];
+    char period_name[24];
     uint64_t frames[SERVER_MAX_CLIENTS];
     uint64_t rx_bytes[SERVER_MAX_CLIENTS];
     uint64_t tx_bytes[SERVER_MAX_CLIENTS];
@@ -2376,6 +2490,9 @@ static int server_status_json(server_context_t *ctx, char *reply, size_t size)
     size_t used = 0;
     int count = 0;
     int i;
+
+    policy_period_name(ctx->config->quota_period, period_name,
+                       sizeof(period_name));
 
     pthread_mutex_lock(&ctx->lock);
 
@@ -2433,7 +2550,7 @@ static int server_status_json(server_context_t *ctx, char *reply, size_t size)
                      "\"quota_remaining_bytes\":%llu}",
                      (unsigned long long)rate_kbps[count],
                      (unsigned long long)quota_mib[count],
-                     ctx->config->quota_period ? "monthly" : "daily",
+                     period_name,
                      (unsigned long long)quota_remaining[count]);
         }
 
@@ -2529,11 +2646,13 @@ static int server_usage(server_context_t *ctx, char *reply, size_t size,
     char config_esc[1024];
     char start_str[16] = "?";
     char end_str[16] = "?";
-    const char *kind = ctx->config->quota_period ? "monthly" : "daily";
+    char kind[24];
     time_t now = time(NULL);
     int period = policy_period(now, ctx->config->quota_period);
     time_t start = policy_period_start(period, ctx->config->quota_period);
     time_t end = policy_period_end(period, ctx->config->quota_period);
+
+    policy_period_name(ctx->config->quota_period, kind, sizeof(kind));
     struct tm tm;
     size_t len = 0;
     int count = 0;
@@ -2704,6 +2823,24 @@ too_large:
  * full table. Client ids are validated at configuration time, so they
  * need no label escaping.
  */
+static int server_ready(char *out, size_t size, void *arg)
+{
+    server_context_t *ctx = (server_context_t *)arg;
+    int sessions;
+
+    if (ctx->tun == NULL || ctx->tun->fd < 0 || ctx->udp_fd < 0) {
+        snprintf(out, size, "not ready: tun or socket is closed\n");
+        return 0;
+    }
+
+    pthread_mutex_lock(&ctx->lock);
+    sessions = count_active(ctx);
+    pthread_mutex_unlock(&ctx->lock);
+
+    snprintf(out, size, "ready: tun=ok udp=ok sessions=%d\n", sessions);
+    return 1;
+}
+
 static int server_metrics_body(char *out, size_t size, void *arg)
 {
     server_context_t *ctx = (server_context_t *)arg;
@@ -2891,6 +3028,96 @@ static int server_kick(server_context_t *ctx, const char *id, char *reply,
     return 0;
 }
 
+/*
+ * Reset, credit or add usage for one client. Used by --reset-usage and
+ * --credit-usage when a counter needs correcting without waiting for the
+ * next period. The state file is written immediately so a restart keeps
+ * the correction.
+ */
+static int server_usage_adjust(server_context_t *ctx, const char *id,
+                               int mode, uint64_t mib, char *reply,
+                               size_t size)
+{
+    struct sockaddr_storage peers[SERVER_MAX_CLIENTS];
+    socklen_t peer_len[SERVER_MAX_CLIENTS];
+    uint8_t keys[SERVER_MAX_CLIENTS][PIPESIX_KEY_LEN];
+    uint64_t delta;
+    uint64_t used;
+    uint64_t updated;
+    int period;
+    int index;
+    int count = 0;
+    int i;
+
+    if (id == NULL || id[0] == '\0') {
+        snprintf(reply, size, "ERR usage: usage-reset <id> or "
+                              "usage-credit <id> <MiB>\n");
+        return -1;
+    }
+
+    delta = mib * 1048576u;
+    period = policy_period(time(NULL), ctx->config->quota_period);
+
+    pthread_mutex_lock(&ctx->lock);
+
+    index = client_index_lookup(ctx->config, id);
+    if (index < 0) {
+        pthread_mutex_unlock(&ctx->lock);
+        snprintf(reply, size, "ERR unknown client '%s'\n", id);
+        return -1;
+    }
+
+    used = policy_quota_used(&ctx->quotas[index], period);
+
+    if (mode == 0) {
+        updated = 0;
+    } else if (mode == 1) {
+        updated = (delta >= used) ? 0 : used - delta;
+    } else {
+        updated = (used > UINT64_MAX - delta) ? UINT64_MAX : used + delta;
+    }
+
+    policy_quota_restore(&ctx->quotas[index], updated, period);
+
+    for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
+        server_session_t *session = &ctx->sessions[i];
+
+        if (!session->active || !session->established ||
+            strcmp(session->client_id, id) != 0) {
+            continue;
+        }
+
+        peers[count] = session->addr;
+        peer_len[count] = session->addr_len;
+        memcpy(keys[count], session->tx_key, sizeof(keys[count]));
+        count++;
+    }
+
+    pthread_mutex_unlock(&ctx->lock);
+
+    for (i = 0; i < count; i++) {
+        send_session_quota_state(ctx, &peers[i], peer_len[i], keys[i],
+                                 index);
+        memset(keys[i], 0, sizeof(keys[i]));
+    }
+
+    if (save_quota_state(ctx) != 0) {
+        log_warn("Usage for client '%s' was adjusted in memory but could "
+                 "not be saved", id);
+    }
+
+    log_info("Usage for client '%s' adjusted: %s%llu MiB (used %llu -> "
+             "%llu B)",
+             id, mode == 0 ? "reset; " : (mode == 1 ? "credited " : "added "),
+             (unsigned long long)mib, (unsigned long long)used,
+             (unsigned long long)updated);
+
+    snprintf(reply, size,
+             "OK client '%s' usage is now %llu B for this period\n",
+             id, (unsigned long long)updated);
+    return 0;
+}
+
 static int server_control_handler(const char *request, char *reply,
                                   size_t size, void *arg)
 {
@@ -2939,6 +3166,34 @@ static int server_control_handler(const char *request, char *reply,
         return server_metrics_body(reply + 3, size - 3, ctx);
     }
 
+    if (strncmp(request, "usage-reset ", 12) == 0) {
+        return server_usage_adjust(ctx, request + 12, 0, 0, reply, size);
+    }
+
+    if (strncmp(request, "usage-credit ", 13) == 0) {
+        char id[CONFIG_MAX_CLIENT_ID];
+        unsigned long long mib;
+
+        if (sscanf(request + 13, "%31s %llu", id, &mib) != 2 ||
+            mib > 1048576u) {
+            snprintf(reply, size, "ERR usage: usage-credit <id> <MiB>\n");
+            return -1;
+        }
+        return server_usage_adjust(ctx, id, 1, (uint64_t)mib, reply, size);
+    }
+
+    if (strncmp(request, "usage-add ", 10) == 0) {
+        char id[CONFIG_MAX_CLIENT_ID];
+        unsigned long long mib;
+
+        if (sscanf(request + 10, "%31s %llu", id, &mib) != 2 ||
+            mib > 1048576u) {
+            snprintf(reply, size, "ERR usage: usage-add <id> <MiB>\n");
+            return -1;
+        }
+        return server_usage_adjust(ctx, id, 2, (uint64_t)mib, reply, size);
+    }
+
     if (strcmp(request, "reload") == 0) {
         /*
          * The CLI has already rewritten and validated the file; this only
@@ -2975,7 +3230,7 @@ static int server_control_handler(const char *request, char *reply,
 static void load_quota_state(server_context_t *ctx)
 {
     policy_usage_t stored[CONFIG_MAX_CLIENTS];
-    int stored_monthly = 0;
+    int stored_kind = 0;
     int count = 0;
     int restored = 0;
     int period = policy_period(time(NULL), ctx->config->quota_period);
@@ -2985,18 +3240,23 @@ static void load_quota_state(server_context_t *ctx)
         return;
     }
 
-    if (policy_state_load(ctx->config->quota_state, &stored_monthly, stored,
+    if (policy_state_load(ctx->config->quota_state, &stored_kind, stored,
                           CONFIG_MAX_CLIENTS, &count) != 0) {
         log_warn("Cannot read the quota state file '%s': %s",
                  ctx->config->quota_state, strerror(errno));
         return;
     }
 
-    if (stored_monthly != ctx->config->quota_period) {
+    if (stored_kind != ctx->config->quota_period) {
+        char old_name[24];
+        char new_name[24];
+
+        policy_period_name(stored_kind, old_name, sizeof(old_name));
+        policy_period_name(ctx->config->quota_period, new_name,
+                           sizeof(new_name));
         log_info("Quota state '%s' was saved for a %s quota; starting this "
-                 "%s from zero", ctx->config->quota_state,
-                 stored_monthly ? "monthly" : "daily",
-                 ctx->config->quota_period ? "month" : "day");
+                 "%s from zero", ctx->config->quota_state, old_name,
+                 new_name);
         return;
     }
 
@@ -3175,9 +3435,34 @@ int server_start(pipesix_config_t *config)
         return -1;
     }
 
+    control_set_handler(server_control_handler, &ctx);
+    metrics_start(config, server_metrics_body, server_ready, &ctx);
+
+    /*
+     * The TUN device, UDP socket and metrics listener are open, so the
+     * data path no longer needs root. Drop before the worker threads
+     * start, which also means a later failure cannot leave a root helper
+     * thread behind.
+     */
+    if (psix_drop_privileges(config->user, config->group) != 0) {
+        log_error("Cannot drop privileges to user '%s' group '%s': %s",
+                  config->user, config->group, strerror(errno));
+        metrics_stop();
+        pthread_mutex_destroy(&ctx.lock);
+        close(ctx.udp_fd);
+        tun_close(&tun);
+        return -1;
+    }
+    if (config->user[0] != '\0') {
+        log_info("Dropped privileges to user '%s'%s%s", config->user,
+                 config->group[0] != '\0' ? " group '" : "",
+                 config->group[0] != '\0' ? config->group : "");
+    }
+
     rc = pthread_create(&receiver_thread, NULL, receiver_loop, &ctx);
     if (rc != 0) {
         log_error("Failed to create receiver thread: %s", strerror(rc));
+        metrics_stop();
         pthread_mutex_destroy(&ctx.lock);
         close(ctx.udp_fd);
         tun_close(&tun);
@@ -3189,14 +3474,12 @@ int server_start(pipesix_config_t *config)
         log_error("Failed to create sender thread: %s", strerror(rc));
         runtime_request_stop();
         pthread_join(receiver_thread, NULL);
+        metrics_stop();
         pthread_mutex_destroy(&ctx.lock);
         close(ctx.udp_fd);
         tun_close(&tun);
         return -1;
     }
-
-    control_set_handler(server_control_handler, &ctx);
-    metrics_start(config, server_metrics_body, &ctx);
 
     {
         int i;

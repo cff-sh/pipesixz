@@ -61,6 +61,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -234,6 +235,12 @@ static void print_usage(const char *progname)
             "      --json              Print --status or --usage as one\n"
             "                          JSON object\n"
             "      --usage             Report per-client usage and limits\n"
+            "      --reset-usage <id>  Reset that client's current-period\n"
+            "                          usage to zero\n"
+            "      --credit-usage <id> Subtract MiB from current usage\n"
+            "                          (needs --mib)\n"
+            "      --add-usage <id>    Add MiB to current usage (needs --mib)\n"
+            "      --mib <MiB>         Amount for --credit-usage/--add-usage\n"
             "      --history           With --usage, print completed periods\n"
             "                          from the usage_history file\n"
             "      --csv               Print --usage as one CSV table\n"
@@ -258,8 +265,20 @@ static void print_usage(const char *progname)
             "      --route <prefix>    Return route for --add-client\n"
             "      --delegate          Give --add-client a free /64 from\n"
             "                          'client_prefix_pool' as its route\n"
+            "      --server-address <host>\n"
+            "                          Address written into exported client\n"
+            "                          configurations (or the bind address)\n"
+            "      --write-client-config <path>\n"
+            "                          Write a complete client config after\n"
+            "                          --add-client or --export-client\n"
+            "      --export-client <id>\n"
+            "                          Export an existing client's config\n"
+            "      --export-dir <dir>  With --export-client or --rotate-all,\n"
+            "                          write <dir>/<id>.conf for each client\n"
             "  -V, --version           Show version information\n"
-            "  -h, --help              Show this help message\n"
+            "  -h, --help              Show this help message\n");
+
+    fprintf(stderr,
             "\n"
             "Configuration file format (key = value):\n"
             "  mode            client | server\n"
@@ -280,7 +299,9 @@ static void print_usage(const char *progname)
             "  client_quota    <id> <MiB> per period (server, repeatable)\n"
             "  client_quota_warn <id> <percent> (server, repeatable)\n"
             "  strict_source   Drop data outside the client route (server)\n"
-            "  quota_period    daily | monthly (default: daily)\n"
+            "  quota_period    daily | weekly | monthly | custom\n"
+            "                  (default: daily)\n"
+            "  quota_period_days Custom period length in days (1-365)\n"
             "  quota_action    drop | throttle (default: drop)\n"
             "  quota_grace     MiB over quota before the action (default: 0)\n"
             "  quota_throttle_kbps Over-quota rate (default: 64)\n"
@@ -295,7 +316,9 @@ static void print_usage(const char *progname)
             "  stats_interval  Stats log interval seconds (default: 60, 0 = off)\n"
             "  metrics_address Metrics endpoint address (empty = disabled)\n"
             "  metrics_port    Metrics endpoint port (default: 9100)\n"
-            "  metrics_token   Bearer token for /metrics (empty = open)\n"
+            "  metrics_token   Bearer token for /metrics (empty = open)\n");
+
+    fprintf(stderr,
             "  log_level       debug | info | warn | error | fatal\n"
             "  log_format      text | json (default: text)\n"
             "\n"
@@ -305,10 +328,10 @@ static void print_usage(const char *progname)
             "  pipesix -t -c ./pipesix.conf\n"
             "\n"
             "Signal SIGUSR1 dumps traffic statistics immediately.\n"
-            "Signal SIGHUP reloads log_level, keepalive, peer_timeout,\n"
-            "session_timeout, stats_interval, strict_source, the quota\n"
-            "action/grace/rate, per-client limits and keys\n"
-            "(server: client table, client: own secret) for live rotation.\n"
+            "Signal SIGHUP reloads log settings, timing settings, ACLs,\n"
+            "allow_client, quota windows/action/grace/rate, quota_state,\n"
+            "usage_history, metrics settings, keys and limits. A client\n"
+            "also adopts new remote_address/remote_port and reconnects.\n"
             "On Windows there are no signals: use --reload and --stats.\n"
             "The control channel (--status, --kick) is a 0600 UNIX socket\n"
             "and is available on POSIX only.\n");
@@ -538,6 +561,127 @@ static int signal_running_instances(const char *config_path, int sig)
  * The keys are printed because they still have to reach each client's
  * 'secret' line; there is no channel that could push them there.
  */
+/*
+ * Turn a client's return prefix into the address it should put on its TUN
+ * device. A /128 is the address itself; a shorter prefix gets host bit 1,
+ * which is valid for the common /64 delegation and avoids the all-zero
+ * subnet-router address.
+ */
+static int client_tun_address(const pipesix_client_cred_t *cred, char *out,
+                              size_t out_size, int *prefix_len)
+{
+    uint8_t addr[16];
+
+    if (cred == NULL || cred->prefix_len <= 0 || out == NULL ||
+        out_size == 0) {
+        return -1;
+    }
+
+    memcpy(addr, cred->prefix, sizeof(addr));
+    if (cred->prefix_len < 128) {
+        if (cred->prefix_len <= 120) {
+            addr[15] = 1;
+        } else {
+            addr[15] |= 1;
+        }
+    }
+
+    *prefix_len = cred->prefix_len;
+    return config_format_prefix(addr, *prefix_len, out, out_size);
+}
+
+/*
+ * Write a complete client configuration for one provisioned client.
+ *
+ * The server's own bind address is a poor default when it is a wildcard,
+ * so the caller should pass --server-address there. The file is opened
+ * with mode 0600 before the secret is written on POSIX.
+ */
+static int write_client_config(const pipesix_config_t *config, const char *id,
+                               const char *server_address, const char *path)
+{
+    const pipesix_client_cred_t *cred = config_find_client(config, id);
+    char tun_address[CONFIG_MAX_ADDRESS];
+    char route_text[CONFIG_MAX_ADDRESS];
+    char dir_path[CONFIG_PATH_MAX];
+    char address[CONFIG_MAX_ADDRESS];
+    const char *remote = server_address;
+    FILE *fp;
+    int prefix_len = 0;
+    int port;
+
+    if (cred == NULL || path == NULL || path[0] == '\0') {
+        log_error("cannot export client '%s': no such credential or path",
+                  id != NULL ? id : "?");
+        return -1;
+    }
+
+    if (client_tun_address(cred, tun_address, sizeof(tun_address),
+                           &prefix_len) != 0) {
+        log_error("cannot export client '%s': it has no client_route", id);
+        return -1;
+    }
+
+    if (config_format_prefix(cred->prefix, cred->prefix_len, route_text,
+                             sizeof(route_text)) != 0) {
+        return -1;
+    }
+
+    if (remote == NULL || remote[0] == '\0') {
+        remote = config->bind_address;
+    }
+    if (remote == NULL || remote[0] == '\0' ||
+        strcmp(remote, "0.0.0.0") == 0 || strcmp(remote, "::") == 0) {
+        log_error("exporting '%s' needs a reachable --server-address", id);
+        return -1;
+    }
+
+    snprintf(dir_path, sizeof(dir_path), "%s", path);
+    fp = fopen(dir_path, "w");
+    if (fp == NULL) {
+        log_error("cannot write client config '%s': %s", path,
+                  strerror(errno));
+        return -1;
+    }
+
+#if !defined(_WIN32)
+    (void)fchmod(fileno(fp), 0600);
+#endif
+
+    port = (strcmp(config->mode, "server") == 0) ? config->bind_port
+                                                  : config->remote_port;
+    snprintf(address, sizeof(address), "%s", tun_address);
+
+    if (fprintf(fp,
+                "# pipesix client configuration for %s\n"
+                "# generated from %s:%s\n"
+                "mode = client\n"
+                "client_id = %s\n"
+                "secret = %s\n"
+                "remote_address = %s\n"
+                "remote_port = %d\n"
+                "tun_name = tun0\n"
+                "tun_address = %s\n"
+                "tun_prefixlen = %d\n"
+                "tun_mtu = %d\n"
+                "log_level = info\n"
+                "# route the generated %s on the client if it is a /64\n",
+                id, config->config_path, route_text, id, cred->secret,
+                remote, port, address, prefix_len, config->tun_mtu,
+                route_text) < 0) {
+        fclose(fp);
+        unlink(path);
+        return -1;
+    }
+
+    if (fclose(fp) != 0) {
+        unlink(path);
+        return -1;
+    }
+
+    return 0;
+}
+
 static void report_rotated_keys(const pipesix_config_t *config)
 {
     int i;
@@ -582,6 +726,14 @@ int main(int argc, char *argv[])
         { "remove-client", required_argument, NULL, 1005 },
         { "route",     required_argument, NULL, 1006 },
         { "delegate",  no_argument,       NULL, 1017 },
+        { "reset-usage", required_argument, NULL, 1019 },
+        { "credit-usage", required_argument, NULL, 1020 },
+        { "add-usage", required_argument, NULL, 1021 },
+        { "mib",       required_argument, NULL, 1022 },
+        { "server-address", required_argument, NULL, 1023 },
+        { "write-client-config", required_argument, NULL, 1024 },
+        { "export-client", required_argument, NULL, 1025 },
+        { "export-dir", required_argument, NULL, 1026 },
         { "version",   no_argument,       NULL, 'V' },
         { "help",      no_argument,       NULL, 'h' },
         { NULL,        0,                 NULL, 0   }
@@ -616,6 +768,15 @@ int main(int argc, char *argv[])
     const char *add_client = NULL;
     const char *remove_client = NULL;
     const char *add_route = NULL;
+    const char *reset_usage = NULL;
+    const char *credit_usage = NULL;
+    const char *add_usage = NULL;
+    const char *mib_arg = NULL;
+    const char *server_address = NULL;
+    const char *write_client_path = NULL;
+    const char *export_client = NULL;
+    const char *export_dir = NULL;
+    uint64_t mib_value = 0;
     int delegate = 0;
     int opt;
 
@@ -692,6 +853,30 @@ int main(int argc, char *argv[])
                 break;
             case 1017:
                 delegate = 1;
+                break;
+            case 1019:
+                reset_usage = optarg;
+                break;
+            case 1020:
+                credit_usage = optarg;
+                break;
+            case 1021:
+                add_usage = optarg;
+                break;
+            case 1022:
+                mib_arg = optarg;
+                break;
+            case 1023:
+                server_address = optarg;
+                break;
+            case 1024:
+                write_client_path = optarg;
+                break;
+            case 1025:
+                export_client = optarg;
+                break;
+            case 1026:
+                export_dir = optarg;
                 break;
             case 'V':
                 printf("pipesix %s (protocol %d)\n",
@@ -812,6 +997,67 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    if ((reset_usage != NULL) + (credit_usage != NULL) +
+            (add_usage != NULL) > 1) {
+        fprintf(stderr, "Error: --reset-usage, --credit-usage and "
+                        "--add-usage are mutually exclusive\n");
+        return EXIT_FAILURE;
+    }
+
+    if (mib_arg != NULL) {
+        if (parse_u64(mib_arg, &mib_value) != 0 ||
+            mib_value > 1048576u) {
+            fprintf(stderr, "Error: --mib must be 0-1048576\n");
+            return EXIT_FAILURE;
+        }
+    }
+
+    if ((credit_usage != NULL || add_usage != NULL) && mib_arg == NULL) {
+        fprintf(stderr, "Error: --credit-usage and --add-usage need "
+                        "--mib <MiB>\n");
+        return EXIT_FAILURE;
+    }
+
+    if (reset_usage != NULL && mib_arg != NULL) {
+        fprintf(stderr, "Error: --mib is not valid with --reset-usage\n");
+        return EXIT_FAILURE;
+    }
+
+    if (mib_arg != NULL && reset_usage == NULL && credit_usage == NULL &&
+        add_usage == NULL) {
+        fprintf(stderr, "Error: --mib requires --credit-usage or "
+                        "--add-usage\n");
+        return EXIT_FAILURE;
+    }
+
+    if (write_client_path != NULL && add_client == NULL &&
+        export_client == NULL) {
+        fprintf(stderr, "Error: --write-client-config requires "
+                        "--add-client or --export-client\n");
+        return EXIT_FAILURE;
+    }
+
+    if (export_dir != NULL && export_client == NULL && !rotate_all) {
+        fprintf(stderr, "Error: --export-dir requires --export-client or "
+                        "--rotate-all\n");
+        return EXIT_FAILURE;
+    }
+
+    if (export_client != NULL &&
+        (add_client != NULL || remove_client != NULL || rotate_all ||
+         set_limit != NULL || clear_limit != NULL)) {
+        fprintf(stderr, "Error: --export-client cannot be combined with "
+                        "provisioning or rotation commands\n");
+        return EXIT_FAILURE;
+    }
+
+    if (export_client != NULL && write_client_path == NULL &&
+        export_dir == NULL) {
+        fprintf(stderr, "Error: --export-client needs --write-client-config "
+                        "or --export-dir\n");
+        return EXIT_FAILURE;
+    }
+
     /*
      * The history is an append-only file, so this query reads it directly
      * and works without a running server (and on a copy of the machine).
@@ -857,14 +1103,15 @@ int main(int argc, char *argv[])
             for (i = 0; i < count; i++) {
                 char start[16] = "?";
                 char end[16] = "?";
+                char kind[24];
 
                 (void)policy_format_date((time_t)rows[i].start_unix, start,
                                          sizeof(start));
                 (void)policy_format_date((time_t)rows[i].end_unix, end,
                                          sizeof(end));
+                policy_period_name(rows[i].kind, kind, sizeof(kind));
                 printf("%s,%s,%s,%s,%llu\n", rows[i].id, start, end,
-                       rows[i].monthly ? "monthly" : "daily",
-                       (unsigned long long)rows[i].used);
+                       kind, (unsigned long long)rows[i].used);
             }
             free(rows);
             return EXIT_SUCCESS;
@@ -885,6 +1132,7 @@ int main(int argc, char *argv[])
                    "\"history\":[", config_esc);
             for (i = 0; i < count; i++) {
                 char id_esc[128];
+                char kind[24];
 
                 if (control_json_escape(rows[i].id, id_esc,
                                         sizeof(id_esc)) != 0) {
@@ -894,14 +1142,14 @@ int main(int argc, char *argv[])
                     return EXIT_FAILURE;
                 }
 
+                policy_period_name(rows[i].kind, kind, sizeof(kind));
                 printf("%s{\"client_id\":\"%s\","
                        "\"period_start_unix\":%lld,"
                        "\"period_end_unix\":%lld,\"period\":\"%s\","
                        "\"used_bytes\":%llu}",
                        i > 0 ? "," : "", id_esc,
                        (long long)rows[i].start_unix,
-                       (long long)rows[i].end_unix,
-                       rows[i].monthly ? "monthly" : "daily",
+                       (long long)rows[i].end_unix, kind,
                        (unsigned long long)rows[i].used);
             }
             printf("]}\n");
@@ -915,14 +1163,15 @@ int main(int argc, char *argv[])
         for (i = 0; i < count; i++) {
             char start[16] = "?";
             char end[16] = "?";
+            char kind[24];
 
             (void)policy_format_date((time_t)rows[i].start_unix, start,
                                      sizeof(start));
             (void)policy_format_date((time_t)rows[i].end_unix, end,
                                      sizeof(end));
+            policy_period_name(rows[i].kind, kind, sizeof(kind));
             printf("  %s %s..%s (%s) used=%llu B\n", rows[i].id, start,
-                   end, rows[i].monthly ? "monthly" : "daily",
-                   (unsigned long long)rows[i].used);
+                   end, kind, (unsigned long long)rows[i].used);
         }
         if (total > count) {
             printf("  ... %d older record(s) not shown\n", total - count);
@@ -937,9 +1186,10 @@ int main(int argc, char *argv[])
      * starting a second one, so they are answered before the
      * configuration is loaded (and before anything is logged to stderr).
      */
-    if (status_only || kick_id != NULL || metrics_only || usage_only) {
+    if (status_only || kick_id != NULL || metrics_only || usage_only ||
+        reset_usage != NULL || credit_usage != NULL || add_usage != NULL) {
         char reply[CONTROL_MAX_REPLY];
-        char request[CONFIG_MAX_CLIENT_ID + 16];
+        char request[CONFIG_MAX_CLIENT_ID + 64];
 
         if (kick_id != NULL) {
             if (strlen(kick_id) >= CONFIG_MAX_CLIENT_ID) {
@@ -947,6 +1197,14 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
             snprintf(request, sizeof(request), "kick %s", kick_id);
+        } else if (reset_usage != NULL) {
+            snprintf(request, sizeof(request), "usage-reset %s", reset_usage);
+        } else if (credit_usage != NULL) {
+            snprintf(request, sizeof(request), "usage-credit %s %llu",
+                     credit_usage, (unsigned long long)mib_value);
+        } else if (add_usage != NULL) {
+            snprintf(request, sizeof(request), "usage-add %s %llu",
+                     add_usage, (unsigned long long)mib_value);
         } else if (usage_only) {
             snprintf(request, sizeof(request), "usage%s",
                      csv_output ? " csv" : (json_output ? " json" : ""));
@@ -1000,6 +1258,29 @@ int main(int argc, char *argv[])
     if (config_validate(&config) != 0) {
         log_error("Configuration validation failed");
         return EXIT_FAILURE;
+    }
+
+    if (export_client != NULL) {
+        char path[CONFIG_PATH_MAX];
+
+        if (export_dir != NULL) {
+            if (snprintf(path, sizeof(path), "%s/%s.conf", export_dir,
+                         export_client) >= (int)sizeof(path)) {
+                fprintf(stderr, "Error: export path is too long\n");
+                return EXIT_FAILURE;
+            }
+        } else {
+            snprintf(path, sizeof(path), "%s", write_client_path);
+        }
+
+        if (write_client_config(&config, export_client, server_address,
+                                path) != 0) {
+            return EXIT_FAILURE;
+        }
+
+        printf("Wrote client configuration for '%s' to %s\n",
+               export_client, path);
+        return EXIT_SUCCESS;
     }
 
     if (add_client != NULL || remove_client != NULL) {
@@ -1066,6 +1347,13 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
 
+            /* Provisioning writes the file; adopt it before exporting. */
+            if (config_reload_runtime(&config) != 0) {
+                fprintf(stderr, "Error: cannot reload '%s' after adding "
+                                "client '%s'\n", config_path, add_client);
+                return EXIT_FAILURE;
+            }
+
             printf("Added client '%s' to %s\n\n", add_client, config_path);
             printf("  client_id = %s\n", add_client);
             printf("  secret    = %s\n", secret);
@@ -1090,6 +1378,15 @@ int main(int argc, char *argv[])
                 printf("  client_quota_warn = %s %llu\n", add_client,
                        (unsigned long long)limits.warn_percent);
             }
+            if (write_client_path != NULL) {
+                if (write_client_config(&config, add_client, server_address,
+                                        write_client_path) != 0) {
+                    return EXIT_FAILURE;
+                }
+                printf("\nWrote a complete client configuration to %s\n",
+                       write_client_path);
+            }
+
             printf("\nSet these on the client host and start it; the key is "
                    "printed once\nand is not stored anywhere else.\n");
         } else {
@@ -1155,9 +1452,12 @@ int main(int argc, char *argv[])
             }
 
             if (limits->quota_mib > 0) {
+                char period_name[24];
+
+                policy_period_name(config.quota_period, period_name,
+                                   sizeof(period_name));
                 printf("  quota: %llu MiB per %s\n",
-                       (unsigned long long)limits->quota_mib,
-                       config.quota_period ? "month" : "day");
+                       (unsigned long long)limits->quota_mib, period_name);
             } else {
                 printf("  quota: unlimited\n");
             }
@@ -1187,6 +1487,25 @@ int main(int argc, char *argv[])
             return EXIT_FAILURE;
         }
         report_rotated_keys(&config);
+
+        if (export_dir != NULL) {
+            int i;
+
+            for (i = 0; i < config.client_count; i++) {
+                char path[CONFIG_PATH_MAX];
+
+                if (snprintf(path, sizeof(path), "%s/%s.conf", export_dir,
+                             config.clients[i].id) >= (int)sizeof(path) ||
+                    write_client_config(&config, config.clients[i].id,
+                                        server_address, path) != 0) {
+                    fprintf(stderr, "Error: cannot export client '%s'\n",
+                            config.clients[i].id);
+                    return EXIT_FAILURE;
+                }
+                printf("Wrote client configuration for '%s' to %s\n",
+                       config.clients[i].id, path);
+            }
+        }
 
 #if defined(_WIN32)
         /* No signals: the running instance is reached through its events. */

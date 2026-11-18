@@ -14,6 +14,7 @@
 
 #include "config.h"
 #include "crypto.h"
+#include "policy.h"
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -489,6 +490,86 @@ static int set_client_route(pipesix_config_t *config, const char *value)
 }
 
 /*
+ * Parse "client_allow = <id> <prefix>" or "client_deny = <id> <prefix>".
+ *
+ * An allow list is closed: once a client has one entry, destinations
+ * outside it are dropped. The deny list is checked first, so a specific
+ * deny can carve a hole out of a broader allow. The 'client' line must
+ * come first, like client_route.
+ */
+static int set_client_acl(pipesix_config_t *config, const char *value,
+                          int deny)
+{
+    char work[CONFIG_MAX_CLIENT_ID + CONFIG_MAX_ADDRESS + 2];
+    pipesix_client_cred_t *cred = NULL;
+    struct in6_addr parsed;
+    char *id;
+    char *prefix;
+    char *slash;
+    size_t len;
+    int prefix_len = 128;
+    int i;
+
+    if (value == NULL) return -1;
+
+    len = strlen(value);
+    if (len == 0 || len >= sizeof(work)) return -1;
+    memcpy(work, value, len + 1);
+
+    id = work;
+    while (isspace((unsigned char)*id)) id++;
+
+    prefix = id;
+    while (*prefix != '\0' && !isspace((unsigned char)*prefix)) prefix++;
+    if (*prefix == '\0') return -1;
+    *prefix = '\0';
+    prefix++;
+    while (isspace((unsigned char)*prefix)) prefix++;
+
+    len = strlen(prefix);
+    while (len > 0 && isspace((unsigned char)prefix[len - 1])) {
+        prefix[--len] = '\0';
+    }
+
+    if (!valid_client_id(id) || prefix[0] == '\0') return -1;
+
+    slash = strchr(prefix, '/');
+    if (slash != NULL) {
+        *slash = '\0';
+        if (parse_int(slash + 1, &prefix_len) != 0) return -1;
+    }
+    if (prefix_len < 1 || prefix_len > 128) return -1;
+
+    for (i = 0; i < config->client_count; i++) {
+        if (strcmp(config->clients[i].id, id) == 0) {
+            cred = &config->clients[i];
+            break;
+        }
+    }
+    if (cred == NULL) {
+        log_error("client_allow/client_deny: unknown client '%s' (the "
+                  "'client' line must come first)", id);
+        return -1;
+    }
+
+    if (inet_pton(AF_INET6, prefix, &parsed) != 1) return -1;
+
+    if (deny) {
+        if (cred->deny_count >= CONFIG_MAX_ACL_PREFIXES) return -1;
+        memcpy(cred->deny[cred->deny_count], &parsed, sizeof(parsed));
+        cred->deny_len[cred->deny_count] = prefix_len;
+        cred->deny_count++;
+    } else {
+        if (cred->allow_count >= CONFIG_MAX_ACL_PREFIXES) return -1;
+        memcpy(cred->allow[cred->allow_count], &parsed, sizeof(parsed));
+        cred->allow_len[cred->allow_count] = prefix_len;
+        cred->allow_count++;
+    }
+
+    return 0;
+}
+
+/*
  * Read and write the first 64 bits of an IPv6 address in network order.
  */
 static uint64_t load_be64(const uint8_t *p)
@@ -808,6 +889,15 @@ static int config_set_value(pipesix_config_t *config, const char *key,
     if (strcmp(key, "secret") == 0) {
         return copy_string(config->secret, CONFIG_MAX_SECRET, value);
     }
+    if (strcmp(key, "secret_file") == 0) {
+        return copy_string(config->secret_file, CONFIG_PATH_MAX, value);
+    }
+    if (strcmp(key, "user") == 0) {
+        return copy_string(config->user, CONFIG_MAX_USER, value);
+    }
+    if (strcmp(key, "group") == 0) {
+        return copy_string(config->group, CONFIG_MAX_GROUP, value);
+    }
     if (strcmp(key, "keepalive") == 0) {
         return set_int_range(&config->keepalive, value, 0, 3600);
     }
@@ -864,19 +954,43 @@ static int config_set_value(pipesix_config_t *config, const char *key,
     if (strcmp(key, "client_quota_warn") == 0) {
         return set_client_policy(config, value, POLICY_WARN);
     }
+    if (strcmp(key, "client_allow") == 0) {
+        return set_client_acl(config, value, 0);
+    }
+    if (strcmp(key, "client_deny") == 0) {
+        return set_client_acl(config, value, 1);
+    }
     if (strcmp(key, "strict_source") == 0) {
         return set_bool(&config->strict_source, value);
     }
+    if (strcmp(key, "client_isolation") == 0) {
+        return set_bool(&config->client_isolation, value);
+    }
     if (strcmp(key, "quota_period") == 0) {
         if (strcasecmp(value, "daily") == 0) {
-            config->quota_period = 0;
+            config->quota_period = POLICY_PERIOD_DAILY;
             return 0;
         }
         if (strcasecmp(value, "monthly") == 0) {
-            config->quota_period = 1;
+            config->quota_period = POLICY_PERIOD_MONTHLY;
+            return 0;
+        }
+        if (strcasecmp(value, "weekly") == 0) {
+            config->quota_period = POLICY_PERIOD_WEEKLY;
+            return 0;
+        }
+        if (strcasecmp(value, "custom") == 0) {
+            config->quota_period = 3; /* resolved after parsing */
             return 0;
         }
         return -1;
+    }
+    if (strcmp(key, "quota_period_days") == 0) {
+        if (set_int_range(&config->quota_period_days, value, 1, 365) != 0) {
+            return -1;
+        }
+        config->quota_period = 3; /* custom; resolved after parsing */
+        return 0;
     }
     if (strcmp(key, "quota_action") == 0) {
         if (strcasecmp(value, "drop") == 0) {
@@ -921,22 +1035,111 @@ static int config_set_value(pipesix_config_t *config, const char *key,
     return 0;
 }
 
-int config_load(const char *path, pipesix_config_t *config)
+/*
+ * Resolve an include path relative to the file that named it, so a
+ * configuration tree works regardless of the daemon's working directory.
+ */
+static int resolve_relative(const char *base, const char *value,
+                            char *out, size_t out_size)
+{
+    const char *slash;
+    size_t dir_len;
+
+    if (value == NULL || value[0] == '\0' || out == NULL || out_size == 0) {
+        return -1;
+    }
+
+    if (value[0] == '/' || base == NULL || strchr(base, '/') == NULL) {
+        return copy_string(out, out_size, value);
+    }
+
+    slash = strrchr(base, '/');
+    dir_len = (size_t)(slash - base) + 1;
+    if (dir_len >= out_size || strlen(value) >= out_size - dir_len) {
+        return -1;
+    }
+
+    memcpy(out, base, dir_len);
+    memcpy(out + dir_len, value, strlen(value) + 1);
+    return 0;
+}
+
+static int config_parse_file(pipesix_config_t *config, const char *path,
+                             int depth);
+
+/*
+ * Read the first non-empty, non-comment line of secret_file into the
+ * configuration's secret. A file is used instead of the config line so
+ * the credential can live in a 0600 file owned by the service account.
+ */
+static int load_secret_file(pipesix_config_t *config)
+{
+    char path[CONFIG_PATH_MAX];
+    char line[CONFIG_MAX_SECRET];
+    FILE *fp;
+    struct stat st;
+
+    if (config->secret_file[0] == '\0') {
+        return 0;
+    }
+
+    if (resolve_relative(config->config_path, config->secret_file, path,
+                         sizeof(path)) != 0) {
+        fprintf(stderr, "config_load: secret_file path is too long\n");
+        return -1;
+    }
+
+    fp = fopen(path, "r");
+    if (fp == NULL) {
+        fprintf(stderr, "config_load: cannot open secret_file '%s': %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+
+    if (stat(path, &st) == 0 &&
+        (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        log_warn("'secret_file' %s is readable by group or other; use "
+                 "mode 0600", path);
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *p = str_trim(line);
+
+        if (*p == '\0' || *p == '#') {
+            continue;
+        }
+        if (strlen(p) >= CONFIG_MAX_SECRET) {
+            fclose(fp);
+            fprintf(stderr, "config_load: secret_file '%s' line is too "
+                            "long\n", path);
+            return -1;
+        }
+
+        if (config->secret[0] != '\0' &&
+            strcmp(config->secret, p) != 0) {
+            log_warn("'secret_file' wins over the inline 'secret'");
+        }
+        snprintf(config->secret, sizeof(config->secret), "%s", p);
+        fclose(fp);
+        return 0;
+    }
+
+    fclose(fp);
+    fprintf(stderr, "config_load: secret_file '%s' is empty\n", path);
+    return -1;
+}
+
+static int config_parse_file(pipesix_config_t *config, const char *path,
+                             int depth)
 {
     FILE *fp;
     char line[4096];
     unsigned int line_num = 0;
 
-    if (config == NULL || path == NULL) {
-        fprintf(stderr, "config_load: invalid parameters\n");
+    if (depth > CONFIG_MAX_INCLUDE_DEPTH) {
+        fprintf(stderr, "config_load: include nesting exceeds %d levels\n",
+                CONFIG_MAX_INCLUDE_DEPTH);
         return -1;
-    }
-
-    config_set_defaults(config);
-
-    if (copy_string(config->config_path, sizeof(config->config_path),
-                    path) != 0) {
-        config->config_path[0] = '\0';
     }
 
     fp = fopen(path, "r");
@@ -992,6 +1195,23 @@ int config_load(const char *path, pipesix_config_t *config)
             return -1;
         }
 
+        if (strcmp(key, "include") == 0) {
+            char included[CONFIG_PATH_MAX];
+
+            if (resolve_relative(path, value, included,
+                                 sizeof(included)) != 0) {
+                fprintf(stderr, "config_load: %s:%u: include path is too "
+                                "long\n", path, line_num);
+                fclose(fp);
+                return -1;
+            }
+            if (config_parse_file(config, included, depth + 1) != 0) {
+                fclose(fp);
+                return -1;
+            }
+            continue;
+        }
+
         if (config_set_value(config, key, value) != 0) {
             fprintf(stderr,
                     "config_load: %s:%u: invalid value for '%s'\n",
@@ -1002,6 +1222,40 @@ int config_load(const char *path, pipesix_config_t *config)
     }
 
     fclose(fp);
+    return 0;
+}
+
+int config_load(const char *path, pipesix_config_t *config)
+{
+    if (config == NULL || path == NULL) {
+        fprintf(stderr, "config_load: invalid parameters\n");
+        return -1;
+    }
+
+    config_set_defaults(config);
+
+    if (copy_string(config->config_path, sizeof(config->config_path),
+                    path) != 0) {
+        config->config_path[0] = '\0';
+    }
+
+    if (config_parse_file(config, path, 0) != 0) {
+        return -1;
+    }
+
+    if (strcmp(config->mode, "client") == 0 &&
+        load_secret_file(config) != 0) {
+        return -1;
+    }
+
+    if (config->quota_period == 3) {
+        if (config->quota_period_days <= 0) {
+            fprintf(stderr, "config_load: %s: 'quota_period = custom' "
+                            "needs 'quota_period_days'\n", path);
+            return -1;
+        }
+        config->quota_period = -config->quota_period_days;
+    }
 
     if (split_remote_endpoints(config) != 0) {
         fprintf(stderr,
@@ -1099,6 +1353,13 @@ int config_validate(const pipesix_config_t *config)
         return -1;
     }
 
+    if (config->quota_period > POLICY_PERIOD_WEEKLY ||
+        config->quota_period == 3 || config->quota_period < -365) {
+        log_error("Configuration validation failed: 'quota_period' is "
+                  "invalid");
+        return -1;
+    }
+
     {
         int i;
 
@@ -1112,6 +1373,19 @@ int config_validate(const pipesix_config_t *config)
             }
         }
     }
+
+    if (config->group[0] != '\0' && config->user[0] == '\0') {
+        log_error("Configuration validation failed: 'group' needs 'user'");
+        return -1;
+    }
+
+#if defined(_WIN32)
+    if (config->user[0] != '\0' || config->group[0] != '\0') {
+        log_error("Configuration validation failed: 'user'/'group' are "
+                  "only supported on POSIX");
+        return -1;
+    }
+#endif
 
     if (strcmp(config->mode, "client") == 0) {
         if (strlen(config->remote_address) == 0) {
@@ -1348,6 +1622,10 @@ void config_dump(const pipesix_config_t *config)
         case LOG_FATAL: level_str = "fatal"; break;
     }
 
+    char quota_name[24];
+
+    policy_period_name(config->quota_period, quota_name, sizeof(quota_name));
+
     log_info("Configuration:");
     log_info("  mode            = %s", config->mode);
     log_info("  tun_name        = %s", config->tun_name);
@@ -1375,6 +1653,15 @@ void config_dump(const pipesix_config_t *config)
 
     log_info("  secret          = %s",
              (config->secret[0] != '\0') ? "(set)" : "(not set)");
+    if (config->secret_file[0] != '\0') {
+        log_info("  secret_file     = %s", config->secret_file);
+    }
+    if (config->user[0] != '\0') {
+        log_info("  user            = %s", config->user);
+    }
+    if (config->group[0] != '\0') {
+        log_info("  group           = %s", config->group);
+    }
     log_info("  client_id       = %s",
              (config->client_id[0] != '\0') ? config->client_id : "(not set)");
 
@@ -1397,12 +1684,19 @@ void config_dump(const pipesix_config_t *config)
 
             log_info("    client: %s route %s/%d", config->clients[i].id,
                      prefix_str, config->clients[i].prefix_len);
+            if (config->clients[i].allow_count > 0 ||
+                config->clients[i].deny_count > 0) {
+                log_info("      acl: %d allow, %d deny",
+                         config->clients[i].allow_count,
+                         config->clients[i].deny_count);
+            }
         }
 
         log_info("  strict_source   = %s",
                  config->strict_source ? "on" : "off");
-        log_info("  quota_period    = %s",
-                 config->quota_period ? "monthly" : "daily");
+        log_info("  client_isolation = %s",
+                 config->client_isolation ? "on" : "off");
+        log_info("  quota_period    = %s", quota_name);
         log_info("  quota_action    = %s (grace %llu MiB, throttle %llu "
                  "kbit/s)",
                  config->quota_throttle ? "throttle" : "drop",
@@ -1424,7 +1718,7 @@ void config_dump(const pipesix_config_t *config)
                      config->policies[i].id,
                      (unsigned long long)config->policies[i].rate_kbps,
                      (unsigned long long)config->policies[i].quota_mib,
-                     config->quota_period ? "month" : "day", warn);
+                     quota_name, warn);
         }
     }
     log_info("  keepalive       = %d s", config->keepalive);
@@ -1503,9 +1797,21 @@ int config_reload_runtime(pipesix_config_t *config)
         memcpy(config->policies, fresh.policies, sizeof(config->policies));
 
         config->strict_source = fresh.strict_source;
+        config->client_isolation = fresh.client_isolation;
         config->quota_throttle = fresh.quota_throttle;
         config->quota_grace_mib = fresh.quota_grace_mib;
         config->quota_throttle_kbps = fresh.quota_throttle_kbps;
+        config->quota_period = fresh.quota_period;
+        config->quota_period_days = fresh.quota_period_days;
+
+        config->allow_client_count = fresh.allow_client_count;
+        memcpy(config->allow_client, fresh.allow_client,
+               sizeof(config->allow_client));
+
+        copy_string(config->quota_state, sizeof(config->quota_state),
+                    fresh.quota_state);
+        copy_string(config->usage_history, sizeof(config->usage_history),
+                    fresh.usage_history);
     } else {
         /*
          * A client's own identity and key are reloadable as well; the
@@ -1514,7 +1820,20 @@ int config_reload_runtime(pipesix_config_t *config)
          */
         memcpy(config->client_id, fresh.client_id, sizeof(config->client_id));
         memcpy(config->secret, fresh.secret, sizeof(config->secret));
+
+        copy_string(config->remote_address, sizeof(config->remote_address),
+                    fresh.remote_address);
+        config->remote_count = fresh.remote_count;
+        memcpy(config->remote_endpoints, fresh.remote_endpoints,
+               sizeof(config->remote_endpoints));
+        config->remote_port = fresh.remote_port;
     }
+
+    copy_string(config->metrics_address, sizeof(config->metrics_address),
+                fresh.metrics_address);
+    config->metrics_port = fresh.metrics_port;
+    copy_string(config->metrics_token, sizeof(config->metrics_token),
+                fresh.metrics_token);
 
     return 0;
 }
@@ -1838,7 +2157,9 @@ static int line_names_client(const char *line, const char *id,
 
     is_client = key_len == 6u && memcmp(p, "client", 6) == 0;
     is_route = key_len == 12u && memcmp(p, "client_route", 12) == 0;
-    is_limit = (key_len == 12u && memcmp(p, "client_quota", 12) == 0) ||
+    is_limit = (key_len == 12u && memcmp(p, "client_allow", 12) == 0) ||
+               (key_len == 11u && memcmp(p, "client_deny", 11) == 0) ||
+               (key_len == 12u && memcmp(p, "client_quota", 12) == 0) ||
                (key_len == 17u &&
                 memcmp(p, "client_rate_limit", 17) == 0) ||
                (key_len == 17u &&
