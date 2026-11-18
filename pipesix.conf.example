@@ -38,11 +38,15 @@ tun_mtu       = 1500
 # ---------------------------------------------------------------------------
 # These settings are used when mode = client.
 #
-# remote_address:  IP address or hostname of the VPS server
+# remote_address:  IP address(es) or hostname(s) of the VPS relay. A
+#                  comma-separated list is tried in order; when one stops
+#                  answering, the client moves to the next one. Up to 8
+#                  endpoints, all on remote_port.
 # remote_port:     UDP port of the VPS server (default: 8899)
 #
 remote_address = 203.0.113.1
 remote_port    = 8899
+#remote_address = relay-a.example, relay-b.example
 
 # ---------------------------------------------------------------------------
 # Local Bind (Server Mode)
@@ -107,10 +111,23 @@ secret    = replace-this-with-pipesix-genkey-output
 #   client_quota      = <id> <MiB>       e.g. 10240 = 10 GiB per period
 #   client_quota_warn = <id> <percent>   e.g. 90 = warn at 90%
 #
-#quota_period      = daily
-#client_rate_limit = client1 50000
-#client_quota      = client1 10240
-#client_quota_warn = client1 90
+# quota_action selects what happens after the quota (and grace) is used:
+# drop (default) or throttle to quota_throttle_kbps in each direction.
+# quota_grace is extra MiB allowed before that action starts.
+#
+#quota_period        = daily
+#quota_action        = drop
+#quota_grace         = 0
+#quota_throttle_kbps = 64
+#client_rate_limit   = client1 50000
+#client_quota        = client1 10240
+#client_quota_warn   = client1 90
+#
+# strict_source drops data whose inner IPv6 source is outside the client's
+# client_route. It is off by default so an existing misconfigured client
+# keeps working; turn it on when every client has an authoritative route.
+#
+#strict_source = off
 #
 # quota_state: file that keeps the per-client usage across a restart
 # (server mode, optional). The current period's counters are restored at
@@ -170,10 +187,11 @@ stats_interval  = 60
 # log_level: Controls verbosity. Options: debug, info, warn, error, fatal
 #
 # SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout,
-# stats_interval, the per-client limits and the credentials: the
+# stats_interval, strict_source, quota_action/quota_grace/
+# quota_throttle_kbps, the per-client limits and the credentials: the
 # 'client'/'client_route' table on a server, this client's own 'secret' and
 # 'client_id' in client mode, so a key can be rotated without a restart.
-# Interface, endpoint, mode, allow_client, metrics_* and quota_state changes
-# take effect after a restart.
+# Interface, remote endpoint list, mode, allow_client, metrics_*, quota_period
+# and quota_state changes take effect after a restart.
 #
 log_level = info

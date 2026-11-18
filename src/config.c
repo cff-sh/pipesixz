@@ -115,6 +115,103 @@ static int set_int_range(int *dst, const char *value, int min, int max)
     return 0;
 }
 
+static int set_u64_range(uint64_t *dst, const char *value,
+                         uint64_t min, uint64_t max)
+{
+    int parsed;
+
+    if (parse_int(value, &parsed) != 0 || parsed < 0 ||
+        (uint64_t)parsed < min || (uint64_t)parsed > max) {
+        return -1;
+    }
+
+    *dst = (uint64_t)parsed;
+    return 0;
+}
+
+/*
+ * Accept the usual spellings for a boolean configuration value.
+ */
+static int set_bool(int *dst, const char *value)
+{
+    if (strcasecmp(value, "on") == 0 ||
+        strcasecmp(value, "true") == 0 ||
+        strcasecmp(value, "yes") == 0 ||
+        strcmp(value, "1") == 0) {
+        *dst = 1;
+        return 0;
+    }
+
+    if (strcasecmp(value, "off") == 0 ||
+        strcasecmp(value, "false") == 0 ||
+        strcasecmp(value, "no") == 0 ||
+        strcmp(value, "0") == 0) {
+        *dst = 0;
+        return 0;
+    }
+
+    return -1;
+}
+
+/*
+ * Split 'remote_address' into ordered endpoints.
+ *
+ * A comma separated list is accepted; whitespace around each entry is
+ * ignored. Keeping the order matters: the client tries them in the order
+ * written and only moves on when one stops answering.
+ */
+static int split_remote_endpoints(pipesix_config_t *config)
+{
+    char work[CONFIG_MAX_REMOTE_LIST];
+    char *p;
+    size_t len;
+
+    config->remote_count = 0;
+
+    if (config->remote_address[0] == '\0') {
+        return 0;
+    }
+
+    len = strlen(config->remote_address);
+    if (len >= sizeof(work)) {
+        return -1;
+    }
+    memcpy(work, config->remote_address, len + 1);
+
+    p = work;
+    while (*p != '\0') {
+        char *start = p;
+        char *end;
+
+        while (*p != '\0' && *p != ',') {
+            p++;
+        }
+        if (*p == ',') {
+            *p = '\0';
+            p++;
+        }
+
+        start = str_trim(start);
+        end = start + strlen(start);
+        while (end > start && isspace((unsigned char)end[-1])) {
+            *--end = '\0';
+        }
+
+        if (*start == '\0' || strlen(start) >= CONFIG_MAX_ADDRESS) {
+            return -1;
+        }
+        if (config->remote_count >= CONFIG_MAX_REMOTE_ENDPOINTS) {
+            return -1;
+        }
+
+        memcpy(config->remote_endpoints[config->remote_count], start,
+               strlen(start) + 1);
+        config->remote_count++;
+    }
+
+    return config->remote_count > 0 ? 0 : -1;
+}
+
 /*
  * Set default values for all configuration fields.
  */
@@ -135,6 +232,7 @@ static void config_set_defaults(pipesix_config_t *config)
     config->peer_timeout   = CONFIG_DEFAULT_PEER_TIMEOUT;
     config->stats_interval = CONFIG_DEFAULT_STATS_INTERVAL;
     config->metrics_port   = CONFIG_DEFAULT_METRICS_PORT;
+    config->quota_throttle_kbps = CONFIG_DEFAULT_QUOTA_THROTTLE_KBPS;
     config->log_level      = CONFIG_DEFAULT_LOG_LEVEL;
     config->policy_count   = 0;
 }
@@ -695,7 +793,8 @@ static int config_set_value(pipesix_config_t *config, const char *key,
         return set_int_range(&config->tun_mtu, value, 0, 65535);
     }
     if (strcmp(key, "remote_address") == 0) {
-        return copy_string(config->remote_address, CONFIG_MAX_ADDRESS, value);
+        return copy_string(config->remote_address, CONFIG_MAX_REMOTE_LIST,
+                           value);
     }
     if (strcmp(key, "remote_port") == 0) {
         return set_int_range(&config->remote_port, value, 1, 65535);
@@ -765,6 +864,9 @@ static int config_set_value(pipesix_config_t *config, const char *key,
     if (strcmp(key, "client_quota_warn") == 0) {
         return set_client_policy(config, value, POLICY_WARN);
     }
+    if (strcmp(key, "strict_source") == 0) {
+        return set_bool(&config->strict_source, value);
+    }
     if (strcmp(key, "quota_period") == 0) {
         if (strcasecmp(value, "daily") == 0) {
             config->quota_period = 0;
@@ -775,6 +877,24 @@ static int config_set_value(pipesix_config_t *config, const char *key,
             return 0;
         }
         return -1;
+    }
+    if (strcmp(key, "quota_action") == 0) {
+        if (strcasecmp(value, "drop") == 0) {
+            config->quota_throttle = 0;
+            return 0;
+        }
+        if (strcasecmp(value, "throttle") == 0) {
+            config->quota_throttle = 1;
+            return 0;
+        }
+        return -1;
+    }
+    if (strcmp(key, "quota_grace") == 0) {
+        return set_u64_range(&config->quota_grace_mib, value, 0, 1048576);
+    }
+    if (strcmp(key, "quota_throttle_kbps") == 0) {
+        return set_u64_range(&config->quota_throttle_kbps, value, 1,
+                             100000000);
     }
     if (strcmp(key, "log_level") == 0) {
         log_level_t level;
@@ -871,6 +991,15 @@ int config_load(const char *path, pipesix_config_t *config)
     }
 
     fclose(fp);
+
+    if (split_remote_endpoints(config) != 0) {
+        fprintf(stderr,
+                "config_load: %s: invalid 'remote_address' list (at most "
+                "%d comma separated endpoints)\n", path,
+                CONFIG_MAX_REMOTE_ENDPOINTS);
+        return -1;
+    }
+
     return 0;
 }
 
@@ -976,6 +1105,13 @@ int config_validate(const pipesix_config_t *config)
     if (strcmp(config->mode, "client") == 0) {
         if (strlen(config->remote_address) == 0) {
             log_error("Configuration validation failed: 'remote_address' is required in client mode");
+            return -1;
+        }
+        if (config->remote_count < 1 ||
+            config->remote_count > CONFIG_MAX_REMOTE_ENDPOINTS) {
+            log_error("Configuration validation failed: "
+                      "'remote_address' must name 1-%d endpoints",
+                      CONFIG_MAX_REMOTE_ENDPOINTS);
             return -1;
         }
         if (config->remote_port < 1 || config->remote_port > 65535) {
@@ -1209,7 +1345,13 @@ void config_dump(const pipesix_config_t *config)
     log_info("  tun_mtu         = %d", config->tun_mtu);
 
     if (strcmp(config->mode, "client") == 0) {
+        int i;
+
         log_info("  remote_address  = %s", config->remote_address);
+        for (i = 0; i < config->remote_count; i++) {
+            log_info("    endpoint %d: %s", i + 1,
+                     config->remote_endpoints[i]);
+        }
         log_info("  remote_port     = %d", config->remote_port);
     }
 
@@ -1246,8 +1388,15 @@ void config_dump(const pipesix_config_t *config)
                      prefix_str, config->clients[i].prefix_len);
         }
 
+        log_info("  strict_source   = %s",
+                 config->strict_source ? "on" : "off");
         log_info("  quota_period    = %s",
                  config->quota_period ? "monthly" : "daily");
+        log_info("  quota_action    = %s (grace %llu MiB, throttle %llu "
+                 "kbit/s)",
+                 config->quota_throttle ? "throttle" : "drop",
+                 (unsigned long long)config->quota_grace_mib,
+                 (unsigned long long)config->quota_throttle_kbps);
 
         for (i = 0; i < config->policy_count; i++) {
             char warn[48];
@@ -1339,6 +1488,11 @@ int config_reload_runtime(pipesix_config_t *config)
          */
         config->policy_count = fresh.policy_count;
         memcpy(config->policies, fresh.policies, sizeof(config->policies));
+
+        config->strict_source = fresh.strict_source;
+        config->quota_throttle = fresh.quota_throttle;
+        config->quota_grace_mib = fresh.quota_grace_mib;
+        config->quota_throttle_kbps = fresh.quota_throttle_kbps;
     } else {
         /*
          * A client's own identity and key are reloadable as well; the

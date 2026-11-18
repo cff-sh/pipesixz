@@ -944,6 +944,108 @@ static void test_config_credentials(void)
     check(config_validate(&config) != 0, "client without secret rejected");
 }
 
+static void test_strict_failover_and_quota_config(void)
+{
+    static const char server_config[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "client_quota = alice 100\n"
+        "strict_source = on\n"
+        "quota_action = throttle\n"
+        "quota_grace = 128\n"
+        "quota_throttle_kbps = 32\n";
+    static const char client_config[] =
+        "mode = client\n"
+        "tun_address = fd00::2/64\n"
+        "remote_address = relay-a.example, 2001:db8::5 , relay-b.example\n"
+        "client_id = alice\n"
+        "secret = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+    static const char too_many_endpoints[] =
+        "mode = client\n"
+        "tun_address = fd00::2/64\n"
+        "remote_address = a1, a2, a3, a4, a5, a6, a7, a8, a9\n"
+        "client_id = alice\n"
+        "secret = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+    static const char bad_action[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "quota_action = block\n";
+    static const char bad_strict[] =
+        "mode = server\n"
+        "tun_address = fd00::1/64\n"
+        "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "strict_source = maybe\n";
+    pipesix_config_t config;
+    char path[64];
+
+    check(write_temp_file(server_config, path, sizeof(path)) == 0,
+          "write strict/quota fixture");
+    check(config_load(path, &config) == 0, "load strict/quota fixture");
+    unlink(path);
+    check(config.strict_source == 1, "strict_source parsed");
+    check(config.quota_throttle == 1, "quota_action=throttle parsed");
+    check(config.quota_grace_mib == 128u, "quota_grace parsed");
+    check(config.quota_throttle_kbps == 32u, "quota_throttle_kbps parsed");
+    check(config_validate(&config) == 0, "strict/quota config validates");
+
+    check(write_temp_file(client_config, path, sizeof(path)) == 0,
+          "write endpoint list fixture");
+    check(config_load(path, &config) == 0, "load endpoint list fixture");
+    unlink(path);
+    check(config.remote_count == 3, "three endpoints parsed");
+    check(strcmp(config.remote_endpoints[0], "relay-a.example") == 0,
+          "first endpoint is trimmed");
+    check(strcmp(config.remote_endpoints[1], "2001:db8::5") == 0,
+          "middle endpoint is trimmed");
+    check(strcmp(config.remote_endpoints[2], "relay-b.example") == 0,
+          "last endpoint is trimmed");
+    check(config_validate(&config) == 0, "endpoint list validates");
+
+    check(write_temp_file(too_many_endpoints, path, sizeof(path)) == 0,
+          "write too-many-endpoints fixture");
+    check(config_load(path, &config) != 0, "too many endpoints rejected");
+    unlink(path);
+
+    check(write_temp_file(bad_action, path, sizeof(path)) == 0,
+          "write bad quota action fixture");
+    check(config_load(path, &config) != 0, "unknown quota_action rejected");
+    unlink(path);
+
+    check(write_temp_file(bad_strict, path, sizeof(path)) == 0,
+          "write bad strict_source fixture");
+    check(config_load(path, &config) != 0, "unknown strict_source value rejected");
+    unlink(path);
+
+    {
+        static const char reloaded[] =
+            "mode = server\n"
+            "tun_address = fd00::1/64\n"
+            "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "client_quota = alice 100\n"
+            "strict_source = off\n"
+            "quota_action = drop\n"
+            "quota_grace = 16\n"
+            "quota_throttle_kbps = 8\n";
+
+        check(write_temp_file(server_config, path, sizeof(path)) == 0,
+              "write server settings for reload");
+        check(config_load(path, &config) == 0,
+              "load server settings before reload");
+        check(write_file(path, reloaded) == 0,
+              "rewrite server settings for reload");
+        check(config_reload_runtime(&config) == 0,
+              "reload strict and quota settings");
+        unlink(path);
+        check(config.strict_source == 0, "reload clears strict_source");
+        check(config.quota_throttle == 0, "reload changes quota_action");
+        check(config.quota_grace_mib == 16u, "reload updates quota_grace");
+        check(config.quota_throttle_kbps == 8u,
+              "reload updates quota_throttle_kbps");
+    }
+}
+
 static int overwrite_file(const char *path, const char *text)
 {
     FILE *fp = fopen(path, "w");
@@ -2328,6 +2430,7 @@ int main(void)
     test_replay_wrap();
     test_config();
     test_config_credentials();
+    test_strict_failover_and_quota_config();
     test_client_routes();
     test_client_policy();
     test_config_reload();

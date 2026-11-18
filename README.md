@@ -23,10 +23,15 @@ Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] �
   peer goes silent (`peer_timeout`). A relay that shuts down tells each
   client so in its own session, so a restart on the server reconnects in
   seconds instead of waiting out the timeout
+- Ordered relay failover: `remote_address` accepts a comma-separated list
+  and the client moves to the next endpoint when a relay stops answering
 - Automatic session renegotiation: a client re-handshakes when the server asks
   it to or after reconnecting, so a restart on either side never leaves a
   stale session blocking the tunnel
 - Server client allow-list (`allow_client`, up to 64 entries)
+- Optional strict source enforcement: `strict_source` drops data whose
+  inner source is outside the client's `client_route`, so a delegated
+  prefix is also a security boundary
 - SIGHUP reload of log level, timing settings and keys on both ends, so a
   credential can be rotated without restarting a process
 - Runtime client provisioning: `--add-client` and `--remove-client` rewrite
@@ -153,10 +158,11 @@ sudo pipesix --rotate-all         # new client keys, printed and reloaded
 ```
 
 `systemctl reload` sends SIGHUP. It applies `log_level`, `keepalive`,
-`peer_timeout`, `session_timeout`, `stats_interval`, the credentials (the
+`peer_timeout`, `session_timeout`, `stats_interval`, `strict_source`,
+`quota_action`, `quota_grace`, `quota_throttle_kbps`, the credentials (the
 `client`/`client_route` table on a server, the `secret` and `client_id` on a
 client) and the per-client limits, so a cap can be changed on a live tunnel.
-Interface, endpoint, mode, allow-list, `metrics_*`, `quota_state` and
+Interface, `remote_address`, mode, allow-list, `metrics_*`, `quota_state` and
 `quota_period` changes require a restart.
 
 ### Control channel
@@ -222,6 +228,23 @@ object with `rate_kbps`, `quota_mib`, `quota_period` and
 `quota_remaining_bytes` (the last is the budget left for the current period,
 or `0` without a quota).
 `--json` is only valid with `--status`.
+
+### Relay failover
+
+`remote_address` may name more than one relay, in the order to try them:
+
+```ini
+remote_address = relay-a.example, 2001:db8::5, relay-b.example
+remote_port    = 8899
+```
+
+All endpoints use the same `remote_port`, and up to eight are accepted. The
+client resolves and tries them at startup; when a relay stops answering, or
+answers the handshake but never completes it, the client moves on to the
+next one. Every reconnect attempt re-resolves DNS. It does not fail back
+automatically once a later endpoint works, and `--status` reports the
+endpoint currently in use. Editing the list needs a restart, like the rest
+of the endpoint settings.
 
 ### Prometheus metrics
 
@@ -303,14 +326,17 @@ like `bind_address`; the rest of the settings keep reloading over SIGHUP.
 
 ### Per-client limits
 
-A server can cap what one client may use without touching the others. Both
+A server can cap what one client may use without touching the others. The
 limits are optional, apply in both directions, and are reloaded on SIGHUP:
 
 ```ini
-quota_period      = monthly       # or daily (the default)
-client_rate_limit = mac1 50000    # 50 Mbit/s
-client_quota      = mac1 10240    # 10 GiB per period
-client_quota_warn = mac1 90       # tell the client at 90% of the quota
+quota_period        = monthly     # or daily (the default)
+quota_action        = drop        # or throttle
+quota_grace         = 0           # extra MiB before the action
+quota_throttle_kbps = 64          # over-quota rate when throttling
+client_rate_limit   = mac1 50000  # 50 Mbit/s
+client_quota        = mac1 10240  # 10 GiB per period
+client_quota_warn   = mac1 90     # tell the client at 90% of the quota
 ```
 
 `client_rate_limit` is in **kilobits per second**, enforced with a token
@@ -322,14 +348,24 @@ client id, so a reconnect or a key rotation does not clear it. `0` means
 unlimited in both keys, and a client without either line is unlimited.
 `quota_period` is read at startup, so switching it needs a restart.
 
-Over-limit traffic is dropped and counted as `throttled` in `--status` and
+With the default `quota_action = drop`, over-limit traffic is dropped. With
+`quota_action = throttle`, it is instead shaped to `quota_throttle_kbps` in
+each direction, so the session, DNS and keepalives stay alive. `quota_grace`
+adds that many MiB on top of every client's quota before the action starts;
+usage is still counted, so `--usage` and the history show the overage. The
+defaults are drop, no grace and 64 kbit/s. All three settings are reloaded
+on SIGHUP. The grace applies server-side: the client's quota line and
+`--usage` report the configured quota, so `left` can read zero while the
+throttled session still passes a trickle of traffic.
+
+Traffic that has to be dropped is counted as `throttled` in `--status` and
 `pipesix_throttled_total` in the metrics. The first drop in a session is
 logged with the configured numbers, so a client that suddenly stops passing
 traffic explains itself. Keepalives bypass the limits.
 
 When a client reaches `client_quota_warn` percent of its quota, and again on
-the first packet dropped because the quota is used up, the server sends an
-authenticated notice inside that session. The client logs it, so a tunnel
+the first packet rejected because the quota and grace are used up, the
+server sends an authenticated notice inside that session. The client logs it, so a tunnel
 that goes quiet at the end of the month says why instead of looking dead.
 Each notice is sent once per session, state and period. A client from an
 older release drops the notice as an unknown frame and keeps working; the
@@ -530,9 +566,13 @@ Two things must hold outside pipesix:
   means `net.ipv6.conf.all.forwarding=1` plus a static route on the LAN
   router or Router Advertisements from the client itself.
 
-The server does not verify inner source addresses, so a client may use any
-address in its delegated /64. Rate limits and quotas count the whole
-session, LAN traffic included.
+By default the server does not verify inner source addresses, so a client
+may use any address in its delegated /64. Set `strict_source = on` to drop
+packets whose source is outside the `client_route` instead; the first drop
+per session is logged and counted in `dropped`. Only clients with a route
+can be checked, so give every client a `client_route` (or delegated /64)
+before enabling it. Rate limits and quotas count the whole session, LAN
+traffic included.
 
 ### Rotating a key
 

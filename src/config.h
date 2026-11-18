@@ -17,7 +17,9 @@
  *   tun_address      - IPv6 address, optionally with /prefix
  *   tun_prefixlen    - IPv6 prefix length when no /prefix is given
  *   tun_mtu          - TUN device MTU
- *   remote_address   - Server address for client mode
+ *   remote_address   - Server address(es) for client mode; a comma
+ *                      separated list is tried in order when a relay
+ *                      stops answering
  *   remote_port      - Server port for client mode
  *   bind_address     - Bind address for server mode
  *   bind_port        - Bind port for server mode
@@ -30,7 +32,12 @@
  *   client_quota     - <id> <MiB> bytes per UTC period (server, repeatable)
  *   client_quota_warn - <id> <percent> warn the client at this usage
  *                      (server, repeatable)
+ *   strict_source    - Drop data whose inner source is outside the
+ *                      client's 'client_route' (server mode, default off)
  *   quota_period     - daily (default) or monthly
+ *   quota_action     - drop (default) or throttle when a quota is used up
+ *   quota_grace      - Extra MiB a client may use before that action
+ *   quota_throttle_kbps - Over-quota rate in kbit/s when throttling
  *   quota_state      - File that keeps quota usage across a restart
  *                      (server mode, empty disables it)
  *   usage_history    - Append-only CSV of completed quota periods
@@ -51,11 +58,12 @@
  *   log_level        - debug, info, warn, error, fatal
  *
  * SIGHUP reloads log_level, keepalive, peer_timeout, session_timeout,
- * stats_interval, the credentials and the per-client limits from the
- * original configuration file: the client table in server mode, this
- * client's own client_id and secret in client mode. Changes to the
- * interface, endpoints, mode, allow_client, metrics_* or quota_state
- * require a restart.
+ * stats_interval, strict_source, the quota action/grace/throttle rate,
+ * the credentials and the per-client limits from the original
+ * configuration file: the client table in server mode, this client's own
+ * client_id and secret in client mode. Changes to the interface,
+ * remote endpoints, mode, allow_client, metrics_* or quota_state require
+ * a restart.
  */
 
 #ifndef PIPESIX_CONFIG_H
@@ -79,6 +87,8 @@
 #define CONFIG_MAX_ALLOWED  64
 #define CONFIG_MAX_CLIENTS  64
 #define CONFIG_MAX_CLIENT_ID 32
+#define CONFIG_MAX_REMOTE_ENDPOINTS 8
+#define CONFIG_MAX_REMOTE_LIST      512
 
 /*
  * Default Configuration Values
@@ -94,6 +104,7 @@
 #define CONFIG_DEFAULT_STATS_INTERVAL    60
 #define CONFIG_DEFAULT_PEER_TIMEOUT      120
 #define CONFIG_DEFAULT_METRICS_PORT      9100
+#define CONFIG_DEFAULT_QUOTA_THROTTLE_KBPS 64
 
 /*
  * Per-client credential: a stable identity, its own pre-shared key, and
@@ -137,8 +148,15 @@ typedef struct {
     int  tun_prefixlen;                     /* IPv6 prefix length */
     int  tun_mtu;                           /* TUN device MTU */
 
-    /* Remote endpoint (used in client mode) */
-    char remote_address[CONFIG_MAX_ADDRESS];  /* Server IPv4/IPv6 address */
+    /*
+     * Remote endpoints (client mode). 'remote_address' keeps the raw
+     * configured value, while 'remote_endpoints' holds the parsed,
+     * ordered list the client walks during failover. A single address
+     * behaves exactly as before.
+     */
+    char remote_address[CONFIG_MAX_REMOTE_LIST];
+    char remote_endpoints[CONFIG_MAX_REMOTE_ENDPOINTS][CONFIG_MAX_ADDRESS];
+    int  remote_count;
     int  remote_port;                         /* Server UDP port */
 
     /* Local bind (used in server mode) */
@@ -168,8 +186,20 @@ typedef struct {
     pipesix_client_policy_t policies[CONFIG_MAX_CLIENTS];
     int  policy_count;
 
+    /*
+     * Drop packets whose inner source is outside the client's route.
+     * Off by default so an existing, misconfigured client keeps working;
+     * an operator opts in when the routes are authoritative.
+     */
+    int  strict_source;
+
     /* Quota period: 0 = UTC day, 1 = UTC calendar month. */
     int  quota_period;
+
+    /* Quota action: 0 = drop over-quota traffic, 1 = throttle it. */
+    int      quota_throttle;
+    uint64_t quota_grace_mib;      /* extra MiB before the action applies */
+    uint64_t quota_throttle_kbps;  /* rate used when quota_throttle is set */
 
     /* Observability */
     int  stats_interval;                     /* Periodic stats interval */

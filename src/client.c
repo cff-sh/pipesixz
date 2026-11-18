@@ -81,6 +81,9 @@ typedef struct {
     _Atomic int64_t    quota_start;
     _Atomic int64_t    quota_end;
     _Atomic time_t     last_quota_request;
+    /* Ordered relay list and the endpoint currently in use. */
+    size_t             endpoint_index;
+    char               remote_current[CONFIG_MAX_ADDRESS];
     pipesix_replay_t   replay;
     pipesix_stats_t    stats;
 } client_context_t;
@@ -274,14 +277,24 @@ static int handshake_once(client_context_t *ctx, int timeout_ms)
     return -1;
 }
 
+static int reconnect_peer(client_context_t *ctx);
+static size_t remote_endpoint_count(const pipesix_config_t *config);
+static const char *remote_endpoint(const pipesix_config_t *config,
+                                   size_t index);
+
 /*
  * Handshake until it succeeds or a shutdown is requested.
+ *
+ * With more than one configured endpoint, two failed attempts move on to
+ * the next relay instead of retrying a relay that accepts UDP but never
+ * answers (a blackholed port, or a host that is down).
  *
  * Returns 0 on success, -1 if shutdown interrupted the attempts.
  */
 static int handshake(client_context_t *ctx)
 {
     unsigned int delay = 1u;
+    unsigned int failures = 0;
 
     while (!runtime_should_stop()) {
         if (handshake_once(ctx, HANDSHAKE_TIMEOUT_MS) == 0) {
@@ -289,6 +302,27 @@ static int handshake(client_context_t *ctx)
         }
         if (runtime_should_stop()) {
             break;
+        }
+
+        failures++;
+        if (remote_endpoint_count(ctx->config) > 1 && failures >= 2) {
+            log_warn("Handshake failed with '%s'; trying the next relay "
+                     "endpoint",
+                     ctx->remote_current[0] != '\0'
+                         ? ctx->remote_current
+                         : remote_endpoint(ctx->config,
+                                           ctx->endpoint_index));
+            psix_close(ctx->udp_fd);
+            ctx->udp_fd = PSIX_INVALID_SOCKET;
+
+            if (reconnect_peer(ctx) != 0) {
+                return -1;
+            }
+
+            reset_session(ctx);
+            failures = 0;
+            delay = 1u;
+            continue;
         }
 
         log_warn("Handshake with the server failed; retrying in %u seconds",
@@ -473,7 +507,7 @@ static void *reverse_loop(void *arg)
 
         if ((frame.flags & PIPESIX_FLAG_QUOTA_EXHAUSTED) != 0) {
             log_error("Server reports the quota is exhausted; traffic is "
-                      "dropped until the period resets");
+                      "throttled or dropped until the period resets");
             atomic_store(&ctx->last_quota_request, 0);
             continue;
         }
@@ -533,11 +567,29 @@ static void *reverse_loop(void *arg)
  * The socket is a SOCKET on Windows, which is pointer sized, so it must
  * not travel through an int.
  */
-static psix_socket_t connect_server(const pipesix_config_t *config)
+static size_t remote_endpoint_count(const pipesix_config_t *config)
+{
+    return config->remote_count > 0 ? (size_t)config->remote_count : 1u;
+}
+
+static const char *remote_endpoint(const pipesix_config_t *config,
+                                   size_t index)
+{
+    if (config->remote_count > 0 && index < (size_t)config->remote_count) {
+        return config->remote_endpoints[index];
+    }
+
+    return config->remote_address;
+}
+
+static psix_socket_t connect_server(const pipesix_config_t *config,
+                                    size_t endpoint_index,
+                                    char *chosen, size_t chosen_size)
 {
     struct addrinfo hints;
     struct addrinfo *result = NULL;
     struct addrinfo *rp;
+    const char *host_name = remote_endpoint(config, endpoint_index);
     char port_str[16];
     int gai;
     psix_socket_t fd = PSIX_INVALID_SOCKET;
@@ -548,10 +600,10 @@ static psix_socket_t connect_server(const pipesix_config_t *config)
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_family = AF_UNSPEC;
 
-    gai = getaddrinfo(config->remote_address, port_str, &hints, &result);
+    gai = getaddrinfo(host_name, port_str, &hints, &result);
     if (gai != 0) {
         log_error("Failed to resolve server address '%s': %s",
-                  config->remote_address, gai_strerror(gai));
+                  host_name, gai_strerror(gai));
         return -1;
     }
 
@@ -568,8 +620,19 @@ static psix_socket_t connect_server(const pipesix_config_t *config)
             if (getnameinfo(rp->ai_addr, rp->ai_addrlen,
                             host, sizeof(host), serv, sizeof(serv),
                             NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
-                log_info("UDP connected to %s:%s (%s)", host, serv,
-                         rp->ai_family == AF_INET6 ? "AF_INET6" : "AF_INET");
+                log_info("UDP connected to %s:%s (%s, endpoint %zu)", host,
+                         serv,
+                         rp->ai_family == AF_INET6 ? "AF_INET6" : "AF_INET",
+                         endpoint_index + 1);
+            }
+            if (chosen != NULL && chosen_size > 0) {
+                size_t name_len = strlen(host_name);
+
+                if (name_len >= chosen_size) {
+                    name_len = chosen_size - 1;
+                }
+                memcpy(chosen, host_name, name_len);
+                chosen[name_len] = '\0';
             }
             break;
         }
@@ -582,8 +645,7 @@ static psix_socket_t connect_server(const pipesix_config_t *config)
 
     if (fd == PSIX_INVALID_SOCKET) {
         log_error("Failed to connect UDP socket to %s:%d: %s",
-                  config->remote_address, config->remote_port,
-                  strerror(errno));
+                  host_name, config->remote_port, strerror(errno));
     }
 
     return fd;
@@ -598,16 +660,33 @@ static psix_socket_t connect_server(const pipesix_config_t *config)
 static int reconnect_peer(client_context_t *ctx)
 {
     unsigned int delay = 1u;
+    size_t count = remote_endpoint_count(ctx->config);
+    size_t start = count > 0
+                       ? (ctx->endpoint_index + 1u) % count
+                       : 0u;
 
     while (!runtime_should_stop()) {
-        int fd = connect_server(ctx->config);
+        size_t i;
 
-        if (fd >= 0) {
-            ctx->udp_fd = fd;
-            return 0;
+        for (i = 0; i < count; i++) {
+            size_t index = (start + i) % count;
+            psix_socket_t fd = connect_server(ctx->config, index,
+                                              ctx->remote_current,
+                                              sizeof(ctx->remote_current));
+
+            if (fd != PSIX_INVALID_SOCKET) {
+                ctx->udp_fd = fd;
+                ctx->endpoint_index = index;
+                return 0;
+            }
         }
 
-        log_warn("Reconnect failed; retrying in %u seconds", delay);
+        if (count > 1) {
+            log_warn("All %zu relay endpoints failed; retrying in %u "
+                     "seconds", count, delay);
+        } else {
+            log_warn("Reconnect failed; retrying in %u seconds", delay);
+        }
         sleep_seconds(delay);
 
         if (delay < RECONNECT_MAX_DELAY) {
@@ -733,8 +812,11 @@ static int client_control_handler(const char *request, char *reply,
                                 sizeof(tun_name_esc)) != 0 ||
             control_json_escape(ctx->config->tun_address, tun_addr_esc,
                                 sizeof(tun_addr_esc)) != 0 ||
-            control_json_escape(ctx->config->remote_address, remote_esc,
-                                sizeof(remote_esc)) != 0) {
+            control_json_escape(
+                ctx->remote_current[0] != '\0'
+                    ? ctx->remote_current
+                    : ctx->config->remote_address,
+                remote_esc, sizeof(remote_esc)) != 0) {
             snprintf(reply, reply_size,
                      "ERR cannot encode the status as JSON\n");
             return -1;
@@ -859,7 +941,10 @@ static int client_control_handler(const char *request, char *reply,
                  "session: %s\n"
                  "%s"
                  "%s\n",
-                 ctx->config->client_id, ctx->config->remote_address,
+                 ctx->config->client_id,
+                 ctx->remote_current[0] != '\0'
+                     ? ctx->remote_current
+                     : ctx->config->remote_address,
                  ctx->config->remote_port, ctx->config->tun_name,
                  ctx->config->tun_address, ctx->config->tun_prefixlen,
                  uptime,
@@ -909,7 +994,19 @@ int client_start(pipesix_config_t *config)
     pipesix_replay_reset(&ctx.replay);
     stats_init(&ctx.stats);
 
-    ctx.udp_fd = connect_server(config);
+    {
+        size_t endpoints = remote_endpoint_count(config);
+        size_t i;
+
+        for (i = 0; i < endpoints; i++) {
+            ctx.udp_fd = connect_server(config, i, ctx.remote_current,
+                                        sizeof(ctx.remote_current));
+            if (ctx.udp_fd != PSIX_INVALID_SOCKET) {
+                ctx.endpoint_index = i;
+                break;
+            }
+        }
+    }
     if (ctx.udp_fd == PSIX_INVALID_SOCKET) {
         tun_close(&tun);
         return -1;
@@ -935,9 +1032,10 @@ int client_start(pipesix_config_t *config)
     metrics_start(config, client_metrics_body, &ctx);
 
     log_info("Client tunnel ready (crypto=chacha20-poly1305, client_id=%s, "
-             "keepalive=%ds, peer_timeout=%ds)",
-             config->client_id, atomic_load(&ctx.keepalive),
-             config->peer_timeout);
+             "endpoint=%s, keepalive=%ds, peer_timeout=%ds)",
+             config->client_id,
+             ctx.remote_current[0] != '\0' ? ctx.remote_current : "?",
+             atomic_load(&ctx.keepalive), config->peer_timeout);
     log_info("Client is running. Send SIGINT/SIGTERM to stop, "
              "SIGUSR1 for stats, SIGHUP to reload.");
 

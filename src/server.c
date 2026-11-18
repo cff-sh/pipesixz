@@ -99,6 +99,9 @@ typedef struct {
     int                     quota_requested;
     pipesix_bucket_t        rx_bucket;
     pipesix_bucket_t        tx_bucket;
+    /* Separate low-rate buckets used after a throttled client's quota. */
+    pipesix_bucket_t        rx_over_bucket;
+    pipesix_bucket_t        tx_over_bucket;
 } server_session_t;
 
 typedef struct {
@@ -183,6 +186,16 @@ static uint64_t quota_limit_for(const pipesix_config_t *config,
     return config->policies[policy].quota_mib * 1048576u;
 }
 
+/* Bytes per second used after a throttled client has used its quota. */
+static uint64_t quota_throttle_bps(const pipesix_config_t *config)
+{
+    if (!config->quota_throttle || config->quota_throttle_kbps == 0) {
+        return 0;
+    }
+
+    return config->quota_throttle_kbps * 125u;
+}
+
 static void send_session_quota_state(server_context_t *ctx,
                                      const struct sockaddr_storage *peer,
                                      socklen_t peer_len,
@@ -248,25 +261,29 @@ static void roll_quota_period_locked(server_context_t *ctx, int old_period,
 /*
  * Charge one packet against a client's quota.
  *
- * Returns 1 when the packet may pass, 0 when it has to be dropped. On
- * the call that crosses the configured warning threshold, or the one that
- * first has to drop a packet, *notify_* is set so the caller can tell the
- * client once it releases the session lock. The caller must hold that
- * lock: both data-path threads charge the same counter.
+ * Returns 1 when the packet may pass, 0 when it has to be dropped. When
+ * the configured quota and grace are used up, *throttle is set to let the
+ * caller apply the over-quota bucket instead of dropping outright. On the
+ * call that crosses the warning threshold, or the one that first reaches
+ * the exhausted state, *notify_* is set so the caller can tell the client
+ * once it releases the session lock. The caller must hold that lock: both
+ * data-path threads charge the same counter.
  */
 static int quota_admit(server_context_t *ctx, server_session_t *session,
                        size_t bytes, time_t now, int *notify_warn,
-                       int *notify_gone)
+                       int *notify_gone, int *throttle)
 {
     pipesix_quota_t *quota;
     const pipesix_client_policy_t *policy = NULL;
     uint64_t limit;
     uint64_t used;
+    uint64_t grace;
+    uint64_t effective;
     int period;
-    int allowed;
 
     *notify_warn = 0;
     *notify_gone = 0;
+    *throttle = 0;
 
     if (session->client_index < 0) {
         return 1;
@@ -286,24 +303,41 @@ static int quota_admit(server_context_t *ctx, server_session_t *session,
         session->quota_exhausted_sent = 0;
     }
 
-    allowed = policy_quota_charge(quota, bytes, period);
+    (void)policy_quota_charge(quota, bytes, period);
 
     if (session->policy_index >= 0) {
         policy = &ctx->config->policies[session->policy_index];
     }
 
-    if (!allowed) {
+    limit = quota->limit;
+    if (limit == 0) {
+        return 1;
+    }
+
+    /*
+     * The grace allowance is enforced here rather than inside the quota
+     * counter: policy_quota_charge() still counts every byte, and the
+     * counter stays comparable across restarts and history records.
+     */
+    grace = ctx->config->quota_grace_mib * 1048576u;
+    effective = (limit > UINT64_MAX - grace) ? UINT64_MAX : limit + grace;
+    used = policy_quota_used(quota, period);
+
+    if (used > effective) {
         if (!session->quota_exhausted_sent) {
             session->quota_exhausted_sent = 1;
             *notify_gone = 1;
         }
+
+        if (ctx->config->quota_throttle) {
+            *throttle = 1;
+            return 1;
+        }
         return 0;
     }
 
-    limit = quota->limit;
-    if (policy != NULL && limit > 0 && policy->warn_percent > 0 &&
+    if (policy != NULL && policy->warn_percent > 0 &&
         !session->quota_warn_sent) {
-        used = policy_quota_used(quota, period);
         if (used * 100u >= limit * policy->warn_percent) {
             session->quota_warn_sent = 1;
             *notify_warn = 1;
@@ -970,6 +1004,12 @@ static void handle_handshake_init(server_context_t *ctx,
                                policy_now_ms());
             policy_bucket_init(&ctx->sessions[slot].tx_bucket, rate_bps,
                                policy_now_ms());
+            policy_bucket_init(&ctx->sessions[slot].rx_over_bucket,
+                               quota_throttle_bps(ctx->config),
+                               policy_now_ms());
+            policy_bucket_init(&ctx->sessions[slot].tx_over_bucket,
+                               quota_throttle_bps(ctx->config),
+                               policy_now_ms());
         }
     }
 
@@ -1355,6 +1395,14 @@ static void reload_config(server_context_t *ctx)
                 policy_bucket_init(&session->tx_bucket, rate_bps,
                                    policy_now_ms());
             }
+
+            /* A reload may switch the quota action or its overage rate. */
+            policy_bucket_init(&session->rx_over_bucket,
+                               quota_throttle_bps(ctx->config),
+                               policy_now_ms());
+            policy_bucket_init(&session->tx_over_bucket,
+                               quota_throttle_bps(ctx->config),
+                               policy_now_ms());
         }
     }
 
@@ -1519,6 +1567,7 @@ static void *receiver_loop(void *arg)
         uint8_t notify_key[PIPESIX_KEY_LEN];
         int notify_warn = 0;
         int notify_gone = 0;
+        int source_denied = 0;
 
         ready = poll(&pfd, 1, POLL_INTERVAL_MS);
         if (ready < 0) {
@@ -1635,14 +1684,21 @@ static void *receiver_loop(void *arg)
             frame.payload_len > 0) {
             server_session_t *session = &ctx->sessions[slot];
             int allowed;
+            int quota_over = 0;
+            uint64_t now_ms = policy_now_ms();
 
             allowed = policy_bucket_allow(&session->rx_bucket,
-                                          frame.payload_len,
-                                          policy_now_ms());
+                                          frame.payload_len, now_ms);
 
             if (allowed) {
                 allowed = quota_admit(ctx, session, frame.payload_len, now,
-                                      &notify_warn, &notify_gone);
+                                      &notify_warn, &notify_gone,
+                                      &quota_over);
+
+                if (allowed && quota_over) {
+                    allowed = policy_bucket_allow(&session->rx_over_bucket,
+                                                  frame.payload_len, now_ms);
+                }
 
                 if (notify_warn || notify_gone) {
                     notify_addr = session->addr;
@@ -1672,9 +1728,11 @@ static void *receiver_loop(void *arg)
 
                 if (policy_warn) {
                     log_warn("Client '%s' exceeded its per-client limits; "
-                             "dropping traffic (rate %llu kbit/s, quota "
+                             "%s traffic (rate %llu kbit/s, quota "
                              "%llu MiB/%s)",
-                             policy_id, (unsigned long long)policy_rate,
+                             policy_id,
+                             quota_over ? "throttling" : "dropping",
+                             (unsigned long long)policy_rate,
                              (unsigned long long)policy_quota,
                              ctx->config->quota_period ? "month" : "day");
                 }
@@ -1695,7 +1753,8 @@ static void *receiver_loop(void *arg)
          * different upstreams look like on the wire, and it is silent
          * otherwise, so report it once per session.
          */
-        if (!ctx->sessions[slot].route_warned &&
+        if ((ctx->config->strict_source ||
+             !ctx->sessions[slot].route_warned) &&
             ctx->sessions[slot].prefix_len > 0 &&
             frame.payload_len >= IPV6_HEADER_LEN) {
             const pipesix_ipv6_header_t *inner = NULL;
@@ -1705,15 +1764,20 @@ static void *receiver_loop(void *arg)
                 !ipv6_prefix_match(ctx->sessions[slot].prefix,
                                    ctx->sessions[slot].prefix_len,
                                    inner->source_addr)) {
-                ctx->sessions[slot].route_warned = 1;
-                mismatch = 1;
-                memcpy(mismatch_src, inner->source_addr,
-                       sizeof(mismatch_src));
-                memcpy(mismatch_prefix, ctx->sessions[slot].prefix,
-                       sizeof(mismatch_prefix));
-                mismatch_prefix_len = ctx->sessions[slot].prefix_len;
-                snprintf(mismatch_id, sizeof(mismatch_id), "%s",
-                         ctx->sessions[slot].client_id);
+                if (!ctx->sessions[slot].route_warned) {
+                    ctx->sessions[slot].route_warned = 1;
+                    mismatch = 1;
+                    memcpy(mismatch_src, inner->source_addr,
+                           sizeof(mismatch_src));
+                    memcpy(mismatch_prefix, ctx->sessions[slot].prefix,
+                           sizeof(mismatch_prefix));
+                    mismatch_prefix_len = ctx->sessions[slot].prefix_len;
+                    snprintf(mismatch_id, sizeof(mismatch_id), "%s",
+                             ctx->sessions[slot].client_id);
+                }
+                if (ctx->config->strict_source) {
+                    source_denied = 1;
+                }
             }
         }
 
@@ -1725,6 +1789,24 @@ static void *receiver_loop(void *arg)
                                      ? PIPESIX_FLAG_QUOTA_EXHAUSTED
                                      : PIPESIX_FLAG_QUOTA_WARNING);
             memset(notify_key, 0, sizeof(notify_key));
+        }
+
+        if (source_denied) {
+            if (mismatch) {
+                char src_str[INET6_ADDRSTRLEN];
+                char prefix_str[INET6_ADDRSTRLEN];
+
+                ipv6_addr_to_str(mismatch_src, src_str, sizeof(src_str));
+                ipv6_addr_to_str(mismatch_prefix, prefix_str,
+                                 sizeof(prefix_str));
+                log_warn("Client '%s' sends from %s, which is outside its "
+                         "route %s/%d; dropping the packet "
+                         "(strict_source)",
+                         mismatch_id, src_str, prefix_str,
+                         mismatch_prefix_len);
+            }
+            stats_add_dropped(&ctx->stats);
+            continue;
         }
 
         if (mismatch) {
@@ -1833,6 +1915,7 @@ static void *sender_loop(void *arg)
         uint8_t notify_key[PIPESIX_KEY_LEN];
         int notify_warn = 0;
         int notify_gone = 0;
+        int quota_over = 0;
 
         ready = poll(&pfd, 1, POLL_INTERVAL_MS);
         if (ready < 0) {
@@ -1882,14 +1965,20 @@ static void *sender_loop(void *arg)
         if (slot >= 0) {
             server_session_t *session = &ctx->sessions[slot];
             int allowed;
+            uint64_t now_ms = policy_now_ms();
 
             allowed = policy_bucket_allow(&session->tx_bucket,
-                                          (size_t)nread, policy_now_ms());
+                                          (size_t)nread, now_ms);
 
             if (allowed) {
                 allowed = quota_admit(ctx, session, (size_t)nread,
                                       time(NULL), &notify_warn,
-                                      &notify_gone);
+                                      &notify_gone, &quota_over);
+
+                if (allowed && quota_over) {
+                    allowed = policy_bucket_allow(&session->tx_over_bucket,
+                                                  (size_t)nread, now_ms);
+                }
 
                 if (notify_warn || notify_gone) {
                     notify_addr = session->addr;
@@ -1941,9 +2030,11 @@ static void *sender_loop(void *arg)
         if (denied) {
             if (denied_warn) {
                 log_warn("Client '%s' exceeded its per-client limits; "
-                         "dropping traffic (rate %llu kbit/s, quota "
+                         "%s traffic (rate %llu kbit/s, quota "
                          "%llu MiB/%s)",
-                         denied_id, (unsigned long long)policy_rate,
+                         denied_id,
+                         quota_over ? "throttling" : "dropping",
+                         (unsigned long long)policy_rate,
                          (unsigned long long)policy_quota,
                          ctx->config->quota_period ? "month" : "day");
             }
