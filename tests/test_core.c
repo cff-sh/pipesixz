@@ -2404,7 +2404,8 @@ static void test_client_policy(void)
               "write the limits fixture");
         check(config_load(path, &config) == 0, "load the limits fixture");
 
-        check(config_set_limits(&config, "alice", &rate, NULL, NULL) == 0,
+        check(config_set_limits(&config, "alice", &rate, NULL, NULL, NULL,
+                                NULL) == 0,
               "set-limit rewrites the rate");
         check(config_find_policy(&config, "alice") != NULL &&
               config_find_policy(&config, "alice")->rate_kbps == 9000u,
@@ -2412,8 +2413,8 @@ static void test_client_policy(void)
         check(config_find_policy(&config, "alice")->quota_mib == 100u,
               "an unspecified quota is kept");
 
-        check(config_set_limits(&config, "alice", NULL, &quota_mib, &warn) ==
-                  0,
+        check(config_set_limits(&config, "alice", NULL, NULL, NULL,
+                                &quota_mib, &warn) == 0,
               "set-limit adds a warning");
         check(config_find_policy(&config, "alice")->warn_percent == 80u,
               "the warning is in memory");
@@ -2437,6 +2438,115 @@ static void test_client_policy(void)
               "no policy survives clear-limit");
         check(config_clear_limits(&config, "alice") != 0,
               "clearing absent limits is refused");
+        unlink(path);
+    }
+
+    {
+        static const char extras_fixture[] =
+            "mode = server\n"
+            "tun_address = fd00::1/64\n"
+            "audit_log = /tmp/pipesix-audit.log\n"
+            "endpoint_failback = on\n"
+            "endpoint_failback_interval = 30\n"
+            "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "client_next = alice: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+            "client_disabled = alice\n"
+            "client_expires = alice 2030-01-01\n"
+            "client_rate_limit = alice 5000\n"
+            "client_rate_limit_in = alice 1000\n"
+            "client_rate_limit_out = alice 2000\n";
+        const pipesix_client_cred_t *cred;
+        const pipesix_client_policy_t *policy;
+
+        check(write_temp_file(extras_fixture, path, sizeof(path)) == 0,
+              "write the extended client fixture");
+        check(config_load(path, &config) == 0,
+              "load the extended client fixture");
+        unlink(path);
+        check(config_validate(&config) == 0,
+              "the extended client fixture validates");
+        cred = config_find_client(&config, "alice");
+        check(cred != NULL && cred->has_next_secret,
+              "a staged key is parsed");
+        check(cred != NULL && cred->disabled,
+              "a disabled client is parsed");
+        check(cred != NULL && cred->has_expiry &&
+              cred->expires_at > 0, "a client expiry is parsed");
+        policy = config_find_policy(&config, "alice");
+        check(policy != NULL && policy->rate_in_set &&
+              policy->rate_in_kbps == 1000u, "the inbound rate is parsed");
+        check(policy != NULL && policy->rate_out_set &&
+              policy->rate_out_kbps == 2000u, "the outbound rate is parsed");
+        check(config.endpoint_failback &&
+              config.endpoint_failback_interval == 30,
+              "failback settings are parsed");
+        check(strcmp(config.audit_log, "/tmp/pipesix-audit.log") == 0,
+              "the audit path is parsed");
+    }
+
+    {
+        static const char state_fixture[] =
+            "mode = server\n"
+            "tun_address = fd00::1/64\n"
+            "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        char staged[PIPESIX_KEY_LEN * 2 + 1];
+        uint64_t in_rate = 1234;
+        const pipesix_client_cred_t *cred;
+        const pipesix_client_policy_t *policy;
+
+        check(write_temp_file(state_fixture, path, sizeof(path)) == 0,
+              "write the key rotation fixture");
+        check(config_load(path, &config) == 0,
+              "load the key rotation fixture");
+
+        check(config_stage_key(&config, "alice", staged, sizeof(staged)) == 0,
+              "stage a replacement key");
+        cred = config_find_client(&config, "alice");
+        check(cred != NULL && cred->has_next_secret &&
+              strcmp(cred->next_secret, staged) == 0,
+              "the staged key is in memory");
+
+        check(config_promote_key(&config, "alice") == 0,
+              "promote the staged key");
+        cred = config_find_client(&config, "alice");
+        check(cred != NULL && !cred->has_next_secret &&
+              strcmp(cred->secret, staged) == 0,
+              "promotion makes the staged key current");
+
+        check(config_stage_key(&config, "alice", staged, sizeof(staged)) == 0,
+              "stage another replacement key");
+        check(config_abort_key(&config, "alice") == 0,
+              "abort the staged key");
+        cred = config_find_client(&config, "alice");
+        check(cred != NULL && !cred->has_next_secret,
+              "aborting removes the staged key");
+
+        check(config_set_client_disabled(&config, "alice", 1) == 0,
+              "disable a client");
+        check(config_find_client(&config, "alice")->disabled,
+              "the disabled state is in memory");
+        check(config_set_client_disabled(&config, "alice", 0) == 0,
+              "enable a client");
+        check(!config_find_client(&config, "alice")->disabled,
+              "the enabled state is in memory");
+
+        check(config_set_client_expiry(&config, "alice", "2030-01-01") == 0,
+              "set a client expiry");
+        cred = config_find_client(&config, "alice");
+        check(cred != NULL && cred->has_expiry && cred->expires_at > 0,
+              "the expiry is in memory");
+        check(config_set_client_expiry(&config, "alice", "never") == 0,
+              "clear a client expiry");
+        check(!config_find_client(&config, "alice")->has_expiry,
+              "the cleared expiry is in memory");
+
+        check(config_set_limits(&config, "alice", NULL, &in_rate, NULL,
+                                NULL, NULL) == 0,
+              "set an inbound-only rate");
+        policy = config_find_policy(&config, "alice");
+        check(policy != NULL && policy->rate_in_set &&
+              policy->rate_in_kbps == 1234u && !policy->rate_out_set,
+              "the inbound rate is rewritten on its own");
         unlink(path);
     }
 

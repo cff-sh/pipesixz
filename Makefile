@@ -50,6 +50,7 @@ CONFIG_DIR   = /etc/pipesix
 SRCDIR       = src
 SOURCES      = $(SRCDIR)/main.c \
                $(SRCDIR)/logger.c \
+               $(SRCDIR)/audit.c \
                $(SRCDIR)/config.c \
                $(SRCDIR)/crypto.c \
                $(SRCDIR)/proto.c \

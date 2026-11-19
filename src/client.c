@@ -29,6 +29,7 @@
  */
 
 #include "client.h"
+#include "audit.h"
 #include "control.h"
 #include "config.h"
 #include "crypto.h"
@@ -267,6 +268,8 @@ static int handshake_once(client_context_t *ctx, int timeout_ms)
         stats_add_handshake(&ctx->stats);
         log_info("Handshake completed as client '%s'",
                  ctx->config->client_id);
+        audit_event("handshake", ctx->config->client_id, "",
+                    "client session established");
         return 0;
     }
 
@@ -584,7 +587,8 @@ static const char *remote_endpoint(const pipesix_config_t *config,
 
 static psix_socket_t connect_server(const pipesix_config_t *config,
                                     size_t endpoint_index,
-                                    char *chosen, size_t chosen_size)
+                                    char *chosen, size_t chosen_size,
+                                    int quiet)
 {
     struct addrinfo hints;
     struct addrinfo *result = NULL;
@@ -619,7 +623,8 @@ static psix_socket_t connect_server(const pipesix_config_t *config,
         if (psix_connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
             if (getnameinfo(rp->ai_addr, rp->ai_addrlen,
                             host, sizeof(host), serv, sizeof(serv),
-                            NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+                            NI_NUMERICHOST | NI_NUMERICSERV) == 0 &&
+                !quiet) {
                 log_info("UDP connected to %s:%s (%s, endpoint %llu)", host,
                          serv,
                          rp->ai_family == AF_INET6 ? "AF_INET6" : "AF_INET",
@@ -652,6 +657,153 @@ static psix_socket_t connect_server(const pipesix_config_t *config,
 }
 
 /*
+ * Send one side-effect-free authenticated probe and wait for its signed
+ * reply. It never changes a session, so it is safe while a tunnel is live.
+ *
+ * Returns 0 when the endpoint answered with a valid response, -1 otherwise.
+ */
+static int probe_endpoint(const pipesix_config_t *config, size_t index,
+                          const uint8_t psk[PIPESIX_KEY_LEN], int timeout_ms,
+                          char *chosen, size_t chosen_size,
+                          unsigned long long *rtt_ms)
+{
+    uint8_t init_body[PIPESIX_HANDSHAKE_INIT_MAX];
+    uint8_t frame[PIPESIX_MAX_FRAME];
+    uint8_t buf[PIPESIX_RECV_BUF_SIZE];
+    uint8_t cnonce[PIPESIX_HANDSHAKE_NONCE_LEN];
+    uint8_t echoed[PIPESIX_HANDSHAKE_NONCE_LEN];
+    uint8_t probe_key[PIPESIX_KEY_LEN];
+    psix_socket_t fd;
+    size_t body_len;
+    size_t frame_len;
+    time_t deadline;
+    uint64_t started;
+
+    memcpy(probe_key, psk, sizeof(probe_key));
+    fd = connect_server(config, index, chosen, chosen_size, 1);
+    if (fd == PSIX_INVALID_SOCKET) {
+        memset(probe_key, 0, sizeof(probe_key));
+        return -1;
+    }
+
+    if (pipesix_random_bytes(cnonce, sizeof(cnonce)) != 0) {
+        psix_close(fd);
+        memset(probe_key, 0, sizeof(probe_key));
+        return -1;
+    }
+    body_len = pipesix_handshake_init_build(init_body, sizeof(init_body),
+                                            config->client_id, cnonce,
+                                            probe_key);
+    memset(probe_key, 0, sizeof(probe_key));
+    if (body_len == 0) {
+        psix_close(fd);
+        return -1;
+    }
+    frame_len = pipesix_frame_build(frame, sizeof(frame),
+                                    PIPESIX_FLAG_PROBE_REQ, 0, 0,
+                                    init_body, body_len, NULL);
+    if (frame_len == 0 ||
+        psix_send(fd, frame, frame_len, 0) != (ssize_t)frame_len) {
+        psix_close(fd);
+        return -1;
+    }
+
+    started = policy_now_ms();
+    deadline = time(NULL) + (time_t)((timeout_ms + 999) / 1000);
+    while (time(NULL) <= deadline) {
+        pipesix_frame_t parsed;
+        uint16_t flags;
+        ssize_t nread;
+        int ready = psix_socket_wait(fd, POLL_INTERVAL_MS);
+
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (ready == 0) {
+            continue;
+        }
+
+        nread = psix_recv(fd, buf, sizeof(buf), 0);
+        if (nread < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pipesix_frame_peek(buf, (size_t)nread, &flags) != PIPESIX_OK ||
+            (flags & PIPESIX_FLAG_PROBE_RESP) == 0) {
+            continue;
+        }
+        if (pipesix_frame_parse(buf, (size_t)nread, &parsed, NULL) !=
+            PIPESIX_OK) {
+            continue;
+        }
+        if (pipesix_handshake_resp_verify(parsed.payload, parsed.payload_len,
+                                          psk, echoed) != PIPESIX_OK ||
+            memcmp(echoed, cnonce, sizeof(cnonce)) != 0) {
+            continue;
+        }
+
+        if (rtt_ms != NULL) {
+            uint64_t finish = policy_now_ms();
+            *rtt_ms = finish >= started ? finish - started : 0;
+        }
+        psix_close(fd);
+        return 0;
+    }
+
+    psix_close(fd);
+    return -1;
+}
+
+int client_doctor(const pipesix_config_t *config)
+{
+    uint8_t psk[PIPESIX_KEY_LEN];
+    size_t count;
+    size_t i;
+    int ok = 0;
+
+    if (config == NULL || strcmp(config->mode, "client") != 0) {
+        fprintf(stderr, "Error: --doctor needs a client configuration\n");
+        return -1;
+    }
+    if (pipesix_key_from_string(config->secret, psk) != 0) {
+        fprintf(stderr, "Error: cannot derive the key from 'secret'\n");
+        return -1;
+    }
+
+    count = remote_endpoint_count(config);
+    printf("config: OK\nclient_id: %s\ntun: %s %s/%d\n",
+           config->client_id, config->tun_name, config->tun_address,
+           config->tun_prefixlen);
+
+    for (i = 0; i < count; i++) {
+        char chosen[CONFIG_MAX_ADDRESS] = "";
+        unsigned long long rtt = 0;
+
+        if (probe_endpoint(config, i, psk, HANDSHAKE_TIMEOUT_MS, chosen,
+                           sizeof(chosen), &rtt) == 0) {
+            printf("endpoint %llu: OK  %s (%llu ms, authenticated)\n",
+                   (unsigned long long)(i + 1),
+                   chosen[0] != '\0' ? chosen : remote_endpoint(config, i),
+                   rtt);
+            ok++;
+        } else {
+            printf("endpoint %llu: FAIL %s (no authenticated reply)\n",
+                   (unsigned long long)(i + 1), remote_endpoint(config, i));
+        }
+    }
+
+    memset(psk, 0, sizeof(psk));
+    if (ok == 0) {
+        fprintf(stderr, "No relay endpoint answered the probe.\n");
+        return -1;
+    }
+    printf("doctor: %d of %llu endpoint(s) reachable\n", ok,
+           (unsigned long long)count);
+    return 0;
+}
+
+/*
  * Reconnect to the server, retrying with exponential backoff until it
  * succeeds or a shutdown is requested.
  *
@@ -672,7 +824,8 @@ static int reconnect_peer(client_context_t *ctx)
             size_t index = (start + i) % count;
             psix_socket_t fd = connect_server(ctx->config, index,
                                               ctx->remote_current,
-                                              sizeof(ctx->remote_current));
+                                              sizeof(ctx->remote_current),
+                                              0);
 
             if (fd != PSIX_INVALID_SOCKET) {
                 ctx->udp_fd = fd;
@@ -1008,13 +1161,19 @@ int client_start(pipesix_config_t *config)
     pipesix_replay_reset(&ctx.replay);
     stats_init(&ctx.stats);
 
+    if (audit_open(config->audit_log) != 0) {
+        log_warn("Cannot open the audit log '%s': %s", config->audit_log,
+                 strerror(errno));
+    }
+    audit_event("startup", config->client_id, "", "client starting");
+
     {
         size_t endpoints = remote_endpoint_count(config);
         size_t i;
 
         for (i = 0; i < endpoints; i++) {
             ctx.udp_fd = connect_server(config, i, ctx.remote_current,
-                                        sizeof(ctx.remote_current));
+                                        sizeof(ctx.remote_current), 0);
             if (ctx.udp_fd != PSIX_INVALID_SOCKET) {
                 ctx.endpoint_index = i;
                 break;
@@ -1073,6 +1232,7 @@ int client_start(pipesix_config_t *config)
 
     {
         time_t last_report = time(NULL);
+        time_t last_failback_probe = time(NULL);
 
         while (!runtime_should_stop()) {
             uint8_t new_psk[PIPESIX_KEY_LEN] = {0};
@@ -1107,6 +1267,11 @@ int client_start(pipesix_config_t *config)
                     logger_set_json(config->log_json);
                     atomic_store(&ctx.keepalive, config->keepalive);
 
+                    if (audit_open(config->audit_log) != 0) {
+                        log_warn("Cannot open the audit log '%s': %s",
+                                 config->audit_log, strerror(errno));
+                    }
+
                     remote_changed =
                         strcmp(old_remote, config->remote_address) != 0 ||
                         old_remote_port != config->remote_port;
@@ -1126,7 +1291,9 @@ int client_start(pipesix_config_t *config)
 
                     log_info("Configuration reloaded (log_level, log_format, "
                              "keepalive, peer_timeout, stats_interval, "
-                             "endpoints, metrics)");
+                             "endpoints, failback, audit, metrics)");
+                    audit_event("reload", config->client_id, "",
+                                "configuration reloaded");
 
                     /*
                      * Our own key or identity changed, so the server will
@@ -1198,6 +1365,65 @@ int client_start(pipesix_config_t *config)
                 workers_running = 1;
                 last_report = now;
                 continue;
+            }
+
+            /*
+             * Probe the preferred endpoint on a temporary socket. The
+             * probe is authenticated but creates no session, so a live
+             * tunnel keeps running while we decide whether to fail back.
+             */
+            if (config->endpoint_failback && ctx.endpoint_index > 0 &&
+                config->endpoint_failback_interval > 0 &&
+                (now - last_failback_probe) >=
+                    (time_t)config->endpoint_failback_interval) {
+                char preferred[CONFIG_MAX_ADDRESS] = "";
+
+                last_failback_probe = now;
+                if (probe_endpoint(config, 0, ctx.psk, HANDSHAKE_TIMEOUT_MS,
+                                   preferred, sizeof(preferred), NULL) == 0) {
+                    psix_socket_t new_fd;
+
+                    log_info("Preferred relay endpoint responded; failing "
+                             "back from endpoint %llu",
+                             (unsigned long long)(ctx.endpoint_index + 1));
+                    stop_workers(&ctx, &forward_thread, &reverse_thread);
+                    workers_running = 0;
+
+                    new_fd = connect_server(config, 0, ctx.remote_current,
+                                            sizeof(ctx.remote_current), 0);
+                    if (new_fd == PSIX_INVALID_SOCKET) {
+                        log_warn("Could not connect to the preferred relay; "
+                                 "staying on the current endpoint");
+                        if (start_workers(&ctx, &forward_thread,
+                                          &reverse_thread) != 0) {
+                            metrics_stop();
+                            control_stop();
+                            psix_close(ctx.udp_fd);
+                            tun_close(&tun);
+                            return -1;
+                        }
+                        workers_running = 1;
+                    } else {
+                        psix_close(ctx.udp_fd);
+                        ctx.udp_fd = new_fd;
+                        ctx.endpoint_index = 0;
+                        if (renegotiate(&ctx) != 0) {
+                            break;
+                        }
+                        if (start_workers(&ctx, &forward_thread,
+                                          &reverse_thread) != 0) {
+                            metrics_stop();
+                            control_stop();
+                            psix_close(ctx.udp_fd);
+                            tun_close(&tun);
+                            return -1;
+                        }
+                        workers_running = 1;
+                        last_report = now;
+                        log_info("Failed back to the preferred relay");
+                        continue;
+                    }
+                }
             }
 
             if (runtime_take_stats_request()) {
@@ -1340,6 +1566,8 @@ int client_start(pipesix_config_t *config)
     tun_close(&tun);
     stats_dump(&ctx.stats, "client");
 
+    audit_event("shutdown", config->client_id, "", "client stopped");
+    audit_close();
     log_info("Client shutdown complete");
     return 0;
 }

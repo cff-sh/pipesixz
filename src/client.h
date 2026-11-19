@@ -30,4 +30,12 @@
  */
 int client_start(pipesix_config_t *config);
 
+/*
+ * Run a non-mutating reachability and authentication check against every
+ * configured relay. Does not open a TUN device or need root.
+ *
+ * Returns 0 when at least one endpoint answered, -1 otherwise.
+ */
+int client_doctor(const pipesix_config_t *config);
+
 #endif /* PIPESIX_CLIENT_H */

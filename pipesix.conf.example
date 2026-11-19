@@ -97,6 +97,16 @@ secret    = replace-this-with-pipesix-genkey-output
 #client = client1: <output of "pipesix --genkey">
 #client = client2: <output of "pipesix --genkey">
 #
+# client_next: staged replacement key. The current key stays valid while
+# it is present; 'pipesix --promote-key <id>' makes it current and
+# 'pipesix --abort-key <id>' discards it.
+#client_next = client1: <new key>
+#
+# client_disabled / client_expires: refuse a client without deleting its
+# route or quota history. Expiry accepts YYYY-MM-DD or Unix seconds.
+#client_disabled = client1
+#client_expires = client1 2027-01-01
+#
 # client_route: the inner IPv6 prefix each client owns, used to route
 # return traffic. Matching is longest-prefix-first, a bare address means
 # /128, and the line must follow its 'client' line. Two clients may not
@@ -133,7 +143,9 @@ secret    = replace-this-with-pipesix-genkey-output
 # UTC days. The period is reloadable, but keep it consistent across a restart
 # when quota_state is enabled (the state file records the period kind).
 #
-#   client_rate_limit = <id> <kbit/s>    e.g. 50000 = 50 Mbit/s
+#   client_rate_limit = <id> <kbit/s>    e.g. 50000 = 50 Mbit/s (both)
+#   client_rate_limit_in  = <id> <kbit/s>  client -> relay
+#   client_rate_limit_out = <id> <kbit/s>  relay -> client
 #   client_quota      = <id> <MiB>       e.g. 10240 = 10 GiB per period
 #   client_quota_warn = <id> <percent>   e.g. 90 = warn at 90%
 #
@@ -188,6 +200,13 @@ keepalive       = 20
 peer_timeout    = 120
 session_timeout = 120
 stats_interval  = 60
+#
+# endpoint_failback: after failing over to a later remote_address, probe
+# the first endpoint in the background and return to it when it answers.
+# Off by default so an ordered, metered relay list is not reordered.
+# endpoint_failback_interval = 60
+#
+#endpoint_failback = off
 
 # ---------------------------------------------------------------------------
 # Prometheus Metrics
@@ -223,11 +242,16 @@ stats_interval  = 60
 # SIGHUP reloads log_level/log_format, keepalive, peer_timeout,
 # session_timeout, stats_interval, strict_source, client_isolation,
 # allow_client, quota_period/quota_action/quota_grace/quota_throttle_kbps,
-# quota_state, usage_history, metrics_*, the remote endpoint list on a
-# client, and the credentials/ACLs/limits: the 'client'/'client_route' table
-# on a server, this client's own 'secret' and 'client_id' in client mode, so
-# a key can be rotated without a restart. Interface, mode, user/group and
+# quota_state, usage_history, metrics_*, audit_log, endpoint_failback, the
+# remote endpoint list on a client, and the credentials/ACLs/limits: the
+# 'client'/'client_route' table plus staged keys and client state on a
+# server, this client's own 'secret' and 'client_id' in client mode, so a
+# key can be rotated without a restart. Interface, mode, user/group and
 # bind_address changes take effect after a restart.
 #
 log_level  = info
 log_format = text
+#
+# audit_log: append-only JSONL security audit. Separate from normal logs;
+# created with mode 0600. Reloadable on SIGHUP.
+#audit_log = /var/log/pipesix/audit.jsonl

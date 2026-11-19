@@ -36,6 +36,7 @@
  */
 
 #include "client.h"
+#include "audit.h"
 #include "config.h"
 #include "control.h"
 #include "crypto.h"
@@ -61,6 +62,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -211,6 +213,8 @@ static void print_usage(const char *progname)
             "                          [--quota-warn <percent>] [-c <config>]\n"
             "       %s --clear-limit <id> [-c <config>]\n"
             "       %s --usage [--history] [--json|--csv] [-c <config>]\n"
+            "       %s --doctor [-c <config>]\n"
+            "       %s --stage-key <id> | --promote-key <id> | --abort-key <id>\n"
             "\n"
             "pipesix %s - IPv6 over UDP Tunnel\n"
             "\n"
@@ -218,8 +222,8 @@ static void print_usage(const char *progname)
             "  -c, --config <path>     Configuration file\n"
             "                          (default: %s)\n",
             progname, progname, progname, progname, progname, progname,
-            progname, progname, progname, PIPESIX_APP_VERSION,
-            DEFAULT_CONFIG_PATH);
+            progname, progname, progname, progname, progname,
+            PIPESIX_APP_VERSION, DEFAULT_CONFIG_PATH);
 
     fprintf(stderr,
             "  -t, --check             Validate configuration and exit\n"
@@ -275,6 +279,21 @@ static void print_usage(const char *progname)
             "                          Export an existing client's config\n"
             "      --export-dir <dir>  With --export-client or --rotate-all,\n"
             "                          write <dir>/<id>.conf for each client\n"
+            "      --doctor            Probe every relay endpoint without\n"
+            "                          opening the TUN device or changing a session\n"
+            "      --stage-key <id>    Generate a replacement key and keep the\n"
+            "                          current one valid\n"
+            "      --promote-key <id>  Make the staged key current\n"
+            "      --abort-key <id>    Discard the staged key\n"
+            "      --disable-client <id> Refuse this client on the next reload\n"
+            "      --enable-client <id>  Re-admit a disabled client\n"
+            "      --expire-client <id> <when>\n"
+            "                          Set a YYYY-MM-DD or Unix expiry; use\n"
+            "                          'never' to clear it\n"
+            "      --rate-in <kbps>    Client-to-server cap for --add-client or\n"
+            "                          --set-limit\n"
+            "      --rate-out <kbps>   Server-to-client cap for --add-client or\n"
+            "                          --set-limit\n"
             "  -V, --version           Show version information\n"
             "  -h, --help              Show this help message\n");
 
@@ -295,7 +314,11 @@ static void print_usage(const char *progname)
             "  client          <id>: <secret> entry (server mode, repeatable)\n"
             "  client_route    <id> <prefix> (server, repeatable)\n"
             "  client_prefix_pool <ipv6>/<len> /64 delegation pool (server)\n"
-            "  client_rate_limit <id> <kbit/s> (server, repeatable)\n"
+            "  client_rate_limit <id> <kbit/s> (server, repeatable, both directions)\n"
+            "  client_rate_limit_in/out <id> <kbit/s> per direction\n"
+            "  client_next     <id>: <secret> staged rotation key\n"
+            "  client_disabled <id> (server, repeatable)\n"
+            "  client_expires  <id> YYYY-MM-DD|unix\n"
             "  client_quota    <id> <MiB> per period (server, repeatable)\n"
             "  client_quota_warn <id> <percent> (server, repeatable)\n"
             "  strict_source   Drop data outside the client route (server)\n"
@@ -306,7 +329,10 @@ static void print_usage(const char *progname)
             "  quota_grace     MiB over quota before the action (default: 0)\n"
             "  quota_throttle_kbps Over-quota rate (default: 64)\n"
             "  quota_state     File for quota usage (server, empty = off)\n"
-            "  usage_history   Completed periods as CSV (server, empty = off)\n");
+            "  usage_history   Completed periods as CSV (server, empty = off)\n"
+            "  audit_log       Append-only JSONL audit file (empty = off)\n"
+            "  endpoint_failback on | off (client, default off)\n"
+            "  endpoint_failback_interval Seconds between preferred probes\n");
 
     fprintf(stderr,
             "  keepalive       Client keepalive seconds (default: 20, 0 = off)\n"
@@ -734,6 +760,15 @@ int main(int argc, char *argv[])
         { "write-client-config", required_argument, NULL, 1024 },
         { "export-client", required_argument, NULL, 1025 },
         { "export-dir", required_argument, NULL, 1026 },
+        { "doctor",    no_argument,       NULL, 1027 },
+        { "stage-key", required_argument, NULL, 1028 },
+        { "promote-key", required_argument, NULL, 1029 },
+        { "abort-key", required_argument, NULL, 1030 },
+        { "disable-client", required_argument, NULL, 1031 },
+        { "enable-client", required_argument, NULL, 1032 },
+        { "expire-client", required_argument, NULL, 1033 },
+        { "rate-in",  required_argument, NULL, 1034 },
+        { "rate-out", required_argument, NULL, 1035 },
         { "version",   no_argument,       NULL, 'V' },
         { "help",      no_argument,       NULL, 'h' },
         { NULL,        0,                 NULL, 0   }
@@ -756,14 +791,28 @@ int main(int argc, char *argv[])
     const char *set_limit = NULL;
     const char *clear_limit = NULL;
     const char *rate_arg = NULL;
+    const char *rate_in_arg = NULL;
+    const char *rate_out_arg = NULL;
     const char *quota_arg = NULL;
     const char *warn_arg = NULL;
     uint64_t rate_kbps = 0;
+    uint64_t rate_in_kbps = 0;
+    uint64_t rate_out_kbps = 0;
     uint64_t quota_mib = 0;
     uint64_t warn_percent = 0;
     int have_rate = 0;
+    int have_rate_in = 0;
+    int have_rate_out = 0;
     int have_quota = 0;
     int have_warn = 0;
+    int doctor_only = 0;
+    const char *stage_key = NULL;
+    const char *promote_key = NULL;
+    const char *abort_key = NULL;
+    const char *disable_client = NULL;
+    const char *enable_client = NULL;
+    const char *expire_client = NULL;
+    const char *expire_when = NULL;
     const char *kick_id = NULL;
     const char *add_client = NULL;
     const char *remove_client = NULL;
@@ -878,6 +927,34 @@ int main(int argc, char *argv[])
             case 1026:
                 export_dir = optarg;
                 break;
+            case 1027:
+                doctor_only = 1;
+                break;
+            case 1028:
+                stage_key = optarg;
+                break;
+            case 1029:
+                promote_key = optarg;
+                break;
+            case 1030:
+                abort_key = optarg;
+                break;
+            case 1031:
+                disable_client = optarg;
+                break;
+            case 1032:
+                enable_client = optarg;
+                break;
+            case 1033:
+                expire_client = optarg;
+                expire_when = argv[optind] != NULL ? argv[optind++] : NULL;
+                break;
+            case 1034:
+                rate_in_arg = optarg;
+                break;
+            case 1035:
+                rate_out_arg = optarg;
+                break;
             case 'V':
                 printf("pipesix %s (protocol %d)\n",
                        PIPESIX_APP_VERSION, PIPESIX_VERSION);
@@ -945,6 +1022,22 @@ int main(int argc, char *argv[])
         }
         have_rate = 1;
     }
+    if (rate_in_arg != NULL) {
+        if (parse_u64(rate_in_arg, &rate_in_kbps) != 0 ||
+            rate_in_kbps > 100000000u) {
+            fprintf(stderr, "Error: --rate-in must be 0-100000000 kbit/s\n");
+            return EXIT_FAILURE;
+        }
+        have_rate_in = 1;
+    }
+    if (rate_out_arg != NULL) {
+        if (parse_u64(rate_out_arg, &rate_out_kbps) != 0 ||
+            rate_out_kbps > 100000000u) {
+            fprintf(stderr, "Error: --rate-out must be 0-100000000 kbit/s\n");
+            return EXIT_FAILURE;
+        }
+        have_rate_out = 1;
+    }
 
     if (quota_arg != NULL) {
         if (parse_u64(quota_arg, &quota_mib) != 0 ||
@@ -964,16 +1057,18 @@ int main(int argc, char *argv[])
         have_warn = 1;
     }
 
-    if ((have_rate || have_quota || have_warn) && add_client == NULL &&
-        set_limit == NULL) {
-        fprintf(stderr, "Error: --rate, --quota and --quota-warn require "
-                        "--add-client or --set-limit\n");
+    if ((have_rate || have_rate_in || have_rate_out || have_quota ||
+         have_warn) && add_client == NULL && set_limit == NULL) {
+        fprintf(stderr, "Error: --rate, --rate-in, --rate-out, --quota and "
+                        "--quota-warn require --add-client or --set-limit\n");
         return EXIT_FAILURE;
     }
 
-    if (set_limit != NULL && !(have_rate || have_quota || have_warn)) {
-        fprintf(stderr, "Error: --set-limit needs --rate, --quota or "
-                        "--quota-warn\n");
+    if (set_limit != NULL &&
+        !(have_rate || have_rate_in || have_rate_out || have_quota ||
+          have_warn)) {
+        fprintf(stderr, "Error: --set-limit needs --rate, --rate-in, "
+                        "--rate-out, --quota or --quota-warn\n");
         return EXIT_FAILURE;
     }
 
@@ -1055,6 +1150,31 @@ int main(int argc, char *argv[])
         export_dir == NULL) {
         fprintf(stderr, "Error: --export-client needs --write-client-config "
                         "or --export-dir\n");
+        return EXIT_FAILURE;
+    }
+
+    if ((stage_key != NULL) + (promote_key != NULL) + (abort_key != NULL) +
+            (disable_client != NULL) + (enable_client != NULL) +
+            (expire_client != NULL) > 1) {
+        fprintf(stderr, "Error: choose one of --stage-key, --promote-key, "
+                        "--abort-key, --disable-client, --enable-client or "
+                        "--expire-client\n");
+        return EXIT_FAILURE;
+    }
+
+    if (expire_client != NULL &&
+        (expire_when == NULL || expire_when[0] == '-')) {
+        fprintf(stderr, "Error: --expire-client needs <id> <when>\n");
+        return EXIT_FAILURE;
+    }
+
+    if (doctor_only &&
+        (stage_key != NULL || promote_key != NULL || abort_key != NULL ||
+         disable_client != NULL || enable_client != NULL ||
+         expire_client != NULL || add_client != NULL ||
+         remove_client != NULL || rotate_all)) {
+        fprintf(stderr, "Error: --doctor cannot be combined with a "
+                        "configuration-changing command\n");
         return EXIT_FAILURE;
     }
 
@@ -1260,6 +1380,101 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    if (doctor_only) {
+        return client_doctor(&config) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
+    if (stage_key != NULL || promote_key != NULL || abort_key != NULL ||
+        disable_client != NULL || enable_client != NULL ||
+        expire_client != NULL) {
+        const char *id = stage_key != NULL ? stage_key
+                        : promote_key != NULL ? promote_key
+                        : abort_key != NULL ? abort_key
+                        : disable_client != NULL ? disable_client
+                        : enable_client != NULL ? enable_client
+                                                : expire_client;
+        char reply[1024];
+        char key[PIPESIX_KEY_LEN * 2 + 1];
+        int rc;
+
+        if (audit_open(config.audit_log) != 0) {
+            fprintf(stderr, "Warning: cannot open the audit log '%s': %s\n",
+                    config.audit_log, strerror(errno));
+        }
+
+        if (stage_key != NULL) {
+            rc = config_stage_key(&config, id, key, sizeof(key));
+            if (rc == 0) {
+                printf("Staged a replacement key for client '%s':\n\n", id);
+                printf("  client_next = %s: %s\n\n", id, key);
+                printf("The current key stays valid. Update the client to "
+                       "the new key,\nverify it connects, then run "
+                       "'pipesix --promote-key %s'.\n", id);
+                audit_event("key_staged", id, "",
+                            "replacement key staged");
+            }
+            memset(key, 0, sizeof(key));
+        } else if (promote_key != NULL) {
+            rc = config_promote_key(&config, id);
+            if (rc == 0) {
+                printf("Promoted the staged key for client '%s'.\n", id);
+                audit_event("key_promoted", id, "",
+                            "staged key promoted to current");
+            }
+        } else if (abort_key != NULL) {
+            rc = config_abort_key(&config, id);
+            if (rc == 0) {
+                printf("Discarded the staged key for client '%s'.\n", id);
+                audit_event("key_aborted", id, "",
+                            "staged key discarded");
+            }
+        } else if (disable_client != NULL) {
+            rc = config_set_client_disabled(&config, id, 1);
+            if (rc == 0) {
+                printf("Client '%s' is now disabled.\n", id);
+                audit_event("client_disabled", id, "",
+                            "client disabled");
+            }
+        } else if (enable_client != NULL) {
+            rc = config_set_client_disabled(&config, id, 0);
+            if (rc == 0) {
+                printf("Client '%s' is now enabled.\n", id);
+                audit_event("client_enabled", id, "",
+                            "client enabled");
+            }
+        } else {
+            rc = config_set_client_expiry(&config, id, expire_when);
+            if (rc == 0) {
+                if (strcasecmp(expire_when, "never") == 0) {
+                    printf("Cleared the expiry for client '%s'.\n", id);
+                    audit_event("client_expiry_cleared", id, "",
+                                "expiry cleared");
+                } else {
+                    printf("Client '%s' now expires at %s UTC.\n", id,
+                           expire_when);
+                    audit_event("client_expiry_set", id, "",
+                                "expires at %s UTC", expire_when);
+                }
+            }
+        }
+
+        if (rc != 0) {
+            fprintf(stderr, "Error: cannot update client '%s' in '%s'\n",
+                    id, config_path);
+            audit_close();
+            return EXIT_FAILURE;
+        }
+
+        if (control_request(config_path, "reload", reply, sizeof(reply)) == 0) {
+            printf("Running instance asked to reload.\n");
+        } else {
+            printf("No running instance for this configuration; the change "
+                   "applies when it starts.\n");
+        }
+        audit_close();
+        return EXIT_SUCCESS;
+    }
+
     if (export_client != NULL) {
         char path[CONFIG_PATH_MAX];
 
@@ -1336,6 +1551,10 @@ int main(int argc, char *argv[])
             memset(&limits, 0, sizeof(limits));
             snprintf(limits.id, sizeof(limits.id), "%s", add_client);
             limits.rate_kbps = have_rate ? rate_kbps : 0;
+            limits.rate_in_set = have_rate_in;
+            limits.rate_in_kbps = have_rate_in ? rate_in_kbps : 0;
+            limits.rate_out_set = have_rate_out;
+            limits.rate_out_kbps = have_rate_out ? rate_out_kbps : 0;
             limits.quota_mib = have_quota ? quota_mib : 0;
             limits.warn_percent = have_warn ? warn_percent : 0;
 
@@ -1369,6 +1588,14 @@ int main(int argc, char *argv[])
             if (limits.rate_kbps > 0) {
                 printf("  client_rate_limit = %s %llu\n", add_client,
                        (unsigned long long)limits.rate_kbps);
+            }
+            if (limits.rate_in_set) {
+                printf("  client_rate_limit_in = %s %llu\n", add_client,
+                       (unsigned long long)limits.rate_in_kbps);
+            }
+            if (limits.rate_out_set) {
+                printf("  client_rate_limit_out = %s %llu\n", add_client,
+                       (unsigned long long)limits.rate_out_kbps);
             }
             if (limits.quota_mib > 0) {
                 printf("  client_quota = %s %llu\n", add_client,
@@ -1423,6 +1650,8 @@ int main(int argc, char *argv[])
         if (set_limit != NULL) {
             if (config_set_limits(&config, id,
                                   have_rate ? &rate_kbps : NULL,
+                                  have_rate_in ? &rate_in_kbps : NULL,
+                                  have_rate_out ? &rate_out_kbps : NULL,
                                   have_quota ? &quota_mib : NULL,
                                   have_warn ? &warn_percent : NULL) != 0) {
                 fprintf(stderr,
@@ -1444,9 +1673,11 @@ int main(int argc, char *argv[])
 
         limits = config_find_policy(&config, id);
         if (limits != NULL) {
-            if (limits->rate_kbps > 0) {
-                printf("  rate:  %llu kbit/s\n",
-                       (unsigned long long)limits->rate_kbps);
+            if (pipesix_policy_rate_in(limits) > 0 ||
+                pipesix_policy_rate_out(limits) > 0) {
+                printf("  rate:  in %llu / out %llu kbit/s\n",
+                       (unsigned long long)pipesix_policy_rate_in(limits),
+                       (unsigned long long)pipesix_policy_rate_out(limits));
             } else {
                 printf("  rate:  unlimited\n");
             }

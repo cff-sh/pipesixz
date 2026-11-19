@@ -233,6 +233,7 @@ static void config_set_defaults(pipesix_config_t *config)
     config->peer_timeout   = CONFIG_DEFAULT_PEER_TIMEOUT;
     config->stats_interval = CONFIG_DEFAULT_STATS_INTERVAL;
     config->metrics_port   = CONFIG_DEFAULT_METRICS_PORT;
+    config->endpoint_failback_interval = 60;
     config->quota_throttle_kbps = CONFIG_DEFAULT_QUOTA_THROTTLE_KBPS;
     config->log_level      = CONFIG_DEFAULT_LOG_LEVEL;
     config->policy_count   = 0;
@@ -352,16 +353,14 @@ static int valid_client_id(const char *id)
 /*
  * Parse "client = <id>: <secret>" and append it to the credential table.
  */
-static int set_client_cred(pipesix_config_t *config, const char *value)
+static int parse_client_secret(const char *value, char *id, size_t id_size,
+                               char *secret, size_t secret_size)
 {
     const char *sep;
     const char *start;
     const char *end;
-    const char *secret;
-    char id[CONFIG_MAX_CLIENT_ID];
     size_t id_len;
     size_t secret_len;
-    size_t i;
 
     if (value == NULL) return -1;
 
@@ -374,23 +373,37 @@ static int set_client_cred(pipesix_config_t *config, const char *value)
     while (end > start && isspace((unsigned char)*(end - 1))) end--;
 
     id_len = (size_t)(end - start);
-    if (id_len == 0 || id_len >= sizeof(id)) return -1;
+    if (id_len == 0 || id_len >= id_size) return -1;
 
     memcpy(id, start, id_len);
     id[id_len] = '\0';
-
     if (!valid_client_id(id)) return -1;
 
-    secret = sep + 1;
-    while (*secret != '\0' && isspace((unsigned char)*secret)) secret++;
-
-    secret_len = strlen(secret);
+    start = sep + 1;
+    while (*start != '\0' && isspace((unsigned char)*start)) start++;
+    secret_len = strlen(start);
     while (secret_len > 0 &&
-           isspace((unsigned char)secret[secret_len - 1])) {
+           isspace((unsigned char)start[secret_len - 1])) {
         secret_len--;
     }
 
-    if (secret_len == 0 || secret_len >= CONFIG_MAX_SECRET) return -1;
+    if (secret_len == 0 || secret_len >= secret_size) return -1;
+    memcpy(secret, start, secret_len);
+    secret[secret_len] = '\0';
+    return 0;
+}
+
+static int set_client_cred(pipesix_config_t *config, const char *value)
+{
+    char id[CONFIG_MAX_CLIENT_ID];
+    char secret[CONFIG_MAX_SECRET];
+    size_t i;
+
+    if (parse_client_secret(value, id, sizeof(id), secret, sizeof(secret)) !=
+        0) {
+        return -1;
+    }
+
     if (config->client_count >= CONFIG_MAX_CLIENTS) return -1;
 
     for (i = 0; i < (size_t)config->client_count; i++) {
@@ -399,11 +412,152 @@ static int set_client_cred(pipesix_config_t *config, const char *value)
         }
     }
 
-    memcpy(config->clients[config->client_count].id, id, id_len + 1);
-    memcpy(config->clients[config->client_count].secret, secret, secret_len);
-    config->clients[config->client_count].secret[secret_len] = '\0';
+    memcpy(config->clients[config->client_count].id, id, strlen(id) + 1);
+    memcpy(config->clients[config->client_count].secret, secret,
+           strlen(secret) + 1);
     config->client_count++;
 
+    return 0;
+}
+
+/* Parse '<id>: <secret>' for a staged key. */
+static int set_client_next(pipesix_config_t *config, const char *value)
+{
+    pipesix_client_cred_t *cred;
+    char id[CONFIG_MAX_CLIENT_ID];
+    char secret[CONFIG_MAX_SECRET];
+
+    if (parse_client_secret(value, id, sizeof(id), secret, sizeof(secret)) !=
+        0) {
+        return -1;
+    }
+
+    cred = (pipesix_client_cred_t *)config_find_client(config, id);
+    if (cred == NULL || cred->has_next_secret) {
+        return -1;
+    }
+
+    memcpy(cred->next_secret, secret, strlen(secret) + 1);
+    cred->has_next_secret = 1;
+    return 0;
+}
+
+/*
+ * Parse a UTC date or Unix timestamp into an expiry instant. A date means
+ * the first second of that UTC day, which is the usual "expires at the end
+ * of the previous day" interpretation.
+ */
+static int64_t days_from_civil(int year, unsigned int month,
+                               unsigned int day)
+{
+    int era;
+    unsigned int yoe;
+    unsigned int doy;
+    unsigned int doe;
+
+    year -= month <= 2;
+    era = (year >= 0 ? year : year - 399) / 400;
+    yoe = (unsigned int)(year - era * 400);
+    doy = (153u * (month + (month > 2 ? (unsigned int)-3 : 9u)) + 2u) / 5u +
+          day - 1u;
+    doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    return (int64_t)era * 146097 + (int64_t)doe - 719468;
+}
+
+static int parse_expiry_value(const char *value, int64_t *out)
+{
+    int year;
+    int month;
+    int day;
+    int consumed = 0;
+
+    if (value == NULL || out == NULL || value[0] == '\0') return -1;
+
+    if (strchr(value, '-') == NULL) {
+        char *end = NULL;
+        long long seconds;
+
+        errno = 0;
+        seconds = strtoll(value, &end, 10);
+        if (errno != 0 || end == value || *end != '\0' || seconds <= 0) {
+            return -1;
+        }
+        *out = (int64_t)seconds;
+        return 0;
+    }
+
+    if (sscanf(value, "%4d-%2d-%2d%n", &year, &month, &day, &consumed) != 3 ||
+        consumed != (int)strlen(value) || month < 1 || month > 12 ||
+        day < 1 || day > 31 || year < 1970 || year > 9999) {
+        return -1;
+    }
+
+    *out = days_from_civil(year, (unsigned int)month, (unsigned int)day) *
+           86400;
+    return *out > 0 ? 0 : -1;
+}
+
+static int set_client_disabled(pipesix_config_t *config, const char *value)
+{
+    pipesix_client_cred_t *cred;
+    char id[CONFIG_MAX_CLIENT_ID];
+    const char *end;
+    size_t len;
+
+    if (value == NULL) return -1;
+
+    while (isspace((unsigned char)*value)) value++;
+    end = value + strlen(value);
+    while (end > value && isspace((unsigned char)*(end - 1))) end--;
+    len = (size_t)(end - value);
+    if (len == 0 || len >= sizeof(id)) return -1;
+
+    memcpy(id, value, len);
+    id[len] = '\0';
+    if (!valid_client_id(id)) return -1;
+
+    cred = (pipesix_client_cred_t *)config_find_client(config, id);
+    if (cred == NULL || cred->disabled) return -1;
+    cred->disabled = 1;
+    return 0;
+}
+
+static int set_client_expiry(pipesix_config_t *config, const char *value)
+{
+    pipesix_client_cred_t *cred;
+    char work[CONFIG_MAX_CLIENT_ID + 64];
+    char *id;
+    char *when;
+    size_t len;
+    int64_t expires;
+
+    if (value == NULL) return -1;
+    len = strlen(value);
+    if (len == 0 || len >= sizeof(work)) return -1;
+    memcpy(work, value, len + 1);
+
+    id = work;
+    while (isspace((unsigned char)*id)) id++;
+    when = id;
+    while (*when != '\0' && !isspace((unsigned char)*when)) when++;
+    if (*when == '\0') return -1;
+    *when++ = '\0';
+    while (isspace((unsigned char)*when)) when++;
+
+    len = strlen(when);
+    while (len > 0 && isspace((unsigned char)when[len - 1])) {
+        when[--len] = '\0';
+    }
+
+    if (!valid_client_id(id) || parse_expiry_value(when, &expires) != 0) {
+        return -1;
+    }
+
+    cred = (pipesix_client_cred_t *)config_find_client(config, id);
+    if (cred == NULL || cred->has_expiry) return -1;
+
+    cred->has_expiry = 1;
+    cred->expires_at = expires;
     return 0;
 }
 
@@ -750,9 +904,11 @@ static pipesix_client_policy_t *policy_entry(pipesix_config_t *config,
 }
 
 /* Which limit a 'client_*' line sets. */
-#define POLICY_RATE  0
-#define POLICY_QUOTA 1
-#define POLICY_WARN  2
+#define POLICY_RATE      0
+#define POLICY_QUOTA     1
+#define POLICY_WARN      2
+#define POLICY_RATE_IN   3
+#define POLICY_RATE_OUT  4
 
 /*
  * Parse "client_rate_limit = <id> <kbit/s>",
@@ -766,7 +922,8 @@ static int set_client_policy(pipesix_config_t *config, const char *value,
                              int kind)
 {
     static const char *const names[] = {
-        "client_rate_limit", "client_quota", "client_quota_warn"
+        "client_rate_limit", "client_quota", "client_quota_warn",
+        "client_rate_limit_in", "client_rate_limit_out"
     };
     pipesix_client_policy_t *policy;
     char work[CONFIG_MAX_CLIENT_ID + 32];
@@ -804,10 +961,10 @@ static int set_client_policy(pipesix_config_t *config, const char *value,
             log_error("client_quota: '%d' MiB is too large", parsed);
             return -1;
         }
-    } else if (kind == POLICY_RATE) {
+    } else if (kind == POLICY_RATE || kind == POLICY_RATE_IN ||
+               kind == POLICY_RATE_OUT) {
         if (parsed > 100000000) {       /* 100 Gbit/s */
-            log_error("client_rate_limit: '%d' kbit/s is too large",
-                      parsed);
+            log_error("%s: '%d' kbit/s is too large", names[kind], parsed);
             return -1;
         }
     } else if (parsed > 99) {
@@ -832,6 +989,22 @@ static int set_client_policy(pipesix_config_t *config, const char *value,
             return -1;
         }
         policy->rate_kbps = (uint64_t)parsed;
+    } else if (kind == POLICY_RATE_IN) {
+        if (policy->rate_in_set) {
+            log_error("client_rate_limit_in: client '%s' already has an "
+                      "inbound rate", id);
+            return -1;
+        }
+        policy->rate_in_set = 1;
+        policy->rate_in_kbps = (uint64_t)parsed;
+    } else if (kind == POLICY_RATE_OUT) {
+        if (policy->rate_out_set) {
+            log_error("client_rate_limit_out: client '%s' already has an "
+                      "outbound rate", id);
+            return -1;
+        }
+        policy->rate_out_set = 1;
+        policy->rate_out_kbps = (uint64_t)parsed;
     } else if (kind == POLICY_QUOTA) {
         if (policy->quota_mib != 0) {
             log_error("client_quota: client '%s' already has a quota", id);
@@ -923,6 +1096,16 @@ static int config_set_value(pipesix_config_t *config, const char *key,
     if (strcmp(key, "metrics_token") == 0) {
         return copy_string(config->metrics_token, CONFIG_MAX_SECRET, value);
     }
+    if (strcmp(key, "audit_log") == 0) {
+        return copy_string(config->audit_log, CONFIG_PATH_MAX, value);
+    }
+    if (strcmp(key, "endpoint_failback") == 0) {
+        return set_bool(&config->endpoint_failback, value);
+    }
+    if (strcmp(key, "endpoint_failback_interval") == 0) {
+        return set_int_range(&config->endpoint_failback_interval, value, 1,
+                             86400);
+    }
     if (strcmp(key, "quota_state") == 0) {
         return copy_string(config->quota_state, CONFIG_PATH_MAX, value);
     }
@@ -942,11 +1125,26 @@ static int config_set_value(pipesix_config_t *config, const char *key,
     if (strcmp(key, "client") == 0) {
         return set_client_cred(config, value);
     }
+    if (strcmp(key, "client_next") == 0) {
+        return set_client_next(config, value);
+    }
+    if (strcmp(key, "client_disabled") == 0) {
+        return set_client_disabled(config, value);
+    }
+    if (strcmp(key, "client_expires") == 0) {
+        return set_client_expiry(config, value);
+    }
     if (strcmp(key, "client_route") == 0) {
         return set_client_route(config, value);
     }
     if (strcmp(key, "client_rate_limit") == 0) {
         return set_client_policy(config, value, POLICY_RATE);
+    }
+    if (strcmp(key, "client_rate_limit_in") == 0) {
+        return set_client_policy(config, value, POLICY_RATE_IN);
+    }
+    if (strcmp(key, "client_rate_limit_out") == 0) {
+        return set_client_policy(config, value, POLICY_RATE_OUT);
     }
     if (strcmp(key, "client_quota") == 0) {
         return set_client_policy(config, value, POLICY_QUOTA);
@@ -1360,6 +1558,13 @@ int config_validate(const pipesix_config_t *config)
         return -1;
     }
 
+    if (config->endpoint_failback_interval < 1 ||
+        config->endpoint_failback_interval > 86400) {
+        log_error("Configuration validation failed: "
+                  "'endpoint_failback_interval' must be 1-86400 seconds");
+        return -1;
+    }
+
     {
         int i;
 
@@ -1369,6 +1574,24 @@ int config_validate(const pipesix_config_t *config)
                 log_error("Configuration validation failed: client '%s' "
                           "sets 'client_quota_warn' without a "
                           "'client_quota'", config->policies[i].id);
+                return -1;
+            }
+        }
+    }
+
+    {
+        int i;
+
+        for (i = 0; i < config->client_count; i++) {
+            if (config->clients[i].has_next_secret &&
+                strlen(config->clients[i].next_secret) < 16) {
+                log_warn("Client '%s' has a short staged key; generate one "
+                         "with 'pipesix --genkey'", config->clients[i].id);
+            }
+            if (config->clients[i].has_expiry &&
+                config->clients[i].expires_at <= 0) {
+                log_error("Configuration validation failed: client '%s' "
+                          "has an invalid expiry", config->clients[i].id);
                 return -1;
             }
         }
@@ -1642,6 +1865,9 @@ void config_dump(const pipesix_config_t *config)
                      config->remote_endpoints[i]);
         }
         log_info("  remote_port     = %d", config->remote_port);
+        log_info("  endpoint_failback = %s (%d s)",
+                 config->endpoint_failback ? "on" : "off",
+                 config->endpoint_failback_interval);
     }
 
     if (strcmp(config->mode, "server") == 0) {
@@ -1690,6 +1916,16 @@ void config_dump(const pipesix_config_t *config)
                          config->clients[i].allow_count,
                          config->clients[i].deny_count);
             }
+            if (config->clients[i].has_next_secret) {
+                log_info("      staged key: yes");
+            }
+            if (config->clients[i].disabled) {
+                log_info("      state: disabled");
+            }
+            if (config->clients[i].has_expiry) {
+                log_info("      expires: %lld",
+                         (long long)config->clients[i].expires_at);
+            }
         }
 
         log_info("  strict_source   = %s",
@@ -1714,9 +1950,13 @@ void config_dump(const pipesix_config_t *config)
                 warn[0] = '\0';
             }
 
-            log_info("    limits: %s rate %llu kbit/s, quota %llu MiB/%s%s",
+            log_info("    limits: %s rate in %llu / out %llu kbit/s, "
+                     "quota %llu MiB/%s%s",
                      config->policies[i].id,
-                     (unsigned long long)config->policies[i].rate_kbps,
+                     (unsigned long long)pipesix_policy_rate_in(
+                         &config->policies[i]),
+                     (unsigned long long)pipesix_policy_rate_out(
+                         &config->policies[i]),
                      (unsigned long long)config->policies[i].quota_mib,
                      quota_name, warn);
         }
@@ -1733,6 +1973,8 @@ void config_dump(const pipesix_config_t *config)
     } else {
         log_info("  metrics         = disabled");
     }
+    log_info("  audit_log       = %s",
+             config->audit_log[0] != '\0' ? config->audit_log : "disabled");
     if (strcmp(config->mode, "server") == 0) {
         if (config->quota_state[0] != '\0') {
             log_info("  quota_state     = %s", config->quota_state);
@@ -1778,6 +2020,10 @@ int config_reload_runtime(pipesix_config_t *config)
     config->peer_timeout    = fresh.peer_timeout;
     config->session_timeout = fresh.session_timeout;
     config->stats_interval  = fresh.stats_interval;
+    config->endpoint_failback = fresh.endpoint_failback;
+    config->endpoint_failback_interval = fresh.endpoint_failback_interval;
+    copy_string(config->audit_log, sizeof(config->audit_log),
+                fresh.audit_log);
 
     /*
      * In server mode the credential table is reloadable too: this is how
@@ -1942,6 +2188,11 @@ static int rewrite_client_keys(const char *path,
         while (key[key_len] != '\0' && key[key_len] != '=' &&
                !isspace((unsigned char)key[key_len])) {
             key_len++;
+        }
+
+        /* A full rotation retires any staged replacement key. */
+        if (key_len == 11u && memcmp(key, "client_next", 11) == 0) {
+            continue;
         }
 
         /* 'client_id' and 'client_route' must not be mistaken for 'client'. */
@@ -2116,6 +2367,9 @@ int config_rotate_all_keys(pipesix_config_t *config)
         memcpy(config->clients[i].secret,
                new_keys + ((size_t)i * ROTATE_KEY_STRIDE),
                ROTATE_KEY_STRIDE);
+        memset(config->clients[i].next_secret, 0,
+               sizeof(config->clients[i].next_secret));
+        config->clients[i].has_next_secret = 0;
     }
 
     return 0;
@@ -2162,6 +2416,10 @@ static int line_names_client(const char *line, const char *id,
                (key_len == 12u && memcmp(p, "client_quota", 12) == 0) ||
                (key_len == 17u &&
                 memcmp(p, "client_rate_limit", 17) == 0) ||
+               (key_len == 20u &&
+                memcmp(p, "client_rate_limit_in", 20) == 0) ||
+               (key_len == 21u &&
+                memcmp(p, "client_rate_limit_out", 21) == 0) ||
                (key_len == 17u &&
                 memcmp(p, "client_quota_warn", 17) == 0);
 
@@ -2189,9 +2447,61 @@ static int line_names_client(const char *line, const char *id,
            memcmp(start, id, id_len) == 0;
 }
 
+/*
+ * Match one exact key and client id. Unlike line_names_client() this can
+ * identify auxiliary lines such as 'client_next' whose value does not use
+ * the same separator convention as the main client table.
+ */
+static int line_is_key_for(const char *line, const char *key,
+                           const char *id)
+{
+    const char *p = line;
+    const char *eq;
+    const char *start;
+    const char *end;
+    size_t key_len = 0;
+    size_t id_len = strlen(id);
+
+    while (isspace((unsigned char)*p)) {
+        p++;
+    }
+    if (*p == '\0' || *p == '#') {
+        return 0;
+    }
+    while (p[key_len] != '\0' && p[key_len] != '=' &&
+           !isspace((unsigned char)p[key_len])) {
+        key_len++;
+    }
+    if (key_len != strlen(key) || memcmp(p, key, key_len) != 0) {
+        return 0;
+    }
+
+    eq = strchr(p, '=');
+    if (eq == NULL) {
+        return 0;
+    }
+    start = eq + 1;
+    while (isspace((unsigned char)*start)) {
+        start++;
+    }
+    end = start;
+    while (*end != '\0' && *end != ':' && !isspace((unsigned char)*end)) {
+        end++;
+    }
+    return (size_t)(end - start) == id_len &&
+           memcmp(start, id, id_len) == 0;
+}
+
+static int line_is_aux_for(const char *line, const char *id)
+{
+    return line_is_key_for(line, "client_next", id) ||
+           line_is_key_for(line, "client_disabled", id) ||
+           line_is_key_for(line, "client_expires", id);
+}
+
 static int line_belongs_to_client(const char *line, const char *id)
 {
-    return line_names_client(line, id, 0);
+    return line_names_client(line, id, 0) || line_is_aux_for(line, id);
 }
 
 static int line_is_limit_for(const char *line, const char *id)
@@ -2361,6 +2671,30 @@ int config_add_client(pipesix_config_t *config, const char *id,
             }
         }
 
+        if (limits->rate_in_set) {
+            if (snprintf(line, sizeof(line),
+                         "client_rate_limit_in = %s %llu\n", id,
+                         (unsigned long long)limits->rate_in_kbps) >=
+                (int)sizeof(line)) {
+                goto cleanup;
+            }
+            if (fputs(line, out) == EOF) {
+                goto cleanup;
+            }
+        }
+
+        if (limits->rate_out_set) {
+            if (snprintf(line, sizeof(line),
+                         "client_rate_limit_out = %s %llu\n", id,
+                         (unsigned long long)limits->rate_out_kbps) >=
+                (int)sizeof(line)) {
+                goto cleanup;
+            }
+            if (fputs(line, out) == EOF) {
+                goto cleanup;
+            }
+        }
+
         if (limits->quota_mib > 0) {
             if (snprintf(line, sizeof(line),
                          "client_quota = %s %llu\n", id,
@@ -2421,13 +2755,18 @@ int config_add_client(pipesix_config_t *config, const char *id,
         }
 
         if (limits != NULL &&
-            (limits->rate_kbps > 0 || limits->quota_mib > 0 ||
+            (limits->rate_kbps > 0 || limits->rate_in_set ||
+             limits->rate_out_set || limits->quota_mib > 0 ||
              limits->warn_percent > 0)) {
             const pipesix_client_policy_t *policy =
                 config_find_policy(&check, id);
 
             if (policy == NULL ||
                 policy->rate_kbps != limits->rate_kbps ||
+                policy->rate_in_set != limits->rate_in_set ||
+                policy->rate_in_kbps != limits->rate_in_kbps ||
+                policy->rate_out_set != limits->rate_out_set ||
+                policy->rate_out_kbps != limits->rate_out_kbps ||
                 policy->quota_mib != limits->quota_mib ||
                 policy->warn_percent != limits->warn_percent) {
                 log_error("the limits for client '%s' were not accepted; "
@@ -2579,15 +2918,22 @@ cleanup:
 }
 
 int config_set_limits(pipesix_config_t *config, const char *id,
-                      const uint64_t *rate_kbps, const uint64_t *quota_mib,
+                      const uint64_t *rate_kbps,
+                      const uint64_t *rate_in_kbps,
+                      const uint64_t *rate_out_kbps,
+                      const uint64_t *quota_mib,
                       const uint64_t *warn_percent)
 {
     const pipesix_client_policy_t *current;
-    char append[512];
+    char append[768];
     size_t used = 0;
     uint64_t rate;
+    uint64_t rate_in;
+    uint64_t rate_out;
     uint64_t quota;
     uint64_t warn;
+    int have_in;
+    int have_out;
 
     if (config == NULL || id == NULL || config->config_path[0] == '\0') {
         return -1;
@@ -2604,14 +2950,26 @@ int config_set_limits(pipesix_config_t *config, const char *id,
         return -1;
     }
 
-    if (rate_kbps == NULL && quota_mib == NULL && warn_percent == NULL) {
-        log_error("--set-limit needs --rate, --quota or --quota-warn");
+    if (rate_kbps == NULL && rate_in_kbps == NULL &&
+        rate_out_kbps == NULL && quota_mib == NULL && warn_percent == NULL) {
+        log_error("--set-limit needs --rate, --rate-in, --rate-out, "
+                  "--quota or --quota-warn");
         return -1;
     }
 
     if (rate_kbps != NULL && *rate_kbps > 100000000u) {
         log_error("--rate: '%llu' kbit/s is too large",
                   (unsigned long long)*rate_kbps);
+        return -1;
+    }
+    if (rate_in_kbps != NULL && *rate_in_kbps > 100000000u) {
+        log_error("--rate-in: '%llu' kbit/s is too large",
+                  (unsigned long long)*rate_in_kbps);
+        return -1;
+    }
+    if (rate_out_kbps != NULL && *rate_out_kbps > 100000000u) {
+        log_error("--rate-out: '%llu' kbit/s is too large",
+                  (unsigned long long)*rate_out_kbps);
         return -1;
     }
 
@@ -2637,6 +2995,17 @@ int config_set_limits(pipesix_config_t *config, const char *id,
                ? *warn_percent
                : (current != NULL ? current->warn_percent : 0);
 
+    have_in = rate_in_kbps != NULL ||
+              (current != NULL && current->rate_in_set);
+    rate_in = (rate_in_kbps != NULL)
+                  ? *rate_in_kbps
+                  : (current != NULL ? current->rate_in_kbps : 0);
+    have_out = rate_out_kbps != NULL ||
+               (current != NULL && current->rate_out_set);
+    rate_out = (rate_out_kbps != NULL)
+                   ? *rate_out_kbps
+                   : (current != NULL ? current->rate_out_kbps : 0);
+
     if (warn > 0 && quota == 0) {
         log_error("--quota-warn needs a quota: set --quota first");
         return -1;
@@ -2648,6 +3017,29 @@ int config_set_limits(pipesix_config_t *config, const char *id,
         int n = snprintf(append + used, sizeof(append) - used,
                          "client_rate_limit = %s %llu\n", id,
                          (unsigned long long)rate);
+
+        if (n < 0 || (size_t)n >= sizeof(append) - used) {
+            return -1;
+        }
+        used += (size_t)n;
+    }
+
+    /* An explicit 0 overrides the shared rate in that direction. */
+    if (have_in) {
+        int n = snprintf(append + used, sizeof(append) - used,
+                         "client_rate_limit_in = %s %llu\n", id,
+                         (unsigned long long)rate_in);
+
+        if (n < 0 || (size_t)n >= sizeof(append) - used) {
+            return -1;
+        }
+        used += (size_t)n;
+    }
+
+    if (have_out) {
+        int n = snprintf(append + used, sizeof(append) - used,
+                         "client_rate_limit_out = %s %llu\n", id,
+                         (unsigned long long)rate_out);
 
         if (n < 0 || (size_t)n >= sizeof(append) - used) {
             return -1;
@@ -2703,6 +3095,366 @@ int config_clear_limits(pipesix_config_t *config, const char *id)
     }
 
     return rewrite_limits(config, id, NULL);
+}
+
+/*
+ * Remove one auxiliary client line and optionally append its replacement.
+ * The caller verifies the resulting in-memory state after the reload.
+ */
+static int rewrite_client_aux(pipesix_config_t *config, const char *id,
+                              const char *key, const char *append)
+{
+    char path[CONFIG_PATH_MAX];
+    char tmp_path[CONFIG_PATH_MAX + 32];
+    char buf[4096];
+    FILE *in = NULL;
+    FILE *out = NULL;
+    int last = '\n';
+    int rc = -1;
+
+    snprintf(path, sizeof(path), "%s", config->config_path);
+    in = fopen(path, "r");
+    if (in == NULL) {
+        return -1;
+    }
+    if (open_replacement(path, tmp_path, sizeof(tmp_path), &out) != 0) {
+        fclose(in);
+        return -1;
+    }
+
+    while (fgets(buf, sizeof(buf), in) != NULL) {
+        if (line_is_key_for(buf, key, id)) {
+            last = buf[strlen(buf) - 1];
+            continue;
+        }
+        if (fputs(buf, out) == EOF) {
+            goto cleanup;
+        }
+        last = buf[strlen(buf) - 1];
+    }
+
+    if (ferror(in)) {
+        goto cleanup;
+    }
+    if (append != NULL) {
+        if (last != '\n' && fputc('\n', out) == EOF) {
+            goto cleanup;
+        }
+        if (fputs(append, out) == EOF) {
+            goto cleanup;
+        }
+    }
+
+    if (fflush(out) != 0 || sync_file(out) != 0) {
+        goto cleanup;
+    }
+    if (fclose(out) != 0) {
+        out = NULL;
+        goto cleanup;
+    }
+    out = NULL;
+
+    {
+        pipesix_config_t check;
+
+        if (config_load(tmp_path, &check) != 0 ||
+            config_validate(&check) != 0) {
+            log_error("the rewritten configuration is invalid; '%s' is "
+                      "unchanged", config->config_path);
+            goto cleanup;
+        }
+    }
+
+    if (rename(tmp_path, path) != 0) {
+        log_error("cannot replace '%s': %s", path, strerror(errno));
+        goto cleanup;
+    }
+    if (config_load(path, config) != 0) {
+        log_error("cannot reload '%s' after the rewrite", path);
+        return -1;
+    }
+
+    rc = 0;
+
+cleanup:
+    if (out != NULL) {
+        fclose(out);
+    }
+    fclose(in);
+    if (rc != 0) {
+        unlink(tmp_path);
+    }
+    return rc;
+}
+
+int config_stage_key(pipesix_config_t *config, const char *id,
+                     char *secret_out, size_t secret_size)
+{
+    const pipesix_client_cred_t *cred;
+    char key_hex[ROTATE_KEY_STRIDE];
+    char line[CONFIG_MAX_CLIENT_ID + CONFIG_MAX_SECRET + 32];
+    uint8_t key[PIPESIX_KEY_LEN];
+
+    if (config == NULL || id == NULL || config->config_path[0] == '\0') {
+        return -1;
+    }
+    if (strcmp(config->mode, "server") != 0) {
+        log_error("keys can only be staged on a server configuration");
+        return -1;
+    }
+    cred = config_find_client(config, id);
+    if (cred == NULL) {
+        log_error("client '%s' is not configured in '%s'", id,
+                  config->config_path);
+        return -1;
+    }
+    if (cred->has_next_secret) {
+        log_error("client '%s' already has a staged key; promote or abort "
+                  "it first", id);
+        return -1;
+    }
+    if (pipesix_random_bytes(key, sizeof(key)) != 0) {
+        log_error("cannot read random bytes: %s", strerror(errno));
+        return -1;
+    }
+    pipesix_hex_encode(key, sizeof(key), key_hex);
+    memset(key, 0, sizeof(key));
+
+    if (snprintf(line, sizeof(line), "client_next = %s: %s\n", id,
+                 key_hex) >= (int)sizeof(line)) {
+        return -1;
+    }
+    if (rewrite_client_aux(config, id, "client_next", line) != 0) {
+        return -1;
+    }
+
+    cred = config_find_client(config, id);
+    if (cred == NULL || !cred->has_next_secret ||
+        strcmp(cred->next_secret, key_hex) != 0) {
+        log_error("the staged key for client '%s' was not accepted", id);
+        return -1;
+    }
+    if (secret_out != NULL && secret_size > 0) {
+        snprintf(secret_out, secret_size, "%s", key_hex);
+    }
+    return 0;
+}
+
+int config_abort_key(pipesix_config_t *config, const char *id)
+{
+    const pipesix_client_cred_t *cred;
+
+    if (config == NULL || id == NULL || config->config_path[0] == '\0') {
+        return -1;
+    }
+    cred = config_find_client(config, id);
+    if (cred == NULL || !cred->has_next_secret) {
+        log_error("client '%s' has no staged key", id);
+        return -1;
+    }
+    if (rewrite_client_aux(config, id, "client_next", NULL) != 0) {
+        return -1;
+    }
+    cred = config_find_client(config, id);
+    if (cred == NULL || cred->has_next_secret) {
+        log_error("the staged key for client '%s' was not removed", id);
+        return -1;
+    }
+    return 0;
+}
+
+int config_promote_key(pipesix_config_t *config, const char *id)
+{
+    const pipesix_client_cred_t *cred;
+    char path[CONFIG_PATH_MAX];
+    char tmp_path[CONFIG_PATH_MAX + 32];
+    char buf[4096];
+    char line[CONFIG_MAX_CLIENT_ID + CONFIG_MAX_SECRET + 32];
+    char new_secret[CONFIG_MAX_SECRET];
+    FILE *in = NULL;
+    FILE *out = NULL;
+    int found = 0;
+    int rc = -1;
+
+    if (config == NULL || id == NULL || config->config_path[0] == '\0') {
+        return -1;
+    }
+    cred = config_find_client(config, id);
+    if (cred == NULL || !cred->has_next_secret) {
+        log_error("client '%s' has no staged key to promote", id);
+        return -1;
+    }
+    snprintf(new_secret, sizeof(new_secret), "%s", cred->next_secret);
+    snprintf(path, sizeof(path), "%s", config->config_path);
+
+    in = fopen(path, "r");
+    if (in == NULL) {
+        return -1;
+    }
+    if (open_replacement(path, tmp_path, sizeof(tmp_path), &out) != 0) {
+        fclose(in);
+        return -1;
+    }
+
+    while (fgets(buf, sizeof(buf), in) != NULL) {
+        if (line_is_key_for(buf, "client", id)) {
+            if (snprintf(line, sizeof(line), "client = %s: %s\n", id,
+                         new_secret) >= (int)sizeof(line)) {
+                goto cleanup;
+            }
+            if (fputs(line, out) == EOF) {
+                goto cleanup;
+            }
+            found = 1;
+            continue;
+        }
+        if (line_is_key_for(buf, "client_next", id)) {
+            continue;
+        }
+        if (fputs(buf, out) == EOF) {
+            goto cleanup;
+        }
+    }
+
+    if (ferror(in) || !found) {
+        goto cleanup;
+    }
+    if (fflush(out) != 0 || sync_file(out) != 0) {
+        goto cleanup;
+    }
+    if (fclose(out) != 0) {
+        out = NULL;
+        goto cleanup;
+    }
+    out = NULL;
+
+    {
+        pipesix_config_t check;
+
+        if (config_load(tmp_path, &check) != 0 ||
+            config_validate(&check) != 0) {
+            log_error("the promoted configuration is invalid; '%s' is "
+                      "unchanged", config->config_path);
+            goto cleanup;
+        }
+        cred = config_find_client(&check, id);
+        if (cred == NULL || strcmp(cred->secret, new_secret) != 0 ||
+            cred->has_next_secret) {
+            log_error("the promoted key for client '%s' was not accepted",
+                      id);
+            goto cleanup;
+        }
+    }
+
+    if (rename(tmp_path, path) != 0) {
+        log_error("cannot replace '%s': %s", path, strerror(errno));
+        goto cleanup;
+    }
+    if (config_load(path, config) != 0) {
+        log_error("cannot reload '%s' after the rewrite", path);
+        return -1;
+    }
+    rc = 0;
+
+cleanup:
+    if (out != NULL) {
+        fclose(out);
+    }
+    fclose(in);
+    if (rc != 0) {
+        unlink(tmp_path);
+    }
+    return rc;
+}
+
+int config_set_client_disabled(pipesix_config_t *config, const char *id,
+                               int disabled)
+{
+    const pipesix_client_cred_t *cred;
+    char line[CONFIG_MAX_CLIENT_ID + 32];
+
+    if (config == NULL || id == NULL || config->config_path[0] == '\0') {
+        return -1;
+    }
+    cred = config_find_client(config, id);
+    if (cred == NULL) {
+        log_error("client '%s' is not configured in '%s'", id,
+                  config->config_path);
+        return -1;
+    }
+    if (cred->disabled == (disabled != 0)) {
+        return 0;
+    }
+
+    if (disabled) {
+        if (snprintf(line, sizeof(line), "client_disabled = %s\n", id) >=
+            (int)sizeof(line)) {
+            return -1;
+        }
+        if (rewrite_client_aux(config, id, "client_disabled", line) != 0) {
+            return -1;
+        }
+    } else if (rewrite_client_aux(config, id, "client_disabled", NULL) != 0) {
+        return -1;
+    }
+
+    cred = config_find_client(config, id);
+    if (cred == NULL || cred->disabled != (disabled != 0)) {
+        log_error("the state for client '%s' was not updated", id);
+        return -1;
+    }
+    return 0;
+}
+
+int config_set_client_expiry(pipesix_config_t *config, const char *id,
+                             const char *when)
+{
+    const pipesix_client_cred_t *cred;
+    char line[CONFIG_MAX_CLIENT_ID + 64];
+    int64_t expires;
+
+    if (config == NULL || id == NULL || config->config_path[0] == '\0') {
+        return -1;
+    }
+    cred = config_find_client(config, id);
+    if (cred == NULL) {
+        log_error("client '%s' is not configured in '%s'", id,
+                  config->config_path);
+        return -1;
+    }
+
+    if (when == NULL || strcasecmp(when, "never") == 0) {
+        if (!cred->has_expiry) {
+            return 0;
+        }
+        if (rewrite_client_aux(config, id, "client_expires", NULL) != 0) {
+            return -1;
+        }
+        cred = config_find_client(config, id);
+        if (cred == NULL || cred->has_expiry) {
+            log_error("the expiry for client '%s' was not cleared", id);
+            return -1;
+        }
+        return 0;
+    }
+
+    if (parse_expiry_value(when, &expires) != 0) {
+        log_error("expiry must be YYYY-MM-DD or a Unix timestamp");
+        return -1;
+    }
+    if (snprintf(line, sizeof(line), "client_expires = %s %s\n", id,
+                 when) >= (int)sizeof(line)) {
+        return -1;
+    }
+    if (rewrite_client_aux(config, id, "client_expires", line) != 0) {
+        return -1;
+    }
+    cred = config_find_client(config, id);
+    if (cred == NULL || !cred->has_expiry || cred->expires_at != expires) {
+        log_error("the expiry for client '%s' was not accepted", id);
+        return -1;
+    }
+    return 0;
 }
 
 int config_remove_client(pipesix_config_t *config, const char *id)

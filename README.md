@@ -31,7 +31,7 @@ Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] �
 - Server client allow-list (`allow_client`, up to 64 entries)
 - Per-client destination ACLs (`client_allow` / `client_deny`) and
   `client_isolation`, which stops one client from reaching another's
-  return prefix unless its rules allow it
+  return prefix even when that prefix is otherwise allowed
 - Optional strict source enforcement: `strict_source` drops data whose
   inner source is outside the client's `client_route`, so a delegated
   prefix is also a security boundary
@@ -41,6 +41,20 @@ Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] �
 - Runtime client provisioning: `--add-client` and `--remove-client` rewrite
   the configuration atomically and make a running server reload it; a
   generated client configuration can be written for hand-off
+- Zero-downtime key rotation: `--stage-key` keeps the current key valid
+  while a new one is distributed, then `--promote-key` makes it current
+- Client lifecycle controls: `--disable-client`, `--enable-client` and
+  `--expire-client` refuse a client without deleting its route, quota or
+  history
+- Side-effect-free `--doctor` probing: verifies DNS, UDP reachability and
+  authentication at every relay endpoint without opening a TUN device or
+  disturbing a live session
+- Optional automatic failback to the preferred relay after the client has
+  moved to a later endpoint
+- Append-only JSONL audit log for handshakes, ACL drops, quota exhaustion,
+  reloads, key changes and administrative client changes
+- Per-direction rate limits with `client_rate_limit_in`/`_out`, while
+  `client_rate_limit` remains the shared default
 - Liveness and readiness probes: `/healthz` proves the process is running,
   while `/readyz` fails until the TUN device and socket can forward
 - Prefix delegation: `--add-client <id> --delegate` hands a client a whole
@@ -162,17 +176,20 @@ sudo systemctl enable --now pipesix
 sudo systemctl reload pipesix     # apply log_level/keepalive/peer_timeout/...
 sudo kill -USR1 $(pidof pipesix)  # dump statistics now
 sudo pipesix --rotate-all         # new client keys, printed and reloaded
+sudo pipesix --doctor             # probe relay endpoints from a client
 ```
 
 `systemctl reload` sends SIGHUP. It applies `log_level`, `log_format`,
 `keepalive`, `peer_timeout`, `session_timeout`, `stats_interval`,
 `strict_source`, `client_isolation`, `allow_client`, `quota_period`,
 `quota_action`, `quota_grace`, `quota_throttle_kbps`, `quota_state`,
-`usage_history`, `metrics_*`, the credentials (the `client`/`client_route`
-table, ACLs and limits on a server; the `secret` and `client_id` on a
-client), and a client's `remote_address`/`remote_port`. A client that sees
-new endpoints drains its workers, reconnects and re-handshakes; a server
-restarts the metrics listener if its address, port or token changed.
+`usage_history`, `metrics_*`, `audit_log`, `endpoint_failback`,
+the credentials (the `client`/`client_route` table, staged keys, disabled
+and expired clients, ACLs and limits on a server; the `secret` and
+`client_id` on a client), and a client's `remote_address`/`remote_port`.
+A client that sees new endpoints drains its workers, reconnects and
+re-handshakes; a server restarts the metrics listener if its address, port
+or token changed.
 Interface, `mode`, `user`/`group` and `bind_address` changes still require a
 restart.
 
@@ -234,8 +251,9 @@ client with `client_id`, `peer`, `rx_bytes`, `tx_bytes`, `frames`,
 `idle_seconds`, `route` and `limits`) and `stats`. A client reports
 `client_id`, `remote`, `session` and the same `stats` object. `route` is
 `null` when the client has no `client_route`, and `limits` is `null` unless
-the client has a `client_rate_limit` or `client_quota`; otherwise it is an
-object with `rate_kbps`, `quota_mib`, `quota_period` and
+the client has a rate limit or `client_quota`; otherwise it is an object
+with `rate_kbps` (the higher of the two effective direction caps),
+`rate_in_kbps`, `rate_out_kbps`, `quota_mib`, `quota_period` and
 `quota_remaining_bytes` (the last is the budget left for the current period,
 or `0` without a quota).
 `--json` is only valid with `--status`.
@@ -252,10 +270,26 @@ remote_port    = 8899
 All endpoints use the same `remote_port`, and up to eight are accepted. The
 client resolves and tries them at startup; when a relay stops answering, or
 answers the handshake but never completes it, the client moves on to the
-next one. Every reconnect attempt re-resolves DNS. It does not fail back
-automatically once a later endpoint works, and `--status` reports the
+next one. Every reconnect attempt re-resolves DNS. `--status` reports the
 endpoint currently in use. Editing the list and sending SIGHUP makes a
 running client reconnect to the new list without restarting.
+
+Set `endpoint_failback = on` to probe the first endpoint in the background
+while a later one is carrying traffic. The probe is authenticated but does
+not create a session, so a live tunnel is unaffected; after a successful
+reply the client reconnects to the preferred endpoint. The interval is
+`endpoint_failback_interval` seconds (default 60). Failback is off by
+default so an ordered, metered relay list is never reordered unexpectedly.
+
+```ini
+endpoint_failback = on
+endpoint_failback_interval = 60
+```
+
+`pipesix --doctor -c /etc/pipesix/pipesix.conf` performs the same probe
+against every endpoint and prints the selected endpoint, round-trip time and
+authentication result. It needs no root, does not open the TUN device, and
+is safe to run while the client is connected.
 
 ### Prometheus metrics
 
@@ -362,6 +396,29 @@ A JSON line looks like:
 {"time":"2026-11-18T12:00:00Z","level":"info","file":"server.c","line":1234,"func":"receiver_loop","msg":"Client 'alice' handshake from 203.0.113.5:41622"}
 ```
 
+### Audit log
+
+Set `audit_log` to keep a separate append-only JSONL record of security
+and lifecycle events:
+
+```ini
+audit_log = /var/log/pipesix/audit.jsonl
+```
+
+Each line is one object with `time`, `event`, `client`, `peer` and `msg`.
+Recorded events include `handshake`, `handshake_failed`, `client_refused`,
+`acl_denied` (once per session), `quota_exhausted`, `reload`, `key_staged`,
+`key_promoted`, `key_changed`, `client_disabled`, `client_enabled`,
+`client_expiry_set`, `client_refused`, `session_blocked`, `startup` and
+`shutdown`. The file is created with mode `0600` and is safe for a running
+server and a provisioning command to append to concurrently. Changing
+`audit_log` takes effect on SIGHUP; the old file is left untouched. Audit
+writing is best-effort: a full disk disables auditing rather than
+recursing through the normal logger.
+
+Audit records are separate from `log_format = json`, so log rotation and
+retention can be managed independently.
+
 ### Per-client limits
 
 A server can cap what one client may use without touching the others. The
@@ -373,14 +430,19 @@ quota_period        = monthly     # daily (default), weekly, monthly or custom
 quota_action        = drop        # or throttle
 quota_grace         = 0           # extra MiB before the action
 quota_throttle_kbps = 64          # over-quota rate when throttling
-client_rate_limit   = mac1 50000  # 50 Mbit/s
+client_rate_limit   = mac1 50000  # shared default: 50 Mbit/s
+client_rate_limit_in  = mac1 20000 # client -> relay: 20 Mbit/s
+client_rate_limit_out = mac1 50000 # relay -> client: 50 Mbit/s
 client_quota        = mac1 10240  # 10 GiB per period
 client_quota_warn   = mac1 90     # tell the client at 90% of the quota
 ```
 
-`client_rate_limit` is in **kilobits per second**, enforced with a token
-bucket that allows a one-second burst (or one full packet, when the cap is
-slower than that). `client_quota` is in **MiB per UTC period**, where
+`client_rate_limit` is in **kilobits per second** and sets both directions;
+`client_rate_limit_in` and `client_rate_limit_out` override one direction.
+An explicit `0` in a directional line means unlimited even when the shared
+rate is set. The same split is available as `--rate-in`/`--rate-out` with
+`--add-client` or `--set-limit`. Each cap uses a token bucket that allows a
+one-second burst (or one full packet, when the cap is slower than that). `client_quota` is in **MiB per UTC period**, where
 `quota_period` selects a UTC day (the default), UTC calendar week, UTC
 calendar month, or a custom number of UTC days (`quota_period = custom` plus
 `quota_period_days`, 1-365). It counts the bytes the client sent and
@@ -670,6 +732,66 @@ per session is logged and counted in `dropped`. Only clients with a route
 can be checked, so give every client a `client_route` (or delegated /64)
 before enabling it. Rate limits and quotas count the whole session, LAN
 traffic included.
+
+### Zero-downtime key rotation
+
+`--rotate-all` changes every current key immediately, which is the right
+tool when a key leaked but leaves old clients unable to connect until
+they are updated. For a planned rotation, stage one client's replacement
+first:
+
+```bash
+sudo pipesix --stage-key alice -c /etc/pipesix/pipesix.conf
+```
+
+This writes a `client_next` line and reloads the server. The old key keeps
+working, so clients that have not been updated yet stay connected. Put the
+new key on Alice's host, confirm `pipesix --status` shows her new session,
+then make it current:
+
+```bash
+sudo pipesix --promote-key alice -c /etc/pipesix/pipesix.conf
+```
+
+Promotion removes the staged line and asks the live session to
+re-handshake with the new key. If the rollout cannot continue, discard the
+staged key and keep the current one:
+
+```bash
+sudo pipesix --abort-key alice -c /etc/pipesix/pipesix.conf
+```
+
+A client has one staged key at a time. `--rotate-all` retires any staged
+keys, so it remains the emergency path rather than the normal rollout.
+
+### Client expiry and disabling
+
+A client can be refused without deleting its route, quota or usage
+history. `--disable-client` adds a `client_disabled` line and drops a live
+session on reload; `--enable-client` is the reverse:
+
+```bash
+sudo pipesix --disable-client alice -c /etc/pipesix/pipesix.conf
+sudo pipesix --enable-client alice  -c /etc/pipesix/pipesix.conf
+```
+
+An expiry is a UTC date or Unix timestamp. The date means the first second
+of that day. A live session is closed when the server notices the expiry,
+and later handshakes are refused:
+
+```bash
+sudo pipesix --expire-client alice 2027-01-01 -c /etc/pipesix/pipesix.conf
+sudo pipesix --expire-client alice never      -c /etc/pipesix/pipesix.conf
+```
+
+The equivalent configuration is:
+
+```ini
+client_disabled = alice
+client_expires = alice 2027-01-01
+```
+
+Both states are reloadable and are recorded in the audit log.
 
 ### Rotating a key
 

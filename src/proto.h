@@ -46,6 +46,10 @@
  *   PIPESIX_FLAG_QUOTA_STATE       - server reports quota bytes, used
  *                                    bytes and the period bounds in a
  *                                    fixed 32-byte authenticated payload
+ *   PIPESIX_FLAG_PROBE_REQ        - authenticated, side-effect-free
+ *                                    reachability probe
+ *   PIPESIX_FLAG_PROBE_RESP       - reply to a probe, signed with the
+ *                                    same PSK and client nonce
  *
  * The two quota notices are sent inside the session, authenticated with
  * the server-to-client key, so a spoofed datagram cannot fake them.
@@ -106,6 +110,8 @@
 #define PIPESIX_FLAG_QUOTA_EXHAUSTED 0x0080u
 #define PIPESIX_FLAG_QUOTA_REQUEST   0x0100u
 #define PIPESIX_FLAG_QUOTA_STATE     0x0200u
+#define PIPESIX_FLAG_PROBE_REQ       0x0400u
+#define PIPESIX_FLAG_PROBE_RESP      0x0800u
 #define PIPESIX_FLAG_KNOWN          (PIPESIX_FLAG_AUTH | PIPESIX_FLAG_KEEPALIVE | \
                                      PIPESIX_FLAG_HANDSHAKE_INIT | \
                                      PIPESIX_FLAG_HANDSHAKE_RESP | \
@@ -114,7 +120,9 @@
                                      PIPESIX_FLAG_QUOTA_WARNING | \
                                      PIPESIX_FLAG_QUOTA_EXHAUSTED | \
                                      PIPESIX_FLAG_QUOTA_REQUEST | \
-                                     PIPESIX_FLAG_QUOTA_STATE)
+                                     PIPESIX_FLAG_QUOTA_STATE | \
+                                     PIPESIX_FLAG_PROBE_REQ | \
+                                     PIPESIX_FLAG_PROBE_RESP)
 
 /* Fixed header size on the wire */
 #define PIPESIX_HEADER_SIZE         24

@@ -31,9 +31,16 @@
  *                      device and sockets
  *   client_id        - This client's identity (client mode)
  *   client           - <id>: <secret> credential (server mode, repeatable)
+ *   client_next      - <id>: <secret> staged replacement key, accepted
+ *                      alongside the current one (server, repeatable)
  *   client_route     - <id> <ipv6[/len]> inner prefix for return traffic
  *                      (server mode, repeatable, follows its client line)
- *   client_rate_limit - <id> <kbit/s> bandwidth cap (server, repeatable)
+ *   client_disabled  - <id> temporarily refuse this client (server)
+ *   client_expires   - <id> <YYYY-MM-DD|unix-seconds> expiry (server)
+ *   client_rate_limit - <id> <kbit/s> bandwidth cap in both directions
+ *                      (server, repeatable)
+ *   client_rate_limit_in - <id> <kbit/s> client-to-server cap
+ *   client_rate_limit_out - <id> <kbit/s> server-to-client cap
  *   client_quota     - <id> <MiB> bytes per UTC period (server, repeatable)
  *   client_quota_warn - <id> <percent> warn the client at this usage
  *                      (server, repeatable)
@@ -67,6 +74,9 @@
  *   metrics_port     - Port for the Prometheus metrics endpoint
  *   metrics_token    - Bearer token required by GET /metrics
  *                      (empty leaves the endpoint open)
+ *   audit_log        - Append-only JSONL security audit file
+ *   endpoint_failback - Return to the first relay after it recovers
+ *   endpoint_failback_interval - Seconds between preferred-relay probes
  *   log_level        - debug, info, warn, error, fatal
  *   log_format       - text (default) or json
  *
@@ -140,20 +150,44 @@ typedef struct {
     uint8_t deny[CONFIG_MAX_ACL_PREFIXES][16];
     int     deny_len[CONFIG_MAX_ACL_PREFIXES];
     int     deny_count;
+    /* Staged replacement key accepted during a zero-downtime rotation. */
+    char    next_secret[CONFIG_MAX_SECRET];
+    int     has_next_secret;
+    /* Administrative state, checked before authentication and by reload. */
+    int     disabled;
+    int     has_expiry;
+    int64_t expires_at;
 } pipesix_client_cred_t;
 
 /*
  * Optional per-client limits, applied by the server in both directions.
- * rate_kbps caps bandwidth in kilobits per second and quota_mib caps the
- * bytes moved per UTC period; 0 means unlimited for either.
+ * rate_kbps is the default for both directions; rate_in/out override it
+ * when their corresponding _set flag is non-zero. quota_mib caps the bytes
+ * moved per UTC period; 0 means unlimited for either.
  */
 typedef struct {
     char     id[CONFIG_MAX_CLIENT_ID];
     uint64_t rate_kbps;
+    uint64_t rate_in_kbps;
+    uint64_t rate_out_kbps;
+    int      rate_in_set;
+    int      rate_out_set;
     uint64_t quota_mib;
     /* Percentage of the quota at which the client is warned; 0 = off. */
     uint64_t warn_percent;
 } pipesix_client_policy_t;
+
+static inline uint64_t pipesix_policy_rate_in(
+    const pipesix_client_policy_t *policy)
+{
+    return policy->rate_in_set ? policy->rate_in_kbps : policy->rate_kbps;
+}
+
+static inline uint64_t pipesix_policy_rate_out(
+    const pipesix_client_policy_t *policy)
+{
+    return policy->rate_out_set ? policy->rate_out_kbps : policy->rate_kbps;
+}
 
 /*
  * pipesix_config_t
@@ -242,8 +276,8 @@ typedef struct {
 
     /*
      * Prometheus endpoint. An empty metrics_address disables it; the
-     * port is only used when an address is configured. Like bind_address
-     * it is applied at startup, so changing it needs a restart.
+     * port is only used when an address is configured. A SIGHUP stops the
+     * old listener and starts a new one with the current settings.
      *
      * metrics_token holds a bearer token: when set, GET /metrics requires
      * 'Authorization: Bearer <token>'. GET /healthz never does, so a
@@ -254,20 +288,25 @@ typedef struct {
     int  metrics_port;
     char metrics_token[CONFIG_MAX_SECRET];
 
+    /* Append-only JSONL security audit, empty disables it. */
+    char audit_log[CONFIG_PATH_MAX];
+
+    /* Client mode: return to the first endpoint after it recovers. */
+    int  endpoint_failback;
+    int  endpoint_failback_interval;  /* seconds between preferred probes */
+
     /*
      * Per-client quota state (server mode). When set, the server restores
      * the current period's counters from this file at startup and rewrites
-     * it periodically and on shutdown. Empty disables persistence. It is
-     * applied at startup like the metrics endpoint, so changing the path
-     * needs a restart.
+     * it periodically and on shutdown. Empty disables persistence. A
+     * SIGHUP switches to a new path without touching the old file.
      */
     char quota_state[CONFIG_PATH_MAX];
 
     /*
      * Completed quota periods are appended here as CSV (server mode).
      * The path is read when a period rolls over, so an empty value keeps
-     * no history. Like quota_state it is not reloaded into the running
-     * server, so changing it needs a restart.
+     * no history. Like quota_state, a SIGHUP applies a changed path.
      */
     char usage_history[CONFIG_PATH_MAX];
 
@@ -315,11 +354,11 @@ void config_dump(const pipesix_config_t *config);
  * Re-read runtime-tunable settings from config->config_path.
  *
  * Applies log_level, log_format, keepalive, peer_timeout, session_timeout,
- * stats_interval, the per-client limits and the credentials: the
- * per-client table in server mode, this client's own client_id and secret
- * in client mode (so a key can be rotated on either end without a
- * restart). Interface, endpoint, mode, allow-list, metrics and
- * quota_state changes are ignored until the process restarts.
+ * stats_interval, endpoint_failback, the per-client limits and the
+ * credentials: the per-client table in server mode, this client's own
+ * client_id and secret in client mode (so a key can be rotated on either
+ * end without a restart). Interface, mode, user/group and bind_address
+ * changes still require a restart.
  *
  * Returns:
  *   0 on success, -1 if the file cannot be loaded or validated (the
@@ -380,10 +419,39 @@ int config_add_client(pipesix_config_t *config, const char *id,
  *   0 on success, -1 on failure (the file is unchanged)
  */
 int config_set_limits(pipesix_config_t *config, const char *id,
-                      const uint64_t *rate_kbps, const uint64_t *quota_mib,
+                      const uint64_t *rate_kbps,
+                      const uint64_t *rate_in_kbps,
+                      const uint64_t *rate_out_kbps,
+                      const uint64_t *quota_mib,
                       const uint64_t *warn_percent);
 
 int config_clear_limits(pipesix_config_t *config, const char *id);
+
+/*
+ * Stage, promote or discard a replacement key for one client.
+ *
+ * Staging writes 'client_next = <id>: <key>' and leaves the current key
+ * valid, so old and new clients can both handshake during the rollout.
+ * Promote makes the staged key current and removes the staged line;
+ * abort removes the staged line without changing the current key. Each
+ * command rewrites the file atomically and re-parses it first. On success
+ * config is reloaded from disk and the caller may print the key.
+ */
+int config_stage_key(pipesix_config_t *config, const char *id,
+                     char *secret_out, size_t secret_size);
+int config_promote_key(pipesix_config_t *config, const char *id);
+int config_abort_key(pipesix_config_t *config, const char *id);
+
+/*
+ * Enable or disable a configured client, or set/clear its UTC expiry.
+ * Disabled and expired clients keep their route and usage but cannot
+ * handshake; a live session is dropped by the next reload/expiry scan.
+ * 'when' accepts YYYY-MM-DD or a Unix timestamp. Pass NULL to clear it.
+ */
+int config_set_client_disabled(pipesix_config_t *config, const char *id,
+                               int disabled);
+int config_set_client_expiry(pipesix_config_t *config, const char *id,
+                             const char *when);
 
 /*
  * Allocate the lowest free /64 in 'client_prefix_pool'.

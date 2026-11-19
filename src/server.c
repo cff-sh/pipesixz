@@ -31,6 +31,7 @@
  */
 
 #include "server.h"
+#include "audit.h"
 #include "config.h"
 #include "control.h"
 #include "crypto.h"
@@ -87,6 +88,8 @@ typedef struct {
     int                     route_warned;
     /* Set once the client was told its packet exceeded the relay MTU. */
     int                     mtu_warned;
+    /* Set once the first ACL drop of this session reached the audit log. */
+    int                     acl_audited;
     /* Per-client limits, resolved from the configuration at handshake. */
     int                     policy_index;   /* -1 = no limits configured */
     int                     policy_warned;  /* logged once per session */
@@ -172,6 +175,61 @@ static int client_index_lookup(const pipesix_config_t *config, const char *id)
     }
 
     return -1;
+}
+
+/* An administrative state check, before authentication or a data frame. */
+static int client_cred_available(const pipesix_client_cred_t *cred,
+                                 time_t now)
+{
+    if (cred->disabled) {
+        return 0;
+    }
+    if (cred->has_expiry && (int64_t)now >= cred->expires_at) {
+        return 0;
+    }
+    return 1;
+}
+
+/* Effective bytes-per-second caps for the two directions. */
+static uint64_t policy_rate_in_bps(const pipesix_client_policy_t *policy)
+{
+    return policy != NULL ? pipesix_policy_rate_in(policy) * 125u : 0;
+}
+
+static uint64_t policy_rate_out_bps(const pipesix_client_policy_t *policy)
+{
+    return policy != NULL ? pipesix_policy_rate_out(policy) * 125u : 0;
+}
+
+/*
+ * Check a handshake INIT against the current key and, when present, the
+ * staged key. Returns 0 for no match, 1 for the current key, 2 for the
+ * staged key and -1 when a configured key cannot be parsed.
+ */
+static int credential_match(const pipesix_client_cred_t *cred,
+                            const uint8_t *payload, size_t payload_len,
+                            uint8_t psk[PIPESIX_KEY_LEN])
+{
+    if (pipesix_key_from_string(cred->secret, psk) != 0) {
+        return -1;
+    }
+    if (pipesix_handshake_init_verify(payload, payload_len, psk) ==
+        PIPESIX_OK) {
+        return 1;
+    }
+
+    if (cred->has_next_secret) {
+        if (pipesix_key_from_string(cred->next_secret, psk) != 0) {
+            return -1;
+        }
+        if (pipesix_handshake_init_verify(payload, payload_len, psk) ==
+            PIPESIX_OK) {
+            return 2;
+        }
+    }
+
+    memset(psk, 0, PIPESIX_KEY_LEN);
+    return 0;
 }
 
 /* Quota in bytes for a client id, or 0 when it has none. */
@@ -329,6 +387,8 @@ static int quota_admit(server_context_t *ctx, server_session_t *session,
         if (!session->quota_exhausted_sent) {
             session->quota_exhausted_sent = 1;
             *notify_gone = 1;
+            audit_event("quota_exhausted", session->client_id, "",
+                        "quota and grace used up");
         }
 
         if (ctx->config->quota_throttle) {
@@ -911,6 +971,81 @@ static void send_keepalive(server_context_t *ctx,
  * ---------------------------------------------------------------------
  */
 
+/*
+ * Answer an authenticated reachability probe. This deliberately does not
+ * touch the session table: --doctor and failback probing must not evict a
+ * live client or change its keys.
+ */
+static void handle_probe(server_context_t *ctx,
+                         const struct sockaddr_storage *peer,
+                         socklen_t peer_len, const uint8_t *payload,
+                         size_t payload_len)
+{
+    char id[CONFIG_MAX_CLIENT_ID];
+    char peer_str[NI_MAXHOST + NI_MAXSERV + 8];
+    const pipesix_client_cred_t *cred;
+    pipesix_client_cred_t cred_copy;
+    uint8_t psk[PIPESIX_KEY_LEN];
+    uint8_t cnonce[PIPESIX_HANDSHAKE_NONCE_LEN];
+    uint8_t snonce[PIPESIX_HANDSHAKE_NONCE_LEN];
+    uint8_t resp[PIPESIX_HANDSHAKE_RESP_MAX];
+    uint8_t frame[PIPESIX_MAX_FRAME];
+    size_t resp_len;
+    size_t frame_len;
+    int matched;
+
+    if (pipesix_handshake_init_peek(payload, payload_len, id, sizeof(id),
+                                    cnonce) != PIPESIX_OK) {
+        stats_add_invalid(&ctx->stats);
+        return;
+    }
+
+    pthread_mutex_lock(&ctx->lock);
+    cred = config_find_client(ctx->config, id);
+    if (cred != NULL) {
+        cred_copy = *cred;
+    }
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (cred == NULL || !client_cred_available(&cred_copy, time(NULL))) {
+        return;
+    }
+
+    matched = credential_match(&cred_copy, payload, payload_len, psk);
+    if (matched <= 0) {
+        memset(psk, 0, sizeof(psk));
+        return;
+    }
+
+    if (pipesix_random_bytes(snonce, sizeof(snonce)) != 0) {
+        memset(psk, 0, sizeof(psk));
+        return;
+    }
+
+    resp_len = pipesix_handshake_resp_build(resp, sizeof(resp), cnonce,
+                                            snonce, psk);
+    memset(psk, 0, sizeof(psk));
+    if (resp_len == 0) {
+        return;
+    }
+
+    frame_len = pipesix_frame_build(frame, sizeof(frame),
+                                    PIPESIX_FLAG_PROBE_RESP, 0, 0, resp,
+                                    resp_len, NULL);
+    if (frame_len == 0) {
+        return;
+    }
+
+    if (sendto(ctx->udp_fd, frame, frame_len, 0,
+               (const struct sockaddr *)peer, peer_len) !=
+        (ssize_t)frame_len) {
+        format_peer((const struct sockaddr *)peer, peer_len, peer_str,
+                    sizeof(peer_str));
+        log_debug("Failed to send a probe response to %s: %s", peer_str,
+                  strerror(errno));
+    }
+}
+
 static void handle_handshake_init(server_context_t *ctx,
                                   const struct sockaddr_storage *peer,
                                   socklen_t peer_len,
@@ -965,22 +1100,37 @@ static void handle_handshake_init(server_context_t *ctx,
         return;
     }
 
-    if (pipesix_key_from_string(cred_copy.secret, psk) != 0) {
-        log_error("Cannot derive a key for client '%s'", id);
+    format_peer((const struct sockaddr *)peer, peer_len, peer_str,
+                sizeof(peer_str));
+
+    if (!client_cred_available(&cred_copy, time(NULL))) {
+        log_warn("Handshake from %s for client '%s' refused: client is %s",
+                 peer_str, id,
+                 cred_copy.disabled ? "disabled" : "expired");
+        audit_event("client_refused", id, peer_str, "client is %s",
+                    cred_copy.disabled ? "disabled" : "expired");
+        stats_add_auth_failure(&ctx->stats);
         stats_add_handshake_failure(&ctx->stats);
         return;
     }
 
-    if (pipesix_handshake_init_verify(payload, payload_len, psk) !=
-        PIPESIX_OK) {
-        format_peer((const struct sockaddr *)peer, peer_len,
-                    peer_str, sizeof(peer_str));
-        log_warn("Handshake from %s failed authentication for client '%s'",
-                 peer_str, id);
-        stats_add_auth_failure(&ctx->stats);
-        stats_add_handshake_failure(&ctx->stats);
-        memset(psk, 0, sizeof(psk));
-        return;
+    {
+        int matched = credential_match(&cred_copy, payload, payload_len, psk);
+
+        if (matched < 0) {
+            log_error("Cannot derive a key for client '%s'", id);
+            stats_add_handshake_failure(&ctx->stats);
+            return;
+        }
+        if (matched == 0) {
+            log_warn("Handshake from %s failed authentication for client "
+                     "'%s'", peer_str, id);
+            audit_event("handshake_failed", id, peer_str,
+                        "authentication failed");
+            stats_add_auth_failure(&ctx->stats);
+            stats_add_handshake_failure(&ctx->stats);
+            return;
+        }
     }
 
     pthread_mutex_lock(&ctx->lock);
@@ -1039,6 +1189,7 @@ static void handle_handshake_init(server_context_t *ctx,
         ctx->sessions[slot].throttled = 0;
         ctx->sessions[slot].route_warned = 0;
         ctx->sessions[slot].mtu_warned = 0;
+        ctx->sessions[slot].acl_audited = 0;
         ctx->sessions[slot].quota_warn_sent = 0;
         ctx->sessions[slot].quota_exhausted_sent = 0;
         ctx->sessions[slot].notice_period = -1;
@@ -1055,13 +1206,17 @@ static void handle_handshake_init(server_context_t *ctx,
                 client_index_lookup(ctx->config, id);
 
             if (policy >= 0) {
-                rate_bps = ctx->config->policies[policy].rate_kbps * 125u;
+                rate_bps = policy_rate_in_bps(&ctx->config->policies[policy]);
             }
 
             policy_bucket_init(&ctx->sessions[slot].rx_bucket, rate_bps,
                                policy_now_ms());
-            policy_bucket_init(&ctx->sessions[slot].tx_bucket, rate_bps,
-                               policy_now_ms());
+            policy_bucket_init(
+                &ctx->sessions[slot].tx_bucket,
+                policy >= 0
+                    ? policy_rate_out_bps(&ctx->config->policies[policy])
+                    : 0,
+                policy_now_ms());
             policy_bucket_init(&ctx->sessions[slot].rx_over_bucket,
                                quota_throttle_bps(ctx->config),
                                policy_now_ms());
@@ -1139,6 +1294,8 @@ static void handle_handshake_init(server_context_t *ctx,
 
     log_info("Client '%s' handshake from %s (crypto=chacha20-poly1305, "
              "%d active)", id, peer_str, session_count);
+    audit_event("handshake", id, peer_str, "authenticated, %d active",
+                session_count);
 }
 
 /*
@@ -1147,23 +1304,37 @@ static void handle_handshake_init(server_context_t *ctx,
 static void sessions_expire(server_context_t *ctx, time_t now)
 {
     int expired[SERVER_MAX_CLIENTS];
+    int blocked[SERVER_MAX_CLIENTS];
+    char blocked_id[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
     int timeout = atomic_load(&ctx->session_timeout);
     int count = 0;
+    int blocked_count = 0;
     int i;
-
-    if (timeout <= 0) {
-        return;
-    }
 
     pthread_mutex_lock(&ctx->lock);
 
     for (i = 0; i < SERVER_MAX_CLIENTS; i++) {
         server_session_t *session = &ctx->sessions[i];
+        const pipesix_client_cred_t *cred;
 
         if (!session->active) {
             continue;
         }
-        if ((now - session->last_seen) <= (time_t)timeout) {
+
+        cred = config_find_client(ctx->config, session->client_id);
+        if (cred == NULL || !client_cred_available(cred, now)) {
+            snprintf(blocked_id[blocked_count],
+                     sizeof(blocked_id[blocked_count]), "%s",
+                     session->client_id);
+            blocked[blocked_count++] = i;
+            session->active = 0;
+            session->established = 0;
+            memset(session->rx_key, 0, sizeof(session->rx_key));
+            memset(session->tx_key, 0, sizeof(session->tx_key));
+            continue;
+        }
+
+        if (timeout <= 0 || (now - session->last_seen) <= (time_t)timeout) {
             continue;
         }
 
@@ -1186,6 +1357,18 @@ static void sessions_expire(server_context_t *ctx, time_t now)
                  "inactivity (%llu frames)",
                  session->client_id[0] != '\0' ? session->client_id : "?",
                  peer_str, timeout, (unsigned long long)session->frames);
+    }
+
+    for (i = 0; i < blocked_count; i++) {
+        server_session_t *session = &ctx->sessions[blocked[i]];
+        char peer_str[NI_MAXHOST + NI_MAXSERV + 8];
+
+        format_peer((const struct sockaddr *)&session->addr, session->addr_len,
+                    peer_str, sizeof(peer_str));
+        log_warn("Client '%s' session %s closed: client is disabled or "
+                 "expired", blocked_id[i], peer_str);
+        audit_event("session_blocked", blocked_id[i], peer_str,
+                    "closed because the client is disabled or expired");
     }
 }
 
@@ -1301,11 +1484,13 @@ static void reload_config(server_context_t *ctx)
     socklen_t hint_addr_len[SERVER_MAX_CLIENTS];
     char hint_ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
     char dropped_ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
+    char blocked_ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
     quota_snapshot_t old_usage[CONFIG_MAX_CLIENTS];
     int before_count = ctx->config->client_count;
     int old_usage_count = 0;
     int hint_count = 0;
     int dropped_count = 0;
+    int blocked_count = 0;
     int rerouted = 0;
     int rc;
     int i;
@@ -1343,6 +1528,11 @@ static void reload_config(server_context_t *ctx)
     logger_set_level(ctx->config->log_level);
     logger_set_json(ctx->config->log_json);
     atomic_store(&ctx->session_timeout, ctx->config->session_timeout);
+
+    if (audit_open(ctx->config->audit_log) != 0) {
+        log_warn("Cannot open the audit log '%s': %s",
+                 ctx->config->audit_log, strerror(errno));
+    }
 
     if (strcmp(old_metrics_address, ctx->config->metrics_address) != 0 ||
         old_metrics_port != ctx->config->metrics_port ||
@@ -1416,6 +1606,20 @@ static void reload_config(server_context_t *ctx)
             continue;
         }
 
+        if (!client_cred_available(new_cred, time(NULL))) {
+            snprintf(blocked_ids[blocked_count],
+                     sizeof(blocked_ids[blocked_count]), "%s",
+                     session->client_id);
+            blocked_count++;
+
+            session->active = 0;
+            session->established = 0;
+            session->prefix_len = 0;
+            memset(session->rx_key, 0, sizeof(session->rx_key));
+            memset(session->tx_key, 0, sizeof(session->tx_key));
+            continue;
+        }
+
         if (old_cred == NULL ||
             strcmp(old_cred->secret, new_cred->secret) != 0) {
             /*
@@ -1468,9 +1672,17 @@ static void reload_config(server_context_t *ctx)
              * Keep the refilled tokens when the cap did not change; only
              * a new rate may reset the bucket.
              */
+            rate_bps = (policy >= 0)
+                           ? policy_rate_in_bps(&ctx->config->policies[policy])
+                           : 0;
             if (session->rx_bucket.rate_bps != rate_bps) {
                 policy_bucket_init(&session->rx_bucket, rate_bps,
                                    policy_now_ms());
+            }
+            rate_bps = (policy >= 0)
+                           ? policy_rate_out_bps(&ctx->config->policies[policy])
+                           : 0;
+            if (session->tx_bucket.rate_bps != rate_bps) {
                 policy_bucket_init(&session->tx_bucket, rate_bps,
                                    policy_now_ms());
             }
@@ -1493,11 +1705,22 @@ static void reload_config(server_context_t *ctx)
                            PIPESIX_FLAG_HANDSHAKE_NEEDED);
         log_warn("Client '%s' key changed; session revoked and a new "
                  "handshake requested", hint_ids[i]);
+        audit_event("key_changed", hint_ids[i], "",
+                    "session revoked and re-handshake requested");
     }
 
     for (i = 0; i < dropped_count; i++) {
         log_warn("Client '%s' was removed from the configuration; its "
                  "session was dropped", dropped_ids[i]);
+        audit_event("client_removed", dropped_ids[i], "",
+                    "session dropped after configuration reload");
+    }
+
+    for (i = 0; i < blocked_count; i++) {
+        log_warn("Client '%s' is disabled or expired; its session was "
+                 "dropped", blocked_ids[i]);
+        audit_event("session_blocked", blocked_ids[i], "",
+                    "session dropped by configuration reload");
     }
 
     if (rerouted > 0) {
@@ -1509,6 +1732,8 @@ static void reload_config(server_context_t *ctx)
              "timing, quotas, paths, metrics): %d credential(s), "
              "%d limit(s); interface and mode changes need a restart",
              ctx->config->client_count, ctx->config->policy_count);
+    audit_event("reload", "", "", "configuration reloaded: %d client(s)",
+                ctx->config->client_count);
 }
 
 /*
@@ -1648,6 +1873,7 @@ static void *receiver_loop(void *arg)
         int notify_gone = 0;
         int source_denied = 0;
         int acl_denied = 0;
+        int acl_audit = 0;
         char acl_id[CONFIG_MAX_CLIENT_ID];
         char acl_dest[INET6_ADDRSTRLEN];
 
@@ -1703,8 +1929,22 @@ static void *receiver_loop(void *arg)
             continue;
         }
 
+        if ((flags & PIPESIX_FLAG_PROBE_REQ) != 0) {
+            pipesix_frame_t probe;
+
+            if (pipesix_frame_parse(frame_buf, (size_t)nread, &probe, NULL) ==
+                PIPESIX_OK) {
+                handle_probe(ctx, &peer, peer_len, probe.payload,
+                             probe.payload_len);
+            } else {
+                stats_add_invalid(&ctx->stats);
+            }
+            continue;
+        }
+
         if ((flags & (PIPESIX_FLAG_HANDSHAKE_RESP |
-                      PIPESIX_FLAG_HANDSHAKE_NEEDED)) != 0) {
+                      PIPESIX_FLAG_HANDSHAKE_NEEDED |
+                      PIPESIX_FLAG_PROBE_RESP)) != 0) {
             continue;
         }
 
@@ -1854,6 +2094,10 @@ static void *receiver_loop(void *arg)
                              ctx->sessions[slot].client_id);
                     ipv6_addr_to_str(inner->dest_addr, acl_dest,
                                      sizeof(acl_dest));
+                    if (!ctx->sessions[slot].acl_audited) {
+                        ctx->sessions[slot].acl_audited = 1;
+                        acl_audit = 1;
+                    }
                 }
 
                 if ((ctx->config->strict_source ||
@@ -1894,6 +2138,10 @@ static void *receiver_loop(void *arg)
             log_warn("Client '%s' sent a packet to %s, which its "
                      "destination policy or client_isolation forbids; "
                      "dropping it", acl_id, acl_dest);
+            if (acl_audit) {
+                audit_event("acl_denied", acl_id, "", "destination %s",
+                            acl_dest);
+            }
             stats_add_policy_denied(&ctx->stats);
             continue;
         }
@@ -2306,12 +2554,13 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
     char ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
     char peers[SERVER_MAX_CLIENTS][96];
     char routes[SERVER_MAX_CLIENTS][INET6_ADDRSTRLEN + 8];
-    char limits[SERVER_MAX_CLIENTS][160];
+    char limits[SERVER_MAX_CLIENTS][256];
     char period_name[24];
     uint64_t frames[SERVER_MAX_CLIENTS];
     uint64_t rx_bytes[SERVER_MAX_CLIENTS];
     uint64_t tx_bytes[SERVER_MAX_CLIENTS];
-    uint64_t rate_kbps[SERVER_MAX_CLIENTS];
+    uint64_t rate_in_kbps[SERVER_MAX_CLIENTS];
+    uint64_t rate_out_kbps[SERVER_MAX_CLIENTS];
     uint64_t quota_mib[SERVER_MAX_CLIENTS];
     uint64_t quota_remaining[SERVER_MAX_CLIENTS];
     long idle[SERVER_MAX_CLIENTS];
@@ -2357,7 +2606,8 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
         frames[count] = session->frames;
         rx_bytes[count] = session->rx_bytes;
         tx_bytes[count] = session->tx_bytes;
-        rate_kbps[count] = 0;
+        rate_in_kbps[count] = 0;
+        rate_out_kbps[count] = 0;
         quota_mib[count] = 0;
         quota_remaining[count] = 0;
         snprintf(limits[count], sizeof(limits[count]), "null");
@@ -2366,7 +2616,8 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
             const pipesix_client_policy_t *policy =
                 &ctx->config->policies[session->policy_index];
 
-            rate_kbps[count] = policy->rate_kbps;
+            rate_in_kbps[count] = pipesix_policy_rate_in(policy);
+            rate_out_kbps[count] = pipesix_policy_rate_out(policy);
             quota_mib[count] = policy->quota_mib;
 
             if (policy->quota_mib > 0 && session->client_index >= 0) {
@@ -2376,10 +2627,16 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
             }
 
             snprintf(limits[count], sizeof(limits[count]),
-                     "{\"rate_kbps\":%llu,\"quota_mib\":%llu,"
+                     "{\"rate_kbps\":%llu,\"rate_in_kbps\":%llu,"
+                     "\"rate_out_kbps\":%llu,\"quota_mib\":%llu,"
                      "\"quota_period\":\"%s\","
                      "\"quota_remaining_bytes\":%llu}",
-                     (unsigned long long)rate_kbps[count],
+                     (unsigned long long)((rate_in_kbps[count] >
+                                           rate_out_kbps[count])
+                                              ? rate_in_kbps[count]
+                                              : rate_out_kbps[count]),
+                     (unsigned long long)rate_in_kbps[count],
+                     (unsigned long long)rate_out_kbps[count],
                      (unsigned long long)quota_mib[count],
                      period_name,
                      (unsigned long long)quota_remaining[count]);
@@ -2423,10 +2680,14 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
             return -1;
         }
 
-        if (rate_kbps[i] > 0 &&
-            server_control_append(reply, size, &used, " rate=%llu kbit/s",
-                                  (unsigned long long)rate_kbps[i]) != 0) {
-            return -1;
+        if (rate_in_kbps[i] > 0 || rate_out_kbps[i] > 0) {
+            if (server_control_append(reply, size, &used,
+                                      " rate=%llu/%llu kbit/s",
+                                      (unsigned long long)rate_in_kbps[i],
+                                      (unsigned long long)rate_out_kbps[i]) !=
+                0) {
+                return -1;
+            }
         }
 
         if (quota_mib[i] > 0 &&
@@ -2470,12 +2731,13 @@ static int server_status_json(server_context_t *ctx, char *reply, size_t size)
     char ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
     char peers[SERVER_MAX_CLIENTS][96];
     char routes[SERVER_MAX_CLIENTS][INET6_ADDRSTRLEN + 12];
-    char limits[SERVER_MAX_CLIENTS][160];
+    char limits[SERVER_MAX_CLIENTS][256];
     char period_name[24];
     uint64_t frames[SERVER_MAX_CLIENTS];
     uint64_t rx_bytes[SERVER_MAX_CLIENTS];
     uint64_t tx_bytes[SERVER_MAX_CLIENTS];
-    uint64_t rate_kbps[SERVER_MAX_CLIENTS];
+    uint64_t rate_in_kbps[SERVER_MAX_CLIENTS];
+    uint64_t rate_out_kbps[SERVER_MAX_CLIENTS];
     uint64_t quota_mib[SERVER_MAX_CLIENTS];
     uint64_t quota_remaining[SERVER_MAX_CLIENTS];
     long idle[SERVER_MAX_CLIENTS];
@@ -2526,7 +2788,8 @@ static int server_status_json(server_context_t *ctx, char *reply, size_t size)
         frames[count] = session->frames;
         rx_bytes[count] = session->rx_bytes;
         tx_bytes[count] = session->tx_bytes;
-        rate_kbps[count] = 0;
+        rate_in_kbps[count] = 0;
+        rate_out_kbps[count] = 0;
         quota_mib[count] = 0;
         quota_remaining[count] = 0;
         snprintf(limits[count], sizeof(limits[count]), "null");
@@ -2535,7 +2798,8 @@ static int server_status_json(server_context_t *ctx, char *reply, size_t size)
             const pipesix_client_policy_t *policy =
                 &ctx->config->policies[session->policy_index];
 
-            rate_kbps[count] = policy->rate_kbps;
+            rate_in_kbps[count] = pipesix_policy_rate_in(policy);
+            rate_out_kbps[count] = pipesix_policy_rate_out(policy);
             quota_mib[count] = policy->quota_mib;
 
             if (policy->quota_mib > 0 && session->client_index >= 0) {
@@ -2545,10 +2809,16 @@ static int server_status_json(server_context_t *ctx, char *reply, size_t size)
             }
 
             snprintf(limits[count], sizeof(limits[count]),
-                     "{\"rate_kbps\":%llu,\"quota_mib\":%llu,"
+                     "{\"rate_kbps\":%llu,\"rate_in_kbps\":%llu,"
+                     "\"rate_out_kbps\":%llu,\"quota_mib\":%llu,"
                      "\"quota_period\":\"%s\","
                      "\"quota_remaining_bytes\":%llu}",
-                     (unsigned long long)rate_kbps[count],
+                     (unsigned long long)((rate_in_kbps[count] >
+                                           rate_out_kbps[count])
+                                              ? rate_in_kbps[count]
+                                              : rate_out_kbps[count]),
+                     (unsigned long long)rate_in_kbps[count],
+                     (unsigned long long)rate_out_kbps[count],
                      (unsigned long long)quota_mib[count],
                      period_name,
                      (unsigned long long)quota_remaining[count]);
@@ -2680,9 +2950,15 @@ static int server_usage(server_context_t *ctx, char *reply, size_t size,
         left[count] = (quota[count] > 0)
                           ? policy_quota_remaining(&ctx->quotas[i], period)
                           : 0;
-        rate[count] = (policy >= 0)
-                          ? ctx->config->policies[policy].rate_kbps
-                          : 0;
+        if (policy >= 0) {
+            uint64_t rate_in = pipesix_policy_rate_in(
+                &ctx->config->policies[policy]);
+            uint64_t rate_out = pipesix_policy_rate_out(
+                &ctx->config->policies[policy]);
+            rate[count] = rate_in > rate_out ? rate_in : rate_out;
+        } else {
+            rate[count] = 0;
+        }
         connected[count] = 0;
 
         for (j = 0; j < SERVER_MAX_CLIENTS; j++) {
@@ -3410,6 +3686,13 @@ int server_start(pipesix_config_t *config)
     ctx.salt = salt;
     stats_init(&ctx.stats);
 
+    if (audit_open(config->audit_log) != 0) {
+        log_warn("Cannot open the audit log '%s': %s", config->audit_log,
+                 strerror(errno));
+    }
+    audit_event("startup", "", "", "server starting in %s mode",
+                config->mode);
+
     {
         int i;
 
@@ -3583,6 +3866,8 @@ int server_start(pipesix_config_t *config)
     tun_close(&tun);
     stats_dump(&ctx.stats, "server");
 
+    audit_event("shutdown", "", "", "server stopped");
+    audit_close();
     log_info("Server shutdown complete");
     return 0;
 }
