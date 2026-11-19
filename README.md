@@ -42,10 +42,16 @@ Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] �
   the configuration atomically and make a running server reload it; a
   generated client configuration can be written for hand-off
 - Zero-downtime key rotation: `--stage-key` keeps the current key valid
-  while a new one is distributed, then `--promote-key` makes it current
+  while a new one is distributed, then `--promote-key` makes it current.
+  `--stage-all`, `--promote-all` and `--abort-all` do the same for the
+  whole client table, and `--export-dir` writes the staged client configs
+- Server-side key files: `client_secret_file` and `client_next_file` keep
+  credentials out of the main configuration; staging writes a mode-0600
+  `<path>.next` file, and promotion updates the current key file
 - Client lifecycle controls: `--disable-client`, `--enable-client` and
   `--expire-client` refuse a client without deleting its route, quota or
-  history
+  history; `--usage` and `--status` report `state`, `expires_at` and
+  `staged_key`
 - Side-effect-free `--doctor` probing: verifies DNS, UDP reachability and
   authentication at every relay endpoint without opening a TUN device or
   disturbing a live session
@@ -176,6 +182,7 @@ sudo systemctl enable --now pipesix
 sudo systemctl reload pipesix     # apply log_level/keepalive/peer_timeout/...
 sudo kill -USR1 $(pidof pipesix)  # dump statistics now
 sudo pipesix --rotate-all         # new client keys, printed and reloaded
+sudo pipesix --stage-all          # stage a fleet-wide rolling rotation
 sudo pipesix --doctor             # probe relay endpoints from a client
 ```
 
@@ -570,15 +577,20 @@ mode: server
 config: /etc/pipesix/pipesix.conf
 period: monthly 2026-11-01..2026-12-01 UTC
 usage: 2 client(s)
-  alice used=734003200 B quota=10737418240 B left=10003415040 B rate=50000 kbit/s connected=yes
-  bob used=131072 B quota=unlimited rate=unlimited connected=no
+  alice used=734003200 B quota=10737418240 B left=10003415040 B rate=50000 kbit/s connected=yes state=enabled expires_at=0 staged_key=no
+  bob used=131072 B quota=unlimited rate=unlimited connected=no state=disabled expires_at=0 staged_key=yes
 ```
+
+`state` is `enabled`, `disabled`, `expired` or `unknown`; `expires_at` is
+Unix seconds (0 when unset), and `staged_key` says whether a rollout is in
+progress. `--status` prints the same fields per live session, and its JSON
+objects include `state`, `expires_at` and `staged_key`.
 
 `--json` emits one object with a `period` object (`kind`, `start_unix`,
 `end_unix`) and a `clients` array (`client_id`, `used_bytes`, `quota_bytes`,
-`quota_remaining_bytes`, `rate_kbps`, `connected`); `--csv` emits the same
-table with the header
-`client_id,period_start,period_end,used_bytes,quota_bytes,quota_remaining_bytes,rate_kbps,connected`.
+`quota_remaining_bytes`, `rate_kbps`, `connected`, `state`, `expires_at`,
+`staged_key`); `--csv` emits the same table with the header
+`client_id,period_start,period_end,used_bytes,quota_bytes,quota_remaining_bytes,rate_kbps,connected,state,expires_at,staged_key`.
 Both strip the `OK` line, so the output pipes straight into `jq` or a
 spreadsheet.
 
@@ -764,6 +776,39 @@ sudo pipesix --abort-key alice -c /etc/pipesix/pipesix.conf
 A client has one staged key at a time. `--rotate-all` retires any staged
 keys, so it remains the emergency path rather than the normal rollout.
 
+For a fleet-wide rollout, stage every client that does not already have a
+staged key, then promote or abort the whole set:
+
+```bash
+sudo pipesix --stage-all --export-dir /root/pipesix-rollout \
+    --server-address 203.0.113.10 -c /etc/pipesix/pipesix.conf
+sudo pipesix --promote-all -c /etc/pipesix/pipesix.conf
+sudo pipesix --abort-all  -c /etc/pipesix/pipesix.conf
+```
+
+`--stage-all` prints one new key per client and, with `--export-dir`, writes
+a complete client config that already contains the staged key. Promotion and
+abort skip clients that have no staged key, so re-running after a partial
+failure is safe.
+
+#### Server-side key files
+
+A server can keep each current key out of the main configuration:
+
+```ini
+client_secret_file = alice /etc/pipesix/keys/alice.key
+client_route = alice 2001:db8:1::/64
+```
+
+The file must contain one key on its first non-empty, non-comment line and
+must be mode `0600`. `--stage-key` writes `/etc/pipesix/keys/alice.key.next`
+and a `client_next_file` line; `--promote-key` copies the staged key over the
+current file and removes the line. If the configuration is split with
+`include`, the path is resolved relative to the file that names it, and the
+staged path line is appended to the main file by the CLI. `--rotate-all`
+updates file-backed and inline clients together, restoring the key files if
+the configuration rewrite fails.
+
 ### Client expiry and disabling
 
 A client can be refused without deleting its route, quota or usage
@@ -894,12 +939,13 @@ user  = pipesix
 group = pipesix
 ```
 
-The included file and the secret file are re-read with the rest of the
-configuration on SIGHUP. `--add-client`, `--rotate-all` and `--remove-client`
-rewrite the main file, so keep credentials that those commands manage in the
-main file; put read-only credentials in an include. The systemd unit also
-sets `NoNewPrivileges`, a private `/tmp`, a read-only system and a restricted
-address-family set.
+The included file and the secret files are re-read with the rest of the
+configuration on SIGHUP. `--add-client` still appends an inline `client`
+line to the main file; use `client_secret_file` when a server credential
+must stay in its own file, and `--stage-key`/`--promote-key` will maintain
+that file rather than putting the key in the main configuration. The
+systemd unit also sets `NoNewPrivileges`, a private `/tmp`, a read-only
+system and a restricted address-family set.
 
 ### Client isolation and destination ACLs
 
@@ -987,7 +1033,8 @@ plaintext frames; they carry an HMAC and exist purely to bootstrap the keys.
 
 Server side notes:
 
-- A server refuses to start without at least one `client` entry.
+- A server refuses to start without at least one `client` or
+  `client_secret_file` entry.
 - Up to 64 clients are tracked at once, each with its own keys and replay
   window. Sessions idle for longer than `session_timeout` are dropped, and
   the least recently used session is evicted when the table is full.
@@ -1161,7 +1208,8 @@ scripts and documentation. The `.deb` installs the binary to
 the executable.
 
 `.github/workflows/ci.yml` builds and tests every push and pull request with
-gcc, clang and the address/UB sanitizers, cross-builds all three targets,
+gcc, clang, the address/UB sanitizers and a root network-namespace suite,
+cross-builds all three targets,
 and on a `v*` tag publishes the archives and checksums as a release.
 
 ## Testing
@@ -1173,3 +1221,16 @@ make check
 Runs the unit tests for cryptography (against RFC known-answer vectors),
 the frame codec, the replay window and the configuration parser. No root
 privileges are required.
+
+The real-TUN integration suite runs in network namespaces and therefore
+needs root and Linux `iproute2`:
+
+```bash
+sudo make check-netns
+```
+
+It brings up a relay and client namespace connected by a veth, then checks
+inner traffic, ACL drops, authenticated `--doctor` probing, file-backed
+staged rotation, expiry teardown/re-admission and failback to the preferred
+relay. CI runs it on every push; `make check` deliberately does not, so the
+unit suite stays usable without privileges.

@@ -142,10 +142,16 @@ $(TEST_BIN): $(TEST_SOURCES) $(TEST_OBJECTS)
 $(TEST_CONTROL_BIN): $(TEST_CONTROL_SOURCES) $(TEST_CONTROL_OBJECTS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-.PHONY: check
+.PHONY: check check-netns
 check: $(TEST_BIN) $(TEST_CONTROL_BIN)
 	@./$(TEST_BIN)
 	@./$(TEST_CONTROL_BIN)
+
+# Root-only integration coverage: real TUN devices, namespaces, ACLs,
+# expiry, probing, rotation and failback. Kept out of 'check' so the
+# ordinary test target still works without privileges.
+check-netns: $(TARGET)
+	@./tests/test_netns.sh
 
 #
 # Build and package every platform the local toolchains support.

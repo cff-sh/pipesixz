@@ -2627,6 +2627,145 @@ static void test_client_policy(void)
     }
 }
 
+/*
+ * Server-side key files: a credential and its staged replacement can
+ * live outside the main configuration, and promotion updates the file
+ * that actually authenticates the client.
+ */
+static void test_server_secret_files(void)
+{
+    char dir[] = "/tmp/pipesix_srv_secret_XXXXXX";
+    char main_path[256];
+    char clients_path[256];
+    char alice_key[256];
+    char alice_next[256];
+    char conf[4096];
+    char staged[PIPESIX_KEY_LEN * 2 + 1];
+    char current[CONFIG_MAX_SECRET];
+    char body[4096];
+    pipesix_config_t config;
+    const pipesix_client_cred_t *cred;
+    struct stat st;
+    FILE *fp;
+    size_t got;
+
+    if (mkdtemp(dir) == NULL) {
+        check(0, "create the server key-file fixture directory");
+        return;
+    }
+
+    snprintf(main_path, sizeof(main_path), "%s/main.conf", dir);
+    snprintf(clients_path, sizeof(clients_path), "%s/clients.conf", dir);
+    snprintf(alice_key, sizeof(alice_key), "%s/alice.key", dir);
+    snprintf(alice_next, sizeof(alice_next), "%s/alice.key.next", dir);
+
+    check(write_file(alice_key,
+                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n") == 0,
+          "write alice's server key file");
+    chmod(alice_key, 0600);
+    snprintf(conf, sizeof(conf),
+             "client_secret_file = alice %s\n"
+             "client_route = alice fd00:1::/64\n",
+             alice_key);
+    check(write_file(clients_path, conf) == 0,
+          "write the included key-file credential");
+    snprintf(conf, sizeof(conf),
+             "mode = server\n"
+             "tun_address = fd00::1/64\n"
+             "include = %s\n"
+             "client = bob: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+             "client_route = bob fd00:2::/64\n",
+             clients_path);
+    check(write_file(main_path, conf) == 0,
+          "write the server key-file configuration");
+    check(config_load(main_path, &config) == 0,
+          "load a server key from a file");
+    check(config_validate(&config) == 0,
+          "the server key-file configuration validates");
+    cred = config_find_client(&config, "alice");
+    check(cred != NULL &&
+              strcmp(cred->secret,
+                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == 0,
+          "client_secret_file supplies the current key");
+    check(cred != NULL && strcmp(cred->secret_file, alice_key) == 0,
+          "the resolved key-file path is retained");
+
+    strcpy(current, config_find_client(&config, "alice")->secret);
+    check(config_stage_key(&config, "alice", staged, sizeof(staged)) == 0,
+          "stage a key for a file-backed client");
+    cred = config_find_client(&config, "alice");
+    check(cred != NULL && cred->has_next_secret &&
+              strcmp(cred->next_secret, staged) == 0,
+          "the file-backed staged key is in memory");
+    check(cred != NULL && strcmp(cred->next_file, alice_next) == 0,
+          "the staged key file uses the .next path");
+    check(strcmp(config_find_client(&config, "alice")->secret, current) == 0,
+          "staging does not replace the current key file");
+    check(stat(alice_next, &st) == 0 && (st.st_mode & 0777) == 0600,
+          "the staged key file is mode 0600");
+
+    fp = fopen(main_path, "r");
+    got = (fp != NULL) ? fread(body, 1, sizeof(body) - 1, fp) : 0;
+    if (fp != NULL) {
+        fclose(fp);
+    }
+    body[got] = '\0';
+    check(strstr(body, "client_next_file = alice ") != NULL,
+          "staging writes a path, not the secret, into the main file");
+    check(strstr(body, staged) == NULL,
+          "the staged secret is absent from the main file");
+
+    check(config_promote_key(&config, "alice") == 0,
+          "promote a file-backed key");
+    cred = config_find_client(&config, "alice");
+    check(cred != NULL && !cred->has_next_secret &&
+              strcmp(cred->secret, staged) == 0,
+          "promotion updates the in-memory key");
+    fp = fopen(alice_key, "r");
+    got = (fp != NULL) ? fread(body, 1, sizeof(body) - 1, fp) : 0;
+    if (fp != NULL) {
+        fclose(fp);
+    }
+    body[got] = '\0';
+    check(strstr(body, staged) != NULL,
+          "promotion updates the current key file");
+    check(access(alice_next, F_OK) != 0,
+          "promotion removes the staged key file");
+
+    strcpy(current, config_find_client(&config, "alice")->secret);
+    check(config_stage_key(&config, "alice", staged, sizeof(staged)) == 0,
+          "stage a second file-backed key");
+    check(config_abort_key(&config, "alice") == 0,
+          "abort a file-backed staged key");
+    cred = config_find_client(&config, "alice");
+    check(cred != NULL && !cred->has_next_secret &&
+              strcmp(cred->secret, current) == 0,
+          "aborting keeps the current file-backed key");
+    check(access(alice_next, F_OK) != 0,
+          "aborting removes the staged key file");
+
+    check(config_rotate_all_keys(&config) == 0,
+          "rotate a mixed file-backed and inline client table");
+    cred = config_find_client(&config, "alice");
+    check(cred != NULL && strcmp(cred->secret, current) != 0,
+          "rotate-all changes the file-backed key");
+    check(cred != NULL && strcmp(cred->secret_file, alice_key) == 0,
+          "rotate-all keeps the key-file path");
+    check(config_find_client(&config, "bob") != NULL &&
+              strcmp(config_find_client(&config, "bob")->secret,
+                     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") != 0,
+          "rotate-all also changes inline clients");
+    check(config_load(main_path, &config) == 0 &&
+              config_validate(&config) == 0,
+          "the rotated mixed configuration still validates");
+
+    unlink(alice_key);
+    unlink(alice_next);
+    unlink(clients_path);
+    unlink(main_path);
+    rmdir(dir);
+}
+
 int main(void)
 {
     logger_init(NULL);
@@ -2662,6 +2801,7 @@ int main(void)
     test_usage_history();
     test_usage_history_config();
     test_config_sources_and_acl();
+    test_server_secret_files();
     test_stats_json();
     test_stats_prometheus();
     test_packet_too_big();

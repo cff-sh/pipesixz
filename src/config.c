@@ -49,6 +49,13 @@ static int sync_file(FILE *fp)
 #endif
 }
 
+static int resolve_relative(const char *base, const char *value,
+                            char *out, size_t out_size);
+static int set_client_secret_file(pipesix_config_t *config, const char *value,
+                                  const char *base);
+static int set_client_next_file(pipesix_config_t *config, const char *value,
+                                const char *base);
+
 /*
  * Trim leading and trailing whitespace from a string in place.
  */
@@ -78,6 +85,67 @@ static int copy_string(char *dst, size_t size, const char *value)
     }
 
     memcpy(dst, value, len + 1);
+    return 0;
+}
+
+/*
+ * Replace a key file atomically with one secret on its own line.
+ *
+ * The temporary file is created with mode 0600 rather than inheriting the
+ * old file's mode: a server key is a credential, not configuration. The
+ * write is synced and renamed, so a crash cannot leave a truncated key
+ * that would lock a client out.
+ */
+static int write_secret_file(const char *path, const char *secret)
+{
+    char tmp_path[CONFIG_PATH_MAX + 32];
+    FILE *fp;
+    int fd;
+
+    if (path == NULL || path[0] == '\0' || secret == NULL ||
+        secret[0] == '\0' || strlen(secret) >= CONFIG_MAX_SECRET) {
+        return -1;
+    }
+    if (strlen(path) + sizeof(".pipesix.XXXXXX") > sizeof(tmp_path)) {
+        return -1;
+    }
+
+    snprintf(tmp_path, sizeof(tmp_path), "%s.pipesix.XXXXXX", path);
+    fd = mkstemp(tmp_path);
+    if (fd < 0) {
+        return -1;
+    }
+#if !defined(_WIN32)
+    if (fchmod(fd, 0600) != 0) {
+        close(fd);
+        unlink(tmp_path);
+        return -1;
+    }
+#endif
+
+    fp = fdopen(fd, "w");
+    if (fp == NULL) {
+        close(fd);
+        unlink(tmp_path);
+        return -1;
+    }
+
+    if (fprintf(fp, "%s\n", secret) < 0 || fflush(fp) != 0 ||
+        sync_file(fp) != 0) {
+        fclose(fp);
+        unlink(tmp_path);
+        return -1;
+    }
+    if (fclose(fp) != 0) {
+        unlink(tmp_path);
+        return -1;
+    }
+
+    if (rename(tmp_path, path) != 0) {
+        unlink(tmp_path);
+        return -1;
+    }
+
     return 0;
 }
 
@@ -1029,7 +1097,7 @@ static int set_client_policy(pipesix_config_t *config, const char *value,
  * Returns 0 on success, -1 if the value is invalid or too long.
  */
 static int config_set_value(pipesix_config_t *config, const char *key,
-                            const char *value)
+                            const char *value, const char *base)
 {
     if (strcmp(key, "mode") == 0) {
         return copy_string(config->mode, CONFIG_MAX_MODE, value);
@@ -1125,8 +1193,14 @@ static int config_set_value(pipesix_config_t *config, const char *key,
     if (strcmp(key, "client") == 0) {
         return set_client_cred(config, value);
     }
+    if (strcmp(key, "client_secret_file") == 0) {
+        return set_client_secret_file(config, value, base);
+    }
     if (strcmp(key, "client_next") == 0) {
         return set_client_next(config, value);
+    }
+    if (strcmp(key, "client_next_file") == 0) {
+        return set_client_next_file(config, value, base);
     }
     if (strcmp(key, "client_disabled") == 0) {
         return set_client_disabled(config, value);
@@ -1259,6 +1333,172 @@ static int resolve_relative(const char *base, const char *value,
 
     memcpy(out, base, dir_len);
     memcpy(out + dir_len, value, strlen(value) + 1);
+    return 0;
+}
+
+/*
+ * Split '<id> <value>' where value is the remainder of the line. Paths may
+ * contain spaces, so only the id ends at whitespace.
+ */
+static int parse_id_and_rest(const char *value, char *id, size_t id_size,
+                             char *rest, size_t rest_size)
+{
+    const char *p;
+    const char *end;
+    size_t len;
+
+    if (value == NULL) return -1;
+
+    p = value;
+    while (isspace((unsigned char)*p)) p++;
+    end = p;
+    while (*end != '\0' && !isspace((unsigned char)*end)) end++;
+    len = (size_t)(end - p);
+    if (len == 0 || len >= id_size) return -1;
+
+    memcpy(id, p, len);
+    id[len] = '\0';
+    if (!valid_client_id(id)) return -1;
+
+    while (isspace((unsigned char)*end)) end++;
+    p = end + strlen(end);
+    while (p > end && isspace((unsigned char)*(p - 1))) p--;
+    len = (size_t)(p - end);
+    if (len == 0 || len >= rest_size) return -1;
+
+    memcpy(rest, end, len);
+    rest[len] = '\0';
+    return 0;
+}
+
+/*
+ * Read one secret from a key file: the first non-empty, non-comment line.
+ * The path is already resolved relative to the file that named it.
+ */
+static int read_secret_line(const char *path, char *out, size_t out_size,
+                            const char *key, const char *id)
+{
+    char line[CONFIG_MAX_SECRET + 2];
+    FILE *fp;
+    struct stat st;
+
+    fp = fopen(path, "r");
+    if (fp == NULL) {
+        log_error("%s: cannot open '%s' for client '%s': %s", key, path, id,
+                  strerror(errno));
+        return -1;
+    }
+
+    if (stat(path, &st) == 0 &&
+        (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        log_warn("%s '%s' is readable by group or other; use mode 0600",
+                 key, path);
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *p;
+
+        if (strchr(line, '\n') == NULL && !feof(fp)) {
+            log_error("%s '%s': line is too long", key, path);
+            fclose(fp);
+            return -1;
+        }
+
+        p = str_trim(line);
+        if (*p == '\0' || *p == '#') {
+            continue;
+        }
+        if (strlen(p) >= out_size) {
+            log_error("%s '%s': secret is too long", key, path);
+            fclose(fp);
+            return -1;
+        }
+
+        snprintf(out, out_size, "%s", p);
+        fclose(fp);
+        return 0;
+    }
+
+    fclose(fp);
+    log_error("%s '%s' is empty", key, path);
+    return -1;
+}
+
+/*
+ * Add a credential whose current key lives in a separate file. The file
+ * is parsed at load time, just like a client-mode 'secret_file', so a
+ * missing or empty file is a configuration error rather than a server
+ * that silently cannot authenticate the client.
+ */
+static int set_client_secret_file(pipesix_config_t *config, const char *value,
+                                  const char *base)
+{
+    pipesix_client_cred_t *cred;
+    char id[CONFIG_MAX_CLIENT_ID];
+    char path[CONFIG_CLIENT_SECRET_PATH];
+    char resolved[CONFIG_CLIENT_SECRET_PATH];
+    char secret[CONFIG_MAX_SECRET];
+
+    if (parse_id_and_rest(value, id, sizeof(id), path, sizeof(path)) != 0) {
+        return -1;
+    }
+    if (config_find_client(config, id) != NULL) {
+        return -1;
+    }
+    if (config->client_count >= CONFIG_MAX_CLIENTS) {
+        return -1;
+    }
+    if (resolve_relative(base, path, resolved, sizeof(resolved)) != 0) {
+        log_error("client_secret_file: path is too long");
+        return -1;
+    }
+    if (read_secret_line(resolved, secret, sizeof(secret),
+                         "client_secret_file", id) != 0) {
+        return -1;
+    }
+
+    cred = &config->clients[config->client_count];
+    memset(cred, 0, sizeof(*cred));
+    snprintf(cred->id, sizeof(cred->id), "%s", id);
+    snprintf(cred->secret, sizeof(cred->secret), "%s", secret);
+    snprintf(cred->secret_file, sizeof(cred->secret_file), "%s", resolved);
+    config->client_count++;
+    return 0;
+}
+
+/*
+ * Add a staged key read from a separate file. This is what --stage-key
+ * writes when the current key came from client_secret_file, so a staged
+ * rotation never puts the new secret in the main configuration either.
+ */
+static int set_client_next_file(pipesix_config_t *config, const char *value,
+                                const char *base)
+{
+    pipesix_client_cred_t *cred;
+    char id[CONFIG_MAX_CLIENT_ID];
+    char path[CONFIG_CLIENT_SECRET_PATH];
+    char resolved[CONFIG_CLIENT_SECRET_PATH];
+    char secret[CONFIG_MAX_SECRET];
+
+    if (parse_id_and_rest(value, id, sizeof(id), path, sizeof(path)) != 0) {
+        return -1;
+    }
+    cred = (pipesix_client_cred_t *)config_find_client(config, id);
+    if (cred == NULL || cred->has_next_secret) {
+        return -1;
+    }
+    if (resolve_relative(base, path, resolved, sizeof(resolved)) != 0) {
+        log_error("client_next_file: path is too long");
+        return -1;
+    }
+    if (read_secret_line(resolved, secret, sizeof(secret),
+                         "client_next_file", id) != 0) {
+        return -1;
+    }
+
+    snprintf(cred->next_secret, sizeof(cred->next_secret), "%s", secret);
+    snprintf(cred->next_file, sizeof(cred->next_file), "%s", resolved);
+    cred->has_next_secret = 1;
     return 0;
 }
 
@@ -1410,7 +1650,7 @@ static int config_parse_file(pipesix_config_t *config, const char *path,
             continue;
         }
 
-        if (config_set_value(config, key, value) != 0) {
+        if (config_set_value(config, key, value, path) != 0) {
             fprintf(stderr,
                     "config_load: %s:%u: invalid value for '%s'\n",
                     path, line_num, key);
@@ -1659,8 +1899,9 @@ int config_validate(const pipesix_config_t *config)
         }
         if (config->client_count == 0) {
             log_error("Configuration validation failed: at least one "
-                      "'client = <id>: <secret>' entry is required in "
-                      "server mode");
+                      "'client = <id>: <secret>' or "
+                      "'client_secret_file = <id> <path>' entry is required "
+                      "in server mode");
             return -1;
         }
         if (config->secret[0] != '\0') {
@@ -1897,6 +2138,15 @@ void config_dump(const pipesix_config_t *config)
         log_info("  clients         = %d configured", config->client_count);
         for (i = 0; i < config->client_count; i++) {
             char prefix_str[INET6_ADDRSTRLEN];
+
+            if (config->clients[i].secret_file[0] != '\0') {
+                log_info("      key file: %s",
+                         config->clients[i].secret_file);
+            }
+            if (config->clients[i].next_file[0] != '\0') {
+                log_info("      staged file: %s",
+                         config->clients[i].next_file);
+            }
 
             if (config->clients[i].prefix_len <= 0) {
                 log_info("    client: %s (no route)", config->clients[i].id);
@@ -2191,7 +2441,8 @@ static int rewrite_client_keys(const char *path,
         }
 
         /* A full rotation retires any staged replacement key. */
-        if (key_len == 11u && memcmp(key, "client_next", 11) == 0) {
+        if ((key_len == 11u && memcmp(key, "client_next", 11) == 0) ||
+            (key_len == 16u && memcmp(key, "client_next_file", 16) == 0)) {
             continue;
         }
 
@@ -2315,6 +2566,8 @@ cleanup:
 int config_rotate_all_keys(pipesix_config_t *config)
 {
     char new_keys[(size_t)CONFIG_MAX_CLIENTS * ROTATE_KEY_STRIDE];
+    char old_secrets[CONFIG_MAX_CLIENTS][CONFIG_MAX_SECRET];
+    int written[CONFIG_MAX_CLIENTS] = { 0 };
     uint8_t key[PIPESIX_KEY_LEN];
     int i;
 
@@ -2350,29 +2603,72 @@ int config_rotate_all_keys(pipesix_config_t *config)
             return -1;
         }
 
+        snprintf(old_secrets[i], sizeof(old_secrets[i]), "%s",
+                 config->clients[i].secret);
         pipesix_hex_encode(key, sizeof(key),
                            new_keys + ((size_t)i * ROTATE_KEY_STRIDE));
     }
 
     memset(key, 0, sizeof(key));
 
+    /*
+     * File-backed credentials have no 'client' line to rewrite. Write
+     * their key files first, then rewrite the configuration; if the
+     * rewrite fails, restore every file before returning so the server is
+     * never left half-rotated.
+     */
+    for (i = 0; i < config->client_count; i++) {
+        const pipesix_client_cred_t *cred = &config->clients[i];
+
+        if (cred->secret_file[0] == '\0') {
+            continue;
+        }
+        if (write_secret_file(cred->secret_file,
+                              new_keys + ((size_t)i * ROTATE_KEY_STRIDE)) !=
+            0) {
+            log_error("--rotate-all: cannot write key file '%s': %s",
+                      cred->secret_file, strerror(errno));
+            goto restore;
+        }
+        written[i] = 1;
+    }
+
     if (rewrite_client_keys(config->config_path, config, new_keys) != 0) {
         log_error("--rotate-all: cannot rewrite '%s'; the existing keys "
                   "are unchanged", config->config_path);
-        return -1;
+        goto restore;
     }
 
     /* The caller prints these, so the new keys can be handed out. */
     for (i = 0; i < config->client_count; i++) {
+        char staged[CONFIG_CLIENT_SECRET_PATH];
+
+        snprintf(staged, sizeof(staged), "%s", config->clients[i].next_file);
         memcpy(config->clients[i].secret,
                new_keys + ((size_t)i * ROTATE_KEY_STRIDE),
                ROTATE_KEY_STRIDE);
         memset(config->clients[i].next_secret, 0,
                sizeof(config->clients[i].next_secret));
+        memset(config->clients[i].next_file, 0,
+               sizeof(config->clients[i].next_file));
         config->clients[i].has_next_secret = 0;
+        if (staged[0] != '\0') {
+            (void)unlink(staged);
+        }
     }
 
     return 0;
+
+restore:
+    for (i = 0; i < config->client_count; i++) {
+        if (written[i] &&
+            write_secret_file(config->clients[i].secret_file,
+                              old_secrets[i]) != 0) {
+            log_error("--rotate-all: cannot restore key file '%s': %s",
+                      config->clients[i].secret_file, strerror(errno));
+        }
+    }
+    return -1;
 }
 
 /*
@@ -2494,7 +2790,9 @@ static int line_is_key_for(const char *line, const char *key,
 
 static int line_is_aux_for(const char *line, const char *id)
 {
-    return line_is_key_for(line, "client_next", id) ||
+    return line_is_key_for(line, "client_secret_file", id) ||
+           line_is_key_for(line, "client_next", id) ||
+           line_is_key_for(line, "client_next_file", id) ||
            line_is_key_for(line, "client_disabled", id) ||
            line_is_key_for(line, "client_expires", id);
 }
@@ -3101,8 +3399,9 @@ int config_clear_limits(pipesix_config_t *config, const char *id)
  * Remove one auxiliary client line and optionally append its replacement.
  * The caller verifies the resulting in-memory state after the reload.
  */
-static int rewrite_client_aux(pipesix_config_t *config, const char *id,
-                              const char *key, const char *append)
+static int rewrite_client_aux_keys(pipesix_config_t *config, const char *id,
+                                   const char *const *keys, int key_count,
+                                   const char *append)
 {
     char path[CONFIG_PATH_MAX];
     char tmp_path[CONFIG_PATH_MAX + 32];
@@ -3111,6 +3410,7 @@ static int rewrite_client_aux(pipesix_config_t *config, const char *id,
     FILE *out = NULL;
     int last = '\n';
     int rc = -1;
+    int i;
 
     snprintf(path, sizeof(path), "%s", config->config_path);
     in = fopen(path, "r");
@@ -3123,7 +3423,15 @@ static int rewrite_client_aux(pipesix_config_t *config, const char *id,
     }
 
     while (fgets(buf, sizeof(buf), in) != NULL) {
-        if (line_is_key_for(buf, key, id)) {
+        int remove = 0;
+
+        for (i = 0; i < key_count; i++) {
+            if (line_is_key_for(buf, keys[i], id)) {
+                remove = 1;
+                break;
+            }
+        }
+        if (remove) {
             last = buf[strlen(buf) - 1];
             continue;
         }
@@ -3187,13 +3495,24 @@ cleanup:
     return rc;
 }
 
+static int rewrite_client_aux(pipesix_config_t *config, const char *id,
+                              const char *key, const char *append)
+{
+    const char *keys[1];
+
+    keys[0] = key;
+    return rewrite_client_aux_keys(config, id, keys, 1, append);
+}
+
 int config_stage_key(pipesix_config_t *config, const char *id,
                      char *secret_out, size_t secret_size)
 {
     const pipesix_client_cred_t *cred;
     char key_hex[ROTATE_KEY_STRIDE];
-    char line[CONFIG_MAX_CLIENT_ID + CONFIG_MAX_SECRET + 32];
+    char line[CONFIG_MAX_CLIENT_ID + CONFIG_CLIENT_SECRET_PATH + 40];
+    char next_path[CONFIG_CLIENT_SECRET_PATH + 8];
     uint8_t key[PIPESIX_KEY_LEN];
+    int file_backed = 0;
 
     if (config == NULL || id == NULL || config->config_path[0] == '\0') {
         return -1;
@@ -3220,18 +3539,44 @@ int config_stage_key(pipesix_config_t *config, const char *id,
     pipesix_hex_encode(key, sizeof(key), key_hex);
     memset(key, 0, sizeof(key));
 
-    if (snprintf(line, sizeof(line), "client_next = %s: %s\n", id,
-                 key_hex) >= (int)sizeof(line)) {
+    file_backed = cred->secret_file[0] != '\0';
+    if (file_backed) {
+        if (snprintf(next_path, sizeof(next_path), "%s.next",
+                     cred->secret_file) >= (int)sizeof(next_path)) {
+            return -1;
+        }
+        if (write_secret_file(next_path, key_hex) != 0) {
+            log_error("cannot write the staged key file '%s': %s",
+                      next_path, strerror(errno));
+            return -1;
+        }
+        if (snprintf(line, sizeof(line), "client_next_file = %s %s\n", id,
+                     next_path) >= (int)sizeof(line)) {
+            unlink(next_path);
+            return -1;
+        }
+    } else if (snprintf(line, sizeof(line), "client_next = %s: %s\n", id,
+                        key_hex) >= (int)sizeof(line)) {
         return -1;
     }
-    if (rewrite_client_aux(config, id, "client_next", line) != 0) {
+
+    if (rewrite_client_aux(config, id,
+                           file_backed ? "client_next_file"
+                                       : "client_next", line) != 0) {
+        if (file_backed) {
+            unlink(next_path);
+        }
         return -1;
     }
 
     cred = config_find_client(config, id);
     if (cred == NULL || !cred->has_next_secret ||
-        strcmp(cred->next_secret, key_hex) != 0) {
+        strcmp(cred->next_secret, key_hex) != 0 ||
+        (file_backed && strcmp(cred->next_file, next_path) != 0)) {
         log_error("the staged key for client '%s' was not accepted", id);
+        if (file_backed) {
+            unlink(next_path);
+        }
         return -1;
     }
     if (secret_out != NULL && secret_size > 0) {
@@ -3242,7 +3587,9 @@ int config_stage_key(pipesix_config_t *config, const char *id,
 
 int config_abort_key(pipesix_config_t *config, const char *id)
 {
+    static const char *const keys[] = { "client_next", "client_next_file" };
     const pipesix_client_cred_t *cred;
+    char next_file[CONFIG_CLIENT_SECRET_PATH];
 
     if (config == NULL || id == NULL || config->config_path[0] == '\0') {
         return -1;
@@ -3252,7 +3599,8 @@ int config_abort_key(pipesix_config_t *config, const char *id)
         log_error("client '%s' has no staged key", id);
         return -1;
     }
-    if (rewrite_client_aux(config, id, "client_next", NULL) != 0) {
+    snprintf(next_file, sizeof(next_file), "%s", cred->next_file);
+    if (rewrite_client_aux_keys(config, id, keys, 2, NULL) != 0) {
         return -1;
     }
     cred = config_find_client(config, id);
@@ -3260,17 +3608,26 @@ int config_abort_key(pipesix_config_t *config, const char *id)
         log_error("the staged key for client '%s' was not removed", id);
         return -1;
     }
+    if (next_file[0] != '\0') {
+        (void)unlink(next_file);
+    }
     return 0;
 }
 
 int config_promote_key(pipesix_config_t *config, const char *id)
 {
+    static const char *const next_keys[] = {
+        "client_next", "client_next_file"
+    };
     const pipesix_client_cred_t *cred;
     char path[CONFIG_PATH_MAX];
     char tmp_path[CONFIG_PATH_MAX + 32];
     char buf[4096];
     char line[CONFIG_MAX_CLIENT_ID + CONFIG_MAX_SECRET + 32];
     char new_secret[CONFIG_MAX_SECRET];
+    char old_secret[CONFIG_MAX_SECRET];
+    char current_file[CONFIG_CLIENT_SECRET_PATH];
+    char next_file[CONFIG_CLIENT_SECRET_PATH];
     FILE *in = NULL;
     FILE *out = NULL;
     int found = 0;
@@ -3285,6 +3642,44 @@ int config_promote_key(pipesix_config_t *config, const char *id)
         return -1;
     }
     snprintf(new_secret, sizeof(new_secret), "%s", cred->next_secret);
+    snprintf(old_secret, sizeof(old_secret), "%s", cred->secret);
+    snprintf(current_file, sizeof(current_file), "%s", cred->secret_file);
+    snprintf(next_file, sizeof(next_file), "%s", cred->next_file);
+
+    /*
+     * A file-backed key has no 'client' line to rewrite. Put the staged
+     * secret into the current key file first, then remove the staged line
+     * from the configuration. If the second step fails, both the new
+     * current key and the staged line still authenticate the client, so a
+     * retry is safe.
+     */
+    if (current_file[0] != '\0') {
+        if (write_secret_file(current_file, new_secret) != 0) {
+            log_error("cannot update the key file '%s': %s", current_file,
+                      strerror(errno));
+            return -1;
+        }
+        if (rewrite_client_aux_keys(config, id, next_keys, 2, NULL) != 0) {
+            /* The config was not replaced; undo the key file change. */
+            if (write_secret_file(current_file, old_secret) != 0) {
+                log_error("cannot restore key file '%s': %s", current_file,
+                          strerror(errno));
+            }
+            return -1;
+        }
+        cred = config_find_client(config, id);
+        if (cred == NULL || cred->has_next_secret ||
+            strcmp(cred->secret, new_secret) != 0) {
+            log_error("the promoted key for client '%s' was not accepted",
+                      id);
+            return -1;
+        }
+        if (next_file[0] != '\0') {
+            (void)unlink(next_file);
+        }
+        return 0;
+    }
+
     snprintf(path, sizeof(path), "%s", config->config_path);
 
     in = fopen(path, "r");
@@ -3308,7 +3703,8 @@ int config_promote_key(pipesix_config_t *config, const char *id)
             found = 1;
             continue;
         }
-        if (line_is_key_for(buf, "client_next", id)) {
+        if (line_is_key_for(buf, "client_next", id) ||
+            line_is_key_for(buf, "client_next_file", id)) {
             continue;
         }
         if (fputs(buf, out) == EOF) {

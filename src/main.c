@@ -215,6 +215,7 @@ static void print_usage(const char *progname)
             "       %s --usage [--history] [--json|--csv] [-c <config>]\n"
             "       %s --doctor [-c <config>]\n"
             "       %s --stage-key <id> | --promote-key <id> | --abort-key <id>\n"
+            "       %s --stage-all | --promote-all | --abort-all [-c <config>]\n"
             "\n"
             "pipesix %s - IPv6 over UDP Tunnel\n"
             "\n"
@@ -222,7 +223,7 @@ static void print_usage(const char *progname)
             "  -c, --config <path>     Configuration file\n"
             "                          (default: %s)\n",
             progname, progname, progname, progname, progname, progname,
-            progname, progname, progname, progname, progname,
+            progname, progname, progname, progname, progname, progname,
             PIPESIX_APP_VERSION, DEFAULT_CONFIG_PATH);
 
     fprintf(stderr,
@@ -298,6 +299,12 @@ static void print_usage(const char *progname)
             "  -h, --help              Show this help message\n");
 
     fprintf(stderr,
+            "      --stage-all         Stage a replacement key for every client\n"
+            "                          that does not already have one\n"
+            "      --promote-all       Promote every staged key\n"
+            "      --abort-all         Discard every staged key\n");
+
+    fprintf(stderr,
             "\n"
             "Configuration file format (key = value):\n"
             "  mode            client | server\n"
@@ -312,6 +319,8 @@ static void print_usage(const char *progname)
             "  secret          This client's pre-shared key (client mode)\n"
             "  client_id       This client's identity (client mode)\n"
             "  client          <id>: <secret> entry (server mode, repeatable)\n"
+            "  client_secret_file <id> <path> key from a 0600 file (server)\n"
+            "  client_next_file <id> <path> staged key from a file (server)\n"
             "  client_route    <id> <prefix> (server, repeatable)\n"
             "  client_prefix_pool <ipv6>/<len> /64 delegation pool (server)\n"
             "  client_rate_limit <id> <kbit/s> (server, repeatable, both directions)\n"
@@ -623,8 +632,11 @@ static int client_tun_address(const pipesix_client_cred_t *cred, char *out,
  * so the caller should pass --server-address there. The file is opened
  * with mode 0600 before the secret is written on POSIX.
  */
-static int write_client_config(const pipesix_config_t *config, const char *id,
-                               const char *server_address, const char *path)
+static int write_client_config_with_secret(const pipesix_config_t *config,
+                                           const char *id,
+                                           const char *server_address,
+                                           const char *path,
+                                           const char *secret_override)
 {
     const pipesix_client_cred_t *cred = config_find_client(config, id);
     char tun_address[CONFIG_MAX_ADDRESS];
@@ -632,6 +644,7 @@ static int write_client_config(const pipesix_config_t *config, const char *id,
     char dir_path[CONFIG_PATH_MAX];
     char address[CONFIG_MAX_ADDRESS];
     const char *remote = server_address;
+    const char *secret = secret_override != NULL ? secret_override : NULL;
     FILE *fp;
     int prefix_len = 0;
     int port;
@@ -640,6 +653,10 @@ static int write_client_config(const pipesix_config_t *config, const char *id,
         log_error("cannot export client '%s': no such credential or path",
                   id != NULL ? id : "?");
         return -1;
+    }
+
+    if (secret == NULL) {
+        secret = cred->secret;
     }
 
     if (client_tun_address(cred, tun_address, sizeof(tun_address),
@@ -692,7 +709,7 @@ static int write_client_config(const pipesix_config_t *config, const char *id,
                 "tun_mtu = %d\n"
                 "log_level = info\n"
                 "# route the generated %s on the client if it is a /64\n",
-                id, config->config_path, route_text, id, cred->secret,
+                id, config->config_path, route_text, id, secret,
                 remote, port, address, prefix_len, config->tun_mtu,
                 route_text) < 0) {
         fclose(fp);
@@ -706,6 +723,13 @@ static int write_client_config(const pipesix_config_t *config, const char *id,
     }
 
     return 0;
+}
+
+static int write_client_config(const pipesix_config_t *config, const char *id,
+                               const char *server_address, const char *path)
+{
+    return write_client_config_with_secret(config, id, server_address, path,
+                                           NULL);
 }
 
 static void report_rotated_keys(const pipesix_config_t *config)
@@ -769,6 +793,9 @@ int main(int argc, char *argv[])
         { "expire-client", required_argument, NULL, 1033 },
         { "rate-in",  required_argument, NULL, 1034 },
         { "rate-out", required_argument, NULL, 1035 },
+        { "stage-all", no_argument,       NULL, 1036 },
+        { "promote-all", no_argument,     NULL, 1037 },
+        { "abort-all", no_argument,       NULL, 1038 },
         { "version",   no_argument,       NULL, 'V' },
         { "help",      no_argument,       NULL, 'h' },
         { NULL,        0,                 NULL, 0   }
@@ -809,6 +836,9 @@ int main(int argc, char *argv[])
     const char *stage_key = NULL;
     const char *promote_key = NULL;
     const char *abort_key = NULL;
+    int stage_all = 0;
+    int promote_all = 0;
+    int abort_all = 0;
     const char *disable_client = NULL;
     const char *enable_client = NULL;
     const char *expire_client = NULL;
@@ -954,6 +984,15 @@ int main(int argc, char *argv[])
                 break;
             case 1035:
                 rate_out_arg = optarg;
+                break;
+            case 1036:
+                stage_all = 1;
+                break;
+            case 1037:
+                promote_all = 1;
+                break;
+            case 1038:
+                abort_all = 1;
                 break;
             case 'V':
                 printf("pipesix %s (protocol %d)\n",
@@ -1132,17 +1171,28 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    if (export_dir != NULL && export_client == NULL && !rotate_all) {
-        fprintf(stderr, "Error: --export-dir requires --export-client or "
-                        "--rotate-all\n");
+    if (export_dir != NULL && export_client == NULL && !rotate_all &&
+        !stage_all) {
+        fprintf(stderr, "Error: --export-dir requires --export-client, "
+                        "--rotate-all or --stage-all\n");
         return EXIT_FAILURE;
     }
 
     if (export_client != NULL &&
         (add_client != NULL || remove_client != NULL || rotate_all ||
+         stage_all || promote_all || abort_all ||
          set_limit != NULL || clear_limit != NULL)) {
         fprintf(stderr, "Error: --export-client cannot be combined with "
                         "provisioning or rotation commands\n");
+        return EXIT_FAILURE;
+    }
+
+    if ((stage_all || promote_all || abort_all) &&
+        (add_client != NULL || remove_client != NULL || rotate_all ||
+         set_limit != NULL || clear_limit != NULL ||
+         export_client != NULL || write_client_path != NULL)) {
+        fprintf(stderr, "Error: a fleet key command cannot be combined "
+                        "with provisioning, export or limits\n");
         return EXIT_FAILURE;
     }
 
@@ -1154,11 +1204,11 @@ int main(int argc, char *argv[])
     }
 
     if ((stage_key != NULL) + (promote_key != NULL) + (abort_key != NULL) +
+            stage_all + promote_all + abort_all +
             (disable_client != NULL) + (enable_client != NULL) +
             (expire_client != NULL) > 1) {
-        fprintf(stderr, "Error: choose one of --stage-key, --promote-key, "
-                        "--abort-key, --disable-client, --enable-client or "
-                        "--expire-client\n");
+        fprintf(stderr, "Error: choose one key-rotation, lifecycle or "
+                        "fleet command\n");
         return EXIT_FAILURE;
     }
 
@@ -1170,6 +1220,7 @@ int main(int argc, char *argv[])
 
     if (doctor_only &&
         (stage_key != NULL || promote_key != NULL || abort_key != NULL ||
+         stage_all || promote_all || abort_all ||
          disable_client != NULL || enable_client != NULL ||
          expire_client != NULL || add_client != NULL ||
          remove_client != NULL || rotate_all)) {
@@ -1384,6 +1435,121 @@ int main(int argc, char *argv[])
         return client_doctor(&config) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
+    if (stage_all || promote_all || abort_all) {
+        char reply[1024];
+        int changed = 0;
+        int failed = 0;
+
+        if (audit_open(config.audit_log) != 0) {
+            fprintf(stderr, "Warning: cannot open the audit log '%s': %s\n",
+                    config.audit_log, strerror(errno));
+        }
+
+        if (stage_all) {
+            printf("Staging replacement keys in %s\n\n", config_path);
+        }
+
+        for (int i = 0; i < config.client_count; i++) {
+            char id[CONFIG_MAX_CLIENT_ID];
+            char key[PIPESIX_KEY_LEN * 2 + 1];
+            const pipesix_client_cred_t *cred = &config.clients[i];
+
+            snprintf(id, sizeof(id), "%s", cred->id);
+
+            if (stage_all) {
+                if (cred->has_next_secret) {
+                    printf("  %-16s already staged; skipped\n", id);
+                    continue;
+                }
+                key[0] = '\0';
+                if (config_stage_key(&config, id, key, sizeof(key)) != 0) {
+                    failed = 1;
+                    break;
+                }
+                printf("  %-16s %s\n", id, key);
+                audit_event("key_staged", id, "",
+                            "replacement key staged by --stage-all");
+                memset(key, 0, sizeof(key));
+                changed++;
+
+                if (export_dir != NULL) {
+                    char path[CONFIG_PATH_MAX];
+
+                    cred = config_find_client(&config, id);
+                    if (cred == NULL ||
+                        snprintf(path, sizeof(path), "%s/%s.conf", export_dir,
+                                 id) >= (int)sizeof(path) ||
+                        write_client_config_with_secret(
+                            &config, id, server_address, path,
+                            cred->next_secret) != 0) {
+                        fprintf(stderr,
+                                "Error: cannot export staged client '%s'\n",
+                                id);
+                        failed = 1;
+                        break;
+                    }
+                    printf("  %-16s wrote %s\n", "", path);
+                }
+            } else if (promote_all) {
+                if (!cred->has_next_secret) {
+                    continue;
+                }
+                if (config_promote_key(&config, id) != 0) {
+                    failed = 1;
+                    break;
+                }
+                printf("Promoted the staged key for client '%s'.\n", id);
+                audit_event("key_promoted", id, "",
+                            "staged key promoted by --promote-all");
+                changed++;
+            } else {
+                if (!cred->has_next_secret) {
+                    continue;
+                }
+                if (config_abort_key(&config, id) != 0) {
+                    failed = 1;
+                    break;
+                }
+                printf("Discarded the staged key for client '%s'.\n", id);
+                audit_event("key_aborted", id, "",
+                            "staged key discarded by --abort-all");
+                changed++;
+            }
+        }
+
+        if (failed) {
+            fprintf(stderr,
+                    "Error: the fleet command stopped after changing %d "
+                    "client(s); inspect '%s' before retrying\n",
+                    changed, config_path);
+            audit_close();
+            return EXIT_FAILURE;
+        }
+        if (changed == 0) {
+            fprintf(stderr, stage_all
+                                ? "Error: every client already has a staged "
+                                  "key\n"
+                                : "Error: no staged keys are configured\n");
+            audit_close();
+            return EXIT_FAILURE;
+        }
+
+        printf("\n");
+        if (stage_all) {
+            printf("The current keys stay valid. Update each client with its "
+                   "new key,\nverify it connects, then run "
+                   "'pipesix --promote-all'.\n");
+        }
+        if (control_request(config_path, "reload", reply, sizeof(reply)) == 0) {
+            printf("Running instance asked to reload.\n");
+        } else {
+            printf("No running instance for this configuration; the change "
+                   "applies when it starts.\n");
+        }
+        audit_close();
+        return EXIT_SUCCESS;
+    }
+
     if (stage_key != NULL || promote_key != NULL || abort_key != NULL ||
         disable_client != NULL || enable_client != NULL ||
         expire_client != NULL) {
@@ -1405,8 +1571,17 @@ int main(int argc, char *argv[])
         if (stage_key != NULL) {
             rc = config_stage_key(&config, id, key, sizeof(key));
             if (rc == 0) {
+                const pipesix_client_cred_t *cred =
+                    config_find_client(&config, id);
+
                 printf("Staged a replacement key for client '%s':\n\n", id);
-                printf("  client_next = %s: %s\n\n", id, key);
+                if (cred != NULL && cred->next_file[0] != '\0') {
+                    printf("  client_next_file = %s %s\n", id,
+                           cred->next_file);
+                    printf("  new secret       = %s\n\n", key);
+                } else {
+                    printf("  client_next = %s: %s\n\n", id, key);
+                }
                 printf("The current key stays valid. Update the client to "
                        "the new key,\nverify it connects, then run "
                        "'pipesix --promote-key %s'.\n", id);

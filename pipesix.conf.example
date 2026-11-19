@@ -97,9 +97,17 @@ secret    = replace-this-with-pipesix-genkey-output
 #client = client1: <output of "pipesix --genkey">
 #client = client2: <output of "pipesix --genkey">
 #
+# Server-side key files keep credentials out of the main configuration.
+# The file is read at load time and must be mode 0600. --stage-key writes
+# <path>.next and a client_next_file line; --promote-key updates the
+# current file and removes the staged line.
+#client_secret_file = client1 /etc/pipesix/keys/client1.key
+#client_next_file = client1 /etc/pipesix/keys/client1.key.next
+#
 # client_next: staged replacement key. The current key stays valid while
 # it is present; 'pipesix --promote-key <id>' makes it current and
-# 'pipesix --abort-key <id>' discards it.
+# 'pipesix --abort-key <id>' discards it. --stage-all, --promote-all and
+# --abort-all apply the same operation to every client.
 #client_next = client1: <new key>
 #
 # client_disabled / client_expires: refuse a client without deleting its

@@ -2549,6 +2549,9 @@ static int server_control_append(char *buf, size_t size, size_t *used,
  * is released, so an operator running --status never stalls the data
  * path behind getnameinfo() or a large write.
  */
+static const char *client_state_text(const pipesix_client_cred_t *cred,
+                                     time_t now);
+
 static int server_status(server_context_t *ctx, char *reply, size_t size)
 {
     char ids[SERVER_MAX_CLIENTS][CONFIG_MAX_CLIENT_ID];
@@ -2563,6 +2566,9 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
     uint64_t rate_out_kbps[SERVER_MAX_CLIENTS];
     uint64_t quota_mib[SERVER_MAX_CLIENTS];
     uint64_t quota_remaining[SERVER_MAX_CLIENTS];
+    char states[SERVER_MAX_CLIENTS][16];
+    int64_t expires_at[SERVER_MAX_CLIENTS];
+    int staged_key[SERVER_MAX_CLIENTS];
     long idle[SERVER_MAX_CLIENTS];
     time_t now = time(NULL);
     time_t started = ctx->stats.started;
@@ -2587,6 +2593,18 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
                  session->client_id[0] != '\0' ? session->client_id : "?");
         format_peer((const struct sockaddr *)&session->addr,
                     session->addr_len, peers[count], sizeof(peers[count]));
+
+        {
+            const pipesix_client_cred_t *cred =
+                config_find_client(ctx->config, ids[count]);
+
+            snprintf(states[count], sizeof(states[count]), "%s",
+                     client_state_text(cred, now));
+            expires_at[count] = (cred != NULL && cred->has_expiry)
+                                    ? cred->expires_at
+                                    : 0;
+            staged_key[count] = (cred != NULL && cred->has_next_secret);
+        }
 
         if (session->prefix_len > 0) {
             char prefix_str[INET6_ADDRSTRLEN];
@@ -2699,7 +2717,11 @@ static int server_status(server_context_t *ctx, char *reply, size_t size)
             return -1;
         }
 
-        if (server_control_append(reply, size, &used, "\n") != 0) {
+        if (server_control_append(
+                reply, size, &used,
+                " state=%s expires_at=%lld staged_key=%s\n", states[i],
+                (long long)expires_at[i], staged_key[i] ? "yes" : "no") !=
+            0) {
             return -1;
         }
     }
@@ -2732,6 +2754,9 @@ static int server_status_json(server_context_t *ctx, char *reply, size_t size)
     char peers[SERVER_MAX_CLIENTS][96];
     char routes[SERVER_MAX_CLIENTS][INET6_ADDRSTRLEN + 12];
     char limits[SERVER_MAX_CLIENTS][256];
+    char states[SERVER_MAX_CLIENTS][16];
+    int64_t expires_at[SERVER_MAX_CLIENTS];
+    int staged_key[SERVER_MAX_CLIENTS];
     char period_name[24];
     uint64_t frames[SERVER_MAX_CLIENTS];
     uint64_t rx_bytes[SERVER_MAX_CLIENTS];
@@ -2769,6 +2794,18 @@ static int server_status_json(server_context_t *ctx, char *reply, size_t size)
                  session->client_id[0] != '\0' ? session->client_id : "?");
         format_peer((const struct sockaddr *)&session->addr,
                     session->addr_len, peers[count], sizeof(peers[count]));
+
+        {
+            const pipesix_client_cred_t *cred =
+                config_find_client(ctx->config, ids[count]);
+
+            snprintf(states[count], sizeof(states[count]), "%s",
+                     client_state_text(cred, now));
+            expires_at[count] = (cred != NULL && cred->has_expiry)
+                                    ? cred->expires_at
+                                    : 0;
+            staged_key[count] = (cred != NULL && cred->has_next_secret);
+        }
 
         if (session->prefix_len > 0) {
             char prefix_str[INET6_ADDRSTRLEN];
@@ -2864,12 +2901,15 @@ static int server_status_json(server_context_t *ctx, char *reply, size_t size)
                 reply, size, &used,
                 "%s{\"client_id\":\"%s\",\"peer\":\"%s\","
                 "\"rx_bytes\":%llu,\"tx_bytes\":%llu,\"frames\":%llu,"
-                "\"idle_seconds\":%ld,\"route\":%s,\"limits\":%s}",
+                "\"idle_seconds\":%ld,\"route\":%s,\"limits\":%s,"
+                "\"state\":\"%s\",\"expires_at\":%lld,"
+                "\"staged_key\":%s}",
                 i > 0 ? "," : "", ids[i], peers[i],
                 (unsigned long long)rx_bytes[i],
                 (unsigned long long)tx_bytes[i],
                 (unsigned long long)frames[i], idle[i], routes[i],
-                limits[i]) != 0) {
+                limits[i], states[i], (long long)expires_at[i],
+                staged_key[i] ? "true" : "false") != 0) {
             goto too_large;
         }
     }
@@ -2904,6 +2944,22 @@ typedef enum {
     USAGE_CSV
 } usage_format_t;
 
+/* Administrative state shown by --status and --usage. */
+static const char *client_state_text(const pipesix_client_cred_t *cred,
+                                     time_t now)
+{
+    if (cred == NULL) {
+        return "unknown";
+    }
+    if (cred->disabled) {
+        return "disabled";
+    }
+    if (cred->has_expiry && cred->expires_at <= (int64_t)now) {
+        return "expired";
+    }
+    return "enabled";
+}
+
 static int server_usage(server_context_t *ctx, char *reply, size_t size,
                         usage_format_t format)
 {
@@ -2913,6 +2969,9 @@ static int server_usage(server_context_t *ctx, char *reply, size_t size,
     uint64_t left[CONFIG_MAX_CLIENTS];
     uint64_t rate[CONFIG_MAX_CLIENTS];
     int connected[CONFIG_MAX_CLIENTS];
+    char states[CONFIG_MAX_CLIENTS][16];
+    int64_t expires_at[CONFIG_MAX_CLIENTS];
+    int staged_key[CONFIG_MAX_CLIENTS];
     char config_esc[1024];
     char start_str[16] = "?";
     char end_str[16] = "?";
@@ -2960,6 +3019,12 @@ static int server_usage(server_context_t *ctx, char *reply, size_t size,
             rate[count] = 0;
         }
         connected[count] = 0;
+        snprintf(states[count], sizeof(states[count]), "%s",
+                 client_state_text(&ctx->config->clients[i], now));
+        expires_at[count] = ctx->config->clients[i].has_expiry
+                                ? ctx->config->clients[i].expires_at
+                                : 0;
+        staged_key[count] = ctx->config->clients[i].has_next_secret;
 
         for (j = 0; j < SERVER_MAX_CLIENTS; j++) {
             if (ctx->sessions[j].active &&
@@ -2978,20 +3043,23 @@ static int server_usage(server_context_t *ctx, char *reply, size_t size,
         if (server_control_append(
                 reply, size, &len,
                 "OK\nclient_id,period_start,period_end,used_bytes,"
-                "quota_bytes,quota_remaining_bytes,rate_kbps,connected\n") != 0) {
+                "quota_bytes,quota_remaining_bytes,rate_kbps,connected,"
+                "state,expires_at,staged_key\n") != 0) {
             return -1;
         }
 
         for (i = 0; i < count; i++) {
             if (server_control_append(
                     reply, size, &len,
-                    "%s,%s,%s,%llu,%llu,%llu,%llu,%s\n",
+                    "%s,%s,%s,%llu,%llu,%llu,%llu,%s,%s,%lld,%s\n",
                     ids[i], start_str, end_str,
                     (unsigned long long)bytes_used[i],
                     (unsigned long long)quota[i],
                     (unsigned long long)left[i],
                     (unsigned long long)rate[i],
-                    connected[i] ? "true" : "false") != 0) {
+                    connected[i] ? "true" : "false", states[i],
+                    (long long)expires_at[i],
+                    staged_key[i] ? "true" : "false") != 0) {
                 return -1;
             }
         }
@@ -3021,13 +3089,17 @@ static int server_usage(server_context_t *ctx, char *reply, size_t size,
                     "%s{\"client_id\":\"%s\",\"used_bytes\":%llu,"
                     "\"quota_bytes\":%llu,"
                     "\"quota_remaining_bytes\":%llu,"
-                    "\"rate_kbps\":%llu,\"connected\":%s}",
+                    "\"rate_kbps\":%llu,\"connected\":%s,"
+                    "\"state\":\"%s\",\"expires_at\":%lld,"
+                    "\"staged_key\":%s}",
                     i > 0 ? "," : "", ids[i],
                     (unsigned long long)bytes_used[i],
                     (unsigned long long)quota[i],
                     (unsigned long long)left[i],
                     (unsigned long long)rate[i],
-                    connected[i] ? "true" : "false") != 0) {
+                    connected[i] ? "true" : "false", states[i],
+                    (long long)expires_at[i],
+                    staged_key[i] ? "true" : "false") != 0) {
                 goto too_large;
             }
         }
@@ -3078,8 +3150,12 @@ static int server_usage(server_context_t *ctx, char *reply, size_t size,
             goto too_large;
         }
 
-        if (server_control_append(reply, size, &len, " connected=%s\n",
-                                  connected[i] ? "yes" : "no") != 0) {
+        if (server_control_append(
+                reply, size, &len,
+                " connected=%s state=%s expires_at=%lld staged_key=%s\n",
+                connected[i] ? "yes" : "no", states[i],
+                (long long)expires_at[i],
+                staged_key[i] ? "yes" : "no") != 0) {
             goto too_large;
         }
     }

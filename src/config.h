@@ -31,8 +31,12 @@
  *                      device and sockets
  *   client_id        - This client's identity (client mode)
  *   client           - <id>: <secret> credential (server mode, repeatable)
+ *   client_secret_file - <id> <path> credential read from a 0600 file
+ *                      (server mode, repeatable)
  *   client_next      - <id>: <secret> staged replacement key, accepted
  *                      alongside the current one (server, repeatable)
+ *   client_next_file - <id> <path> staged replacement key read from a file
+ *                      (server mode, repeatable)
  *   client_route     - <id> <ipv6[/len]> inner prefix for return traffic
  *                      (server mode, repeatable, follows its client line)
  *   client_disabled  - <id> temporarily refuse this client (server)
@@ -109,6 +113,7 @@
 #define CONFIG_MAX_ALLOWED  64
 #define CONFIG_MAX_CLIENTS  64
 #define CONFIG_MAX_CLIENT_ID 32
+#define CONFIG_CLIENT_SECRET_PATH 512
 #define CONFIG_MAX_REMOTE_ENDPOINTS 8
 #define CONFIG_MAX_REMOTE_LIST      512
 #define CONFIG_MAX_USER             64
@@ -153,6 +158,14 @@ typedef struct {
     /* Staged replacement key accepted during a zero-downtime rotation. */
     char    next_secret[CONFIG_MAX_SECRET];
     int     has_next_secret;
+    /*
+     * When the credential comes from a file, these hold the resolved path
+     * to the current and staged key. Paths are kept with the client so a
+     * rewrite can update the file without putting the secret in the main
+     * configuration (which may be world-readable or in version control).
+     */
+    char    secret_file[CONFIG_CLIENT_SECRET_PATH];
+    char    next_file[CONFIG_CLIENT_SECRET_PATH];
     /* Administrative state, checked before authentication and by reload. */
     int     disabled;
     int     has_expiry;
