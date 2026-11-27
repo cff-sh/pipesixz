@@ -110,7 +110,8 @@ stage_linux() {
     mkdir -p "$stage"
     install -m 755 "$ROOT/pipesix" "$stage/pipesix"
     install -m 644 "$ROOT/pipesix.conf.example" "$ROOT/pipesix.service" \
-                   "$ROOT/README.md" "$ROOT/LICENSE" "$stage/"
+                   "$ROOT/README.md" "$ROOT/CHANGELOG.md" "$ROOT/LICENSE" \
+                   "$stage/"
     install -m 755 "$ROOT/setup.sh" "$ROOT/netassist-up.sh" \
                    "$ROOT/wg-route64.sh" "$stage/"
 
@@ -138,7 +139,7 @@ make_deb() {
                    "$root/etc/pipesix/pipesix.conf.example"
     install -m 644 "$ROOT/pipesix.service" \
                    "$root/lib/systemd/system/pipesix.service"
-    install -m 644 "$ROOT/README.md" "$ROOT/LICENSE" \
+    install -m 644 "$ROOT/README.md" "$ROOT/CHANGELOG.md" "$ROOT/LICENSE" \
                    "$root/usr/share/doc/pipesix/"
 
     cat > "$root/DEBIAN/control" <<EOF
@@ -148,7 +149,8 @@ Section: net
 Priority: optional
 Architecture: $arch
 Depends: libc6, iproute2
-Maintainer: pipesix maintainers <noreply@example.invalid>
+Maintainer: pipesix contributors <alexander.bergmans@student.elisa.be>
+Homepage: https://github.com/cff-sh/pipesixz
 Description: IPv6 over UDP tunnel with per-client pre-shared keys
  pipesix relays IPv6 traffic between a client TUN device and a server
  routed to an upstream IPv6 tunnel broker. Every client has its own key,
@@ -200,7 +202,7 @@ build_windows() {
     mkdir -p "$stage"
     install -m 755 "$ROOT/pipesix.exe" "$stage/pipesix.exe"
     install -m 644 "$ROOT/pipesix.conf.example" "$ROOT/README.md" \
-                   "$ROOT/LICENSE" "$stage/"
+                   "$ROOT/CHANGELOG.md" "$ROOT/LICENSE" "$stage/"
 
     if have zip; then
         ( cd "$DIST" && zip -qr "pipesix-$VERSION-windows-amd64.zip" \

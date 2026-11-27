@@ -177,6 +177,7 @@ sudo systemctl enable --now pipesix
 | `build.sh` | Multi-platform build and packaging (Linux binaries, Windows exe) |
 | `setup.sh` | Server/client setup (config + routes + NAT) |
 | `pipesix.service` | systemd unit for auto-start |
+| `CHANGELOG.md` | Release notes and upgrade guidance |
 | `wg-route64.sh` | Route64 WireGuard setup |
 | `netassist-up.sh` | NetAssist SIT tunnel setup |
 
@@ -1232,7 +1233,8 @@ shared, so a Windows client talks to an unchanged Linux server.
 
 ## Release builds
 
-`build.sh` produces self-contained artifacts for the platforms pipesix runs
+See [CHANGELOG.md](CHANGELOG.md) for the changes and upgrade notes in this
+release. `build.sh` produces self-contained artifacts for the platforms pipesix runs
 on. It stages each target under `dist/`, writes `SHA256SUMS`, and skips a
 target whose toolchain is not installed (so `--all` works on a machine with
 only the native compiler):
@@ -1246,7 +1248,7 @@ only the native compiler):
 ```bash
 ./build.sh                          # host platform
 ./build.sh --all                    # every target whose toolchain exists
-./build.sh --target windows-amd64 --version 2.4.0
+./build.sh --target windows-amd64 --version 2.5.0
 make dist                           # same as ./build.sh --all
 ```
 
