@@ -49,6 +49,17 @@ typedef int (*control_handler_fn)(const char *request, char *reply,
                                   size_t reply_size, void *arg);
 
 /*
+ * Configure the administrative role table before control_start().
+ *
+ * The access group decides who may connect; the admin and operator
+ * groups elevate members. Empty names keep the historical owner-only
+ * socket. Returns 0 on success, -1 when a configured group is missing or
+ * an elevated group is named without an access group.
+ */
+int control_configure(const char *access_group, const char *admin_group,
+                      const char *operator_group);
+
+/*
  * Start listening for control requests for this configuration.
  *
  * Harmless to call on any platform; a no-op where no channel exists.

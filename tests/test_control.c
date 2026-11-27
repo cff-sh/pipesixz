@@ -12,9 +12,14 @@
  */
 
 #include "control.h"
+#include "admin.h"
+#include "audit.h"
 #include "logger.h"
 
 #include <errno.h>
+#if !defined(_WIN32)
+#include <grp.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,6 +82,167 @@ static int check_reply(const char *path, const char *request,
     return 0;
 }
 
+static int test_admin_matrix(void)
+{
+    int failed = 0;
+
+    if (!admin_request_allowed(ADMIN_ROLE_VIEWER, "status") ||
+        !admin_request_allowed(ADMIN_ROLE_VIEWER, "usage json") ||
+        !admin_request_allowed(ADMIN_ROLE_VIEWER, "metrics") ||
+        !admin_request_allowed(ADMIN_ROLE_VIEWER, "stats")) {
+        fprintf(stderr, "admin: viewer read commands were denied\n");
+        failed = 1;
+    }
+    if (admin_request_allowed(ADMIN_ROLE_VIEWER, "kick alice") ||
+        admin_request_allowed(ADMIN_ROLE_VIEWER, "reload") ||
+        admin_request_allowed(ADMIN_ROLE_VIEWER, "usage-reset alice")) {
+        fprintf(stderr, "admin: viewer was allowed to change state\n");
+        failed = 1;
+    }
+    if (!admin_request_allowed(ADMIN_ROLE_OPERATOR, "kick alice") ||
+        !admin_request_allowed(ADMIN_ROLE_OPERATOR, "reload")) {
+        fprintf(stderr, "admin: operator was denied kick or reload\n");
+        failed = 1;
+    }
+    if (admin_request_allowed(ADMIN_ROLE_OPERATOR, "usage-reset alice")) {
+        fprintf(stderr, "admin: operator was allowed an accounting change\n");
+        failed = 1;
+    }
+    if (!admin_request_allowed(ADMIN_ROLE_ADMIN, "usage-reset alice")) {
+        fprintf(stderr, "admin: administrator was denied an accounting change\n");
+        failed = 1;
+    }
+    if (strcmp(admin_role_name(ADMIN_ROLE_ADMIN), "admin") != 0 ||
+        strcmp(admin_role_name(ADMIN_ROLE_OPERATOR), "operator") != 0 ||
+        strcmp(admin_role_name(ADMIN_ROLE_VIEWER), "viewer") != 0) {
+        fprintf(stderr, "admin: role names changed\n");
+        failed = 1;
+    }
+    if (!admin_role_satisfies(ADMIN_ROLE_ADMIN, ADMIN_ROLE_OPERATOR) ||
+        admin_role_satisfies(ADMIN_ROLE_VIEWER, ADMIN_ROLE_OPERATOR)) {
+        fprintf(stderr, "admin: role ordering is wrong\n");
+        failed = 1;
+    }
+
+    return failed;
+}
+
+static int test_audit_actor(void)
+{
+    char path[] = "/tmp/pipesix-audit-test-XXXXXX";
+    char body[2048];
+    FILE *fp;
+    int fd;
+    int failed = 0;
+    size_t used;
+
+    fd = mkstemp(path);
+    if (fd < 0) {
+        perror("mkstemp");
+        return 1;
+    }
+    close(fd);
+
+    if (audit_open(path) != 0) {
+        fprintf(stderr, "audit: cannot open test file: %s\n",
+                strerror(errno));
+        unlink(path);
+        return 1;
+    }
+
+    audit_set_actor("alice", 1000, "admin", "req-1");
+    audit_event("test", "client", "peer", "hello");
+    audit_close();
+    audit_clear_actor();
+
+    fp = fopen(path, "r");
+    used = (fp != NULL) ? fread(body, 1, sizeof(body) - 1, fp) : 0;
+    if (fp != NULL) {
+        fclose(fp);
+    }
+    body[used] = '\0';
+
+    if (strstr(body, "\"actor\":\"alice\"") == NULL ||
+        strstr(body, "\"actor_uid\":1000") == NULL ||
+        strstr(body, "\"role\":\"admin\"") == NULL ||
+        strstr(body, "\"request_id\":\"req-1\"") == NULL) {
+        fprintf(stderr, "audit: actor fields missing from '%s'\n", body);
+        failed = 1;
+    }
+
+    unlink(path);
+    return failed;
+}
+
+static int test_control_config(void)
+{
+    int failed = 0;
+
+    if (control_configure("pipesix-no-such-control-group", NULL, NULL) == 0) {
+        fprintf(stderr, "admin: a missing control group was accepted\n");
+        failed = 1;
+    }
+    if (control_configure(NULL, NULL, NULL) != 0) {
+        fprintf(stderr, "admin: clearing the role table failed\n");
+        failed = 1;
+    }
+
+    return failed;
+}
+
+/*
+ * With an access group configured but no elevation group, the current
+ * non-root user is a viewer. This exercises the real peer-credential path
+ * rather than only the request matrix.
+ */
+static int test_viewer_socket(const char *path)
+{
+#if !defined(_WIN32)
+    struct group *group;
+    int before;
+    int failed = 0;
+
+    if (getuid() == 0) {
+        return 0;
+    }
+
+    group = getgrgid(getgid());
+    if (group == NULL) {
+        return 0;
+    }
+
+    if (control_configure(group->gr_name, NULL, NULL) != 0) {
+        fprintf(stderr, "admin: cannot configure the viewer group\n");
+        return 1;
+    }
+
+    control_start(path);
+    before = s_handled;
+
+    if (check_reply(path, "status", "mode: test", 1) != 0) failed = 1;
+    if (check_reply(path, "kick alice", "permission denied", 0) != 0) {
+        failed = 1;
+    }
+    if (check_reply(path, "usage-reset alice", "permission denied", 0) != 0) {
+        failed = 1;
+    }
+    if (s_handled != before + 1) {
+        fprintf(stderr, "admin: a denied request reached the handler\n");
+        failed = 1;
+    }
+
+    control_stop();
+    if (control_configure(NULL, NULL, NULL) != 0) {
+        failed = 1;
+    }
+
+    return failed;
+#else
+    (void)path;
+    return 0;
+#endif
+}
+
 /*
  * JSON escaping: quotes, backslashes, control bytes and truncation.
  */
@@ -135,6 +301,9 @@ int main(void)
     logger_set_level(LOG_ERROR);
 
     if (test_json_escape() != 0) failed = 1;
+    if (test_admin_matrix() != 0) failed = 1;
+    if (test_audit_actor() != 0) failed = 1;
+    if (test_control_config() != 0) failed = 1;
 
     control_set_handler(test_handler, NULL);
     control_start(path);
@@ -153,6 +322,7 @@ int main(void)
     }
 
     control_stop();
+    if (test_viewer_socket(path) != 0) failed = 1;
     unlink(path);
 
     if (failed) {

@@ -79,6 +79,10 @@
  *   metrics_token    - Bearer token required by GET /metrics
  *                      (empty leaves the endpoint open)
  *   audit_log        - Append-only JSONL security audit file
+ *   control_group    - POSIX group allowed to use the control socket;
+ *                      empty keeps the socket owner-only
+ *   control_admin_group - Members with full administrative rights
+ *   control_operator_group - Members allowed to kick and reload
  *   endpoint_failback - Return to the first relay after it recovers
  *   endpoint_failback_interval - Seconds between preferred-relay probes
  *   log_level        - debug, info, warn, error, fatal
@@ -89,7 +93,8 @@
  * the credentials and the per-client limits from the original
  * configuration file: the client table, ACLs, limits and runtime paths in
  * server mode, this client's own client_id/secret and endpoints in client
- * mode. Changes to the interface, mode or user/group require a restart.
+ * mode. Changes to the interface, mode, user/group or control_* groups
+ * require a restart.
  */
 
 #ifndef PIPESIX_CONFIG_H
@@ -303,6 +308,17 @@ typedef struct {
 
     /* Append-only JSONL security audit, empty disables it. */
     char audit_log[CONFIG_PATH_MAX];
+
+    /*
+     * Administrative RBAC for the UNIX control socket and provisioning
+     * CLI. Empty control_group preserves the owner-only socket; members of
+     * control_admin_group and control_operator_group are elevated, and
+     * every other member of control_group is a viewer. Changes require a
+     * restart because the socket's group and mode are set at bind time.
+     */
+    char control_group[CONFIG_MAX_GROUP];
+    char control_admin_group[CONFIG_MAX_GROUP];
+    char control_operator_group[CONFIG_MAX_GROUP];
 
     /* Client mode: return to the first endpoint after it recovers. */
     int  endpoint_failback;

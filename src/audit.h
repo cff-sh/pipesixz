@@ -30,6 +30,24 @@ int audit_open(const char *path);
 void audit_close(void);
 
 /*
+ * Set the actor for the current thread. The control channel uses this to
+ * attribute an administrative request to the peer that made it. Passing
+ * NULL or an empty string clears the corresponding field.
+ */
+void audit_set_actor(const char *user, unsigned long uid, const char *role,
+                     const char *request_id);
+
+/* Clear the current thread's actor override. */
+void audit_clear_actor(void);
+
+/*
+ * Set the process-wide fallback actor. Worker threads that never call
+ * audit_set_actor() use this, so data-path events are still attributable
+ * to the service account rather than an empty actor.
+ */
+void audit_set_process_actor(const char *role);
+
+/*
  * Append one audit event. event should be a stable short identifier such
  * as "handshake" or "acl_denied"; client and peer may be NULL or empty.
  * The remaining arguments are a printf-style message.

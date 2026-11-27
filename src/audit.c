@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #include <time.h>
@@ -17,6 +18,7 @@
 #if defined(_WIN32)
 #include <io.h>
 #else
+#include <pwd.h>
 #include <sys/stat.h>
 #endif
 
@@ -26,6 +28,23 @@
 
 static pthread_mutex_t audit_lock = PTHREAD_MUTEX_INITIALIZER;
 static int audit_fd = -1;
+
+typedef struct {
+    char          user[64];
+    unsigned long uid;
+    char          role[16];
+    char          request_id[64];
+    int           set;
+} audit_actor_t;
+
+#if defined(_MSC_VER)
+#define AUDIT_THREAD_LOCAL __declspec(thread)
+#else
+#define AUDIT_THREAD_LOCAL _Thread_local
+#endif
+
+static AUDIT_THREAD_LOCAL audit_actor_t tls_actor;
+static audit_actor_t default_actor;
 
 int audit_open(const char *path)
 {
@@ -59,6 +78,61 @@ void audit_close(void)
         close(audit_fd);
         audit_fd = -1;
     }
+    pthread_mutex_unlock(&audit_lock);
+}
+
+void audit_set_actor(const char *user, unsigned long uid, const char *role,
+                     const char *request_id)
+{
+    snprintf(tls_actor.user, sizeof(tls_actor.user), "%s",
+             user != NULL ? user : "");
+    tls_actor.uid = uid;
+    snprintf(tls_actor.role, sizeof(tls_actor.role), "%s",
+             role != NULL ? role : "");
+    snprintf(tls_actor.request_id, sizeof(tls_actor.request_id), "%s",
+             request_id != NULL ? request_id : "");
+    tls_actor.set = 1;
+}
+
+void audit_clear_actor(void)
+{
+    tls_actor.set = 0;
+}
+
+void audit_set_process_actor(const char *role)
+{
+    audit_actor_t actor;
+
+    memset(&actor, 0, sizeof(actor));
+
+#if defined(_WIN32)
+    {
+        const char *user = getenv("USERNAME");
+        snprintf(actor.user, sizeof(actor.user), "%s",
+                 user != NULL ? user : "unknown");
+    }
+#else
+    {
+        struct passwd pw;
+        struct passwd *result = NULL;
+        char buf[4096];
+
+        actor.uid = (unsigned long)getuid();
+        if (getpwuid_r((uid_t)actor.uid, &pw, buf, sizeof(buf), &result) == 0 &&
+            result != NULL) {
+            snprintf(actor.user, sizeof(actor.user), "%s", result->pw_name);
+        } else {
+            snprintf(actor.user, sizeof(actor.user), "uid:%lu", actor.uid);
+        }
+    }
+#endif
+
+    snprintf(actor.role, sizeof(actor.role), "%s",
+             role != NULL ? role : "service");
+    actor.set = 1;
+
+    pthread_mutex_lock(&audit_lock);
+    default_actor = actor;
     pthread_mutex_unlock(&audit_lock);
 }
 
@@ -119,8 +193,12 @@ void audit_event(const char *event, const char *client, const char *peer,
     char event_esc[96];
     char client_esc[160];
     char peer_esc[224];
+    char actor_esc[160];
+    char role_esc[32];
+    char request_esc[160];
     char message_esc[1600];
     char line[4096];
+    audit_actor_t actor;
     char stamp[32];
     struct tm tm_now;
     time_t now;
@@ -135,6 +213,8 @@ void audit_event(const char *event, const char *client, const char *peer,
         pthread_mutex_unlock(&audit_lock);
         return;
     }
+
+    actor = tls_actor.set ? tls_actor : default_actor;
 
     va_start(ap, fmt);
     vsnprintf(message, sizeof(message), fmt, ap);
@@ -163,12 +243,18 @@ void audit_event(const char *event, const char *client, const char *peer,
     json_escape(event_esc, sizeof(event_esc), event);
     json_escape(client_esc, sizeof(client_esc), client);
     json_escape(peer_esc, sizeof(peer_esc), peer);
+    json_escape(actor_esc, sizeof(actor_esc), actor.user);
+    json_escape(role_esc, sizeof(role_esc), actor.role);
+    json_escape(request_esc, sizeof(request_esc), actor.request_id);
     json_escape(message_esc, sizeof(message_esc), message);
 
     n = snprintf(line, sizeof(line),
                  "{\"time\":\"%s\",\"event\":\"%s\",\"client\":\"%s\","
-                 "\"peer\":\"%s\",\"msg\":\"%s\"}\n",
-                 stamp, event_esc, client_esc, peer_esc, message_esc);
+                 "\"peer\":\"%s\",\"actor\":\"%s\","
+                 "\"actor_uid\":%lu,\"role\":\"%s\","
+                 "\"request_id\":\"%s\",\"msg\":\"%s\"}\n",
+                 stamp, event_esc, client_esc, peer_esc, actor_esc,
+                 actor.uid, role_esc, request_esc, message_esc);
     if (n < 0 || (size_t)n >= sizeof(line)) {
         pthread_mutex_unlock(&audit_lock);
         return;

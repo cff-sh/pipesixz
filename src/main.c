@@ -36,6 +36,7 @@
  */
 
 #include "client.h"
+#include "admin.h"
 #include "audit.h"
 #include "config.h"
 #include "control.h"
@@ -340,6 +341,9 @@ static void print_usage(const char *progname)
             "  quota_state     File for quota usage (server, empty = off)\n"
             "  usage_history   Completed periods as CSV (server, empty = off)\n"
             "  audit_log       Append-only JSONL audit file (empty = off)\n"
+            "  control_group   POSIX group allowed to use the control socket\n"
+            "  control_admin_group  Members with full administrative rights\n"
+            "  control_operator_group  Members allowed to kick and reload\n"
             "  endpoint_failback on | off (client, default off)\n"
             "  endpoint_failback_interval Seconds between preferred probes\n");
 
@@ -368,8 +372,10 @@ static void print_usage(const char *progname)
             "usage_history, metrics settings, keys and limits. A client\n"
             "also adopts new remote_address/remote_port and reconnects.\n"
             "On Windows there are no signals: use --reload and --stats.\n"
-            "The control channel (--status, --kick) is a 0600 UNIX socket\n"
-            "and is available on POSIX only.\n");
+            "The control channel (--status, --kick) is a UNIX socket and is\n"
+            "available on POSIX only. It is owner-only unless control_group\n"
+            "names an access group; control_admin_group and\n"
+            "control_operator_group then assign roles.\n");
 }
 
 static int parse_u64(const char *text, uint64_t *out)
@@ -748,6 +754,40 @@ static void report_rotated_keys(const pipesix_config_t *config)
            "Put each key in the matching client's 'secret' line and reload\n"
            "each client:\n"
            "  sudo systemctl reload pipesix\n");
+}
+
+/*
+ * Refuse a local command that the caller's role does not allow. The
+ * control channel enforces the same matrix for remote requests; this
+ * check covers direct configuration rewrites and signal-based reloads.
+ */
+static int require_cli_role(const pipesix_config_t *config,
+                            admin_role_t required, const char *action)
+{
+    admin_role_t have;
+
+    if (admin_current_role(&have) != 0 ||
+        !admin_role_satisfies(have, required)) {
+        if (config->audit_log[0] != '\0') {
+            if (audit_open(config->audit_log) == 0) {
+                audit_set_process_actor("denied");
+                audit_event("admin_denied", "", "",
+                            "action=%s required=%s", action,
+                            admin_role_name(required));
+                audit_close();
+            } else {
+                fprintf(stderr,
+                        "Warning: cannot write the audit log '%s': %s\n",
+                        config->audit_log, strerror(errno));
+            }
+        }
+        fprintf(stderr, "Error: %s requires the %s role\n", action,
+                admin_role_name(required));
+        return -1;
+    }
+
+    audit_set_process_actor(admin_role_name(have));
+    return 0;
 }
 
 int main(int argc, char *argv[])
@@ -1247,6 +1287,14 @@ int main(int argc, char *argv[])
             return EXIT_FAILURE;
         }
 
+        if (control_configure(config.control_group,
+                              config.control_admin_group,
+                              config.control_operator_group) != 0 ||
+            require_cli_role(&config, ADMIN_ROLE_VIEWER,
+                             "usage history") != 0) {
+            return EXIT_FAILURE;
+        }
+
         if (config.usage_history[0] == '\0') {
             fprintf(stderr,
                     "Error: no 'usage_history' configured in '%s'\n",
@@ -1431,8 +1479,28 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    if (control_configure(config.control_group, config.control_admin_group,
+                          config.control_operator_group) != 0) {
+        log_error("Cannot configure administrative roles");
+        return EXIT_FAILURE;
+    }
+
     if (doctor_only) {
+        if (require_cli_role(&config, ADMIN_ROLE_VIEWER, "doctor") != 0) {
+            return EXIT_FAILURE;
+        }
         return client_doctor(&config) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
+    if ((rotate_all || stage_all || promote_all || abort_all ||
+         stage_key != NULL || promote_key != NULL || abort_key != NULL ||
+         disable_client != NULL || enable_client != NULL ||
+         expire_client != NULL || add_client != NULL ||
+         remove_client != NULL || set_limit != NULL || clear_limit != NULL ||
+         export_client != NULL) &&
+        require_cli_role(&config, ADMIN_ROLE_ADMIN,
+                         "configuration change") != 0) {
+        return EXIT_FAILURE;
     }
 
     if (stage_all || promote_all || abort_all) {
@@ -1653,6 +1721,11 @@ int main(int argc, char *argv[])
     if (export_client != NULL) {
         char path[CONFIG_PATH_MAX];
 
+        if (audit_open(config.audit_log) != 0) {
+            fprintf(stderr, "Warning: cannot open the audit log '%s': %s\n",
+                    config.audit_log, strerror(errno));
+        }
+
         if (export_dir != NULL) {
             if (snprintf(path, sizeof(path), "%s/%s.conf", export_dir,
                          export_client) >= (int)sizeof(path)) {
@@ -1670,12 +1743,19 @@ int main(int argc, char *argv[])
 
         printf("Wrote client configuration for '%s' to %s\n",
                export_client, path);
+        audit_event("client_exported", export_client, "", "path=%s", path);
+        audit_close();
         return EXIT_SUCCESS;
     }
 
     if (add_client != NULL || remove_client != NULL) {
         char reply[1024];
         char secret[PIPESIX_KEY_LEN * 2 + 1];
+
+        if (audit_open(config.audit_log) != 0) {
+            fprintf(stderr, "Warning: cannot open the audit log '%s': %s\n",
+                    config.audit_log, strerror(errno));
+        }
 
         if (add_client != NULL) {
             pipesix_client_policy_t limits;
@@ -1791,6 +1871,8 @@ int main(int argc, char *argv[])
 
             printf("\nSet these on the client host and start it; the key is "
                    "printed once\nand is not stored anywhere else.\n");
+            audit_event("client_added", add_client, "", "route=%s",
+                        route != NULL ? route : "none");
         } else {
             if (config_remove_client(&config, remove_client) != 0) {
                 fprintf(stderr,
@@ -1800,6 +1882,7 @@ int main(int argc, char *argv[])
             }
             printf("Removed client '%s' from %s\n", remove_client,
                    config_path);
+            audit_event("client_removed", remove_client, "", "removed");
         }
 
         /*
@@ -1813,6 +1896,7 @@ int main(int argc, char *argv[])
             printf("No running server for this configuration; the change "
                    "applies when it starts.\n");
         }
+        audit_close();
 
         return EXIT_SUCCESS;
     }
@@ -1821,6 +1905,11 @@ int main(int argc, char *argv[])
         const char *id = (set_limit != NULL) ? set_limit : clear_limit;
         const pipesix_client_policy_t *limits;
         char reply[1024];
+
+        if (audit_open(config.audit_log) != 0) {
+            fprintf(stderr, "Warning: cannot open the audit log '%s': %s\n",
+                    config.audit_log, strerror(errno));
+        }
 
         if (set_limit != NULL) {
             if (config_set_limits(&config, id,
@@ -1880,6 +1969,10 @@ int main(int argc, char *argv[])
             printf("No running server for this configuration; the change "
                    "applies when it starts.\n");
         }
+        audit_event(set_limit != NULL ? "limits_set" : "limits_cleared",
+                    id, "", "%s", set_limit != NULL ? "limits updated"
+                                                   : "limits removed");
+        audit_close();
 
         return EXIT_SUCCESS;
     }
@@ -1889,9 +1982,16 @@ int main(int argc, char *argv[])
     if (rotate_all) {
         int signalled;
 
+        if (audit_open(config.audit_log) != 0) {
+            fprintf(stderr, "Warning: cannot open the audit log '%s': %s\n",
+                    config.audit_log, strerror(errno));
+        }
+
         if (config_rotate_all_keys(&config) != 0) {
+            audit_close();
             return EXIT_FAILURE;
         }
+        audit_event("key_rotated", "", "", "all client keys rotated");
         report_rotated_keys(&config);
 
         if (export_dir != NULL) {
@@ -1936,11 +2036,16 @@ int main(int argc, char *argv[])
                    "server to\nadopt the new keys:\n"
                    "  sudo systemctl reload pipesix\n");
         }
+        audit_close();
 
         return EXIT_SUCCESS;
     }
 
     if (check_only) {
+        if (require_cli_role(&config, ADMIN_ROLE_VIEWER,
+                             "configuration check") != 0) {
+            return EXIT_FAILURE;
+        }
         printf("Configuration OK: %s\n", config_path);
         return EXIT_SUCCESS;
     }
@@ -1951,7 +2056,14 @@ int main(int argc, char *argv[])
      * behaviour is the same everywhere.
      */
     if (reload_only || stats_only) {
+        admin_role_t required = reload_only ? ADMIN_ROLE_OPERATOR
+                                            : ADMIN_ROLE_VIEWER;
+        const char *action = reload_only ? "reload" : "statistics";
         int signalled;
+
+        if (require_cli_role(&config, required, action) != 0) {
+            return EXIT_FAILURE;
+        }
 
 #if defined(_WIN32)
         signalled = reload_only ? control_request_reload(config.config_path)
@@ -1960,6 +2072,13 @@ int main(int argc, char *argv[])
         signalled = signal_running_instances(config.config_path,
                                              reload_only ? SIGHUP : SIGUSR1);
 #endif
+
+        if (reload_only && audit_open(config.audit_log) == 0) {
+            audit_event("admin_action", "", "",
+                        "action=reload result=%s",
+                        signalled > 0 ? "requested" : "no-instance");
+            audit_close();
+        }
 
         if (signalled > 0) {
             printf("Signalled %d running pipesix process(es): %s\n",

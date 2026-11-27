@@ -22,6 +22,7 @@
 #include <io.h>
 #else
 #include <arpa/inet.h>
+#include <grp.h>
 #endif
 #include <ctype.h>
 #include <errno.h>
@@ -1167,6 +1168,17 @@ static int config_set_value(pipesix_config_t *config, const char *key,
     if (strcmp(key, "audit_log") == 0) {
         return copy_string(config->audit_log, CONFIG_PATH_MAX, value);
     }
+    if (strcmp(key, "control_group") == 0) {
+        return copy_string(config->control_group, CONFIG_MAX_GROUP, value);
+    }
+    if (strcmp(key, "control_admin_group") == 0) {
+        return copy_string(config->control_admin_group, CONFIG_MAX_GROUP,
+                           value);
+    }
+    if (strcmp(key, "control_operator_group") == 0) {
+        return copy_string(config->control_operator_group, CONFIG_MAX_GROUP,
+                           value);
+    }
     if (strcmp(key, "endpoint_failback") == 0) {
         return set_bool(&config->endpoint_failback, value);
     }
@@ -1728,6 +1740,32 @@ static int valid_metrics_token(const char *token)
     return 1;
 }
 
+/*
+ * A group name must be usable by getgrnam() and must not contain the
+ * whitespace that the flat configuration format trims. Existence is
+ * checked on POSIX so a typo cannot silently widen access.
+ */
+static int valid_control_group(const char *name)
+{
+    const unsigned char *p = (const unsigned char *)name;
+
+    if (name[0] == '\0') {
+        return 1;
+    }
+
+    for (; *p != '\0'; p++) {
+        if (*p <= 0x20 || *p >= 0x7f) {
+            return 0;
+        }
+    }
+
+#if defined(_WIN32)
+    return 1;
+#else
+    return getgrnam(name) != NULL;
+#endif
+}
+
 int config_validate(const pipesix_config_t *config)
 {
     struct in6_addr parsed_addr;
@@ -1788,6 +1826,40 @@ int config_validate(const pipesix_config_t *config)
     if (!valid_metrics_token(config->metrics_token)) {
         log_error("Configuration validation failed: 'metrics_token' must be "
                   "printable ASCII without spaces");
+        return -1;
+    }
+
+    if ((config->control_admin_group[0] != '\0' ||
+         config->control_operator_group[0] != '\0') &&
+        config->control_group[0] == '\0') {
+        log_error("Configuration validation failed: "
+                  "'control_admin_group' and 'control_operator_group' "
+                  "require 'control_group'");
+        return -1;
+    }
+
+#if defined(_WIN32)
+    if (config->control_group[0] != '\0') {
+        log_error("Configuration validation failed: 'control_group' is "
+                  "not supported on Windows");
+        return -1;
+    }
+#endif
+
+    if (!valid_control_group(config->control_group)) {
+        log_error("Configuration validation failed: 'control_group' must "
+                  "name an existing POSIX group without spaces");
+        return -1;
+    }
+    if (!valid_control_group(config->control_admin_group)) {
+        log_error("Configuration validation failed: 'control_admin_group' "
+                  "must name an existing POSIX group without spaces");
+        return -1;
+    }
+    if (!valid_control_group(config->control_operator_group)) {
+        log_error("Configuration validation failed: "
+                  "'control_operator_group' must name an existing POSIX "
+                  "group without spaces");
         return -1;
     }
 
@@ -2225,6 +2297,17 @@ void config_dump(const pipesix_config_t *config)
     }
     log_info("  audit_log       = %s",
              config->audit_log[0] != '\0' ? config->audit_log : "disabled");
+    log_info("  control_group   = %s",
+             config->control_group[0] != '\0' ? config->control_group
+                                               : "owner-only");
+    if (config->control_admin_group[0] != '\0') {
+        log_info("  control_admin_group = %s",
+                 config->control_admin_group);
+    }
+    if (config->control_operator_group[0] != '\0') {
+        log_info("  control_operator_group = %s",
+                 config->control_operator_group);
+    }
     if (strcmp(config->mode, "server") == 0) {
         if (config->quota_state[0] != '\0') {
             log_info("  quota_state     = %s", config->quota_state);
@@ -2262,6 +2345,14 @@ int config_reload_runtime(pipesix_config_t *config)
     if (strcmp(fresh.mode, config->mode) != 0) {
         log_error("Configuration reload rejected: 'mode' cannot change at runtime");
         return -1;
+    }
+
+    if (strcmp(fresh.control_group, config->control_group) != 0 ||
+        strcmp(fresh.control_admin_group, config->control_admin_group) != 0 ||
+        strcmp(fresh.control_operator_group,
+               config->control_operator_group) != 0) {
+        log_warn("control_* group changes require a restart; the current "
+                 "control socket permissions and roles are unchanged");
     }
 
     config->log_level       = fresh.log_level;

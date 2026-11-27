@@ -51,6 +51,7 @@ SRCDIR       = src
 SOURCES      = $(SRCDIR)/main.c \
                $(SRCDIR)/logger.c \
                $(SRCDIR)/audit.c \
+               $(SRCDIR)/admin.c \
                $(SRCDIR)/config.c \
                $(SRCDIR)/crypto.c \
                $(SRCDIR)/proto.c \
@@ -78,7 +79,8 @@ TEST_OBJECTS = $(SRCDIR)/crypto.o $(SRCDIR)/proto.o \
 # the tunnel.
 TEST_CONTROL_BIN     = tests/test_control
 TEST_CONTROL_SOURCES = tests/test_control.c
-TEST_CONTROL_OBJECTS = $(SRCDIR)/control.o $(SRCDIR)/logger.o
+TEST_CONTROL_OBJECTS = $(SRCDIR)/control.o $(SRCDIR)/admin.o \
+                       $(SRCDIR)/audit.o $(SRCDIR)/logger.o
 
 # Binary name
 TARGET       = pipesix

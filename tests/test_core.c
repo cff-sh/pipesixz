@@ -17,6 +17,9 @@
 #include "stats.h"
 
 #include <arpa/inet.h>
+#if !defined(_WIN32)
+#include <grp.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2483,6 +2486,66 @@ static void test_client_policy(void)
         check(strcmp(config.audit_log, "/tmp/pipesix-audit.log") == 0,
               "the audit path is parsed");
     }
+
+#if !defined(_WIN32)
+    {
+        struct group *group = getgrgid(getgid());
+
+        if (group != NULL) {
+            char fixture[512];
+            char bad_fixture[512];
+
+            snprintf(fixture, sizeof(fixture),
+                     "mode = server\n"
+                     "tun_address = fd00::1/64\n"
+                     "control_group = %s\n"
+                     "control_admin_group = %s\n"
+                     "control_operator_group = %s\n"
+                     "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                     group->gr_name, group->gr_name, group->gr_name);
+            check(write_temp_file(fixture, path, sizeof(path)) == 0,
+                  "write the control-group fixture");
+            check(config_load(path, &config) == 0,
+                  "load the control-group fixture");
+            check(strcmp(config.control_group, group->gr_name) == 0,
+                  "control_group is parsed");
+            check(strcmp(config.control_admin_group, group->gr_name) == 0,
+                  "control_admin_group is parsed");
+            check(strcmp(config.control_operator_group, group->gr_name) == 0,
+                  "control_operator_group is parsed");
+            check(config_validate(&config) == 0,
+                  "existing control groups validate");
+            unlink(path);
+
+            snprintf(bad_fixture, sizeof(bad_fixture),
+                     "mode = server\n"
+                     "tun_address = fd00::1/64\n"
+                     "control_admin_group = %s\n"
+                     "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                     group->gr_name);
+            check(write_temp_file(bad_fixture, path, sizeof(path)) == 0,
+                  "write the elevated-without-access fixture");
+            check(config_load(path, &config) == 0,
+                  "load the elevated-without-access fixture");
+            check(config_validate(&config) != 0,
+                  "an elevated group without control_group is rejected");
+            unlink(path);
+        }
+
+        check(write_temp_file(
+                  "mode = server\n"
+                  "tun_address = fd00::1/64\n"
+                  "control_group = pipesix-no-such-group-xyz\n"
+                  "client = alice: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                  path, sizeof(path)) == 0,
+              "write the missing-group fixture");
+        check(config_load(path, &config) == 0,
+              "load the missing-group fixture");
+        check(config_validate(&config) != 0,
+              "a missing control_group is rejected");
+        unlink(path);
+    }
+#endif
 
     {
         static const char state_fixture[] =

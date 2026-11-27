@@ -20,6 +20,8 @@
  */
 
 #include "control.h"
+#include "admin.h"
+#include "audit.h"
 
 #if defined(_WIN32)
 
@@ -272,6 +274,7 @@ int control_request(const char *config_path, const char *request,
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -284,6 +287,7 @@ static int                s_thread_started;
 static int                s_listen_fd = -1;
 static char               s_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 static _Atomic int        s_stopping = 1;
+static _Atomic unsigned long s_request_seq;
 
 static pthread_mutex_t    s_handler_lock = PTHREAD_MUTEX_INITIALIZER;
 static control_handler_fn s_handler;
@@ -389,9 +393,15 @@ static void control_serve_connection(int fd)
 {
     char request[CONTROL_MAX_REQUEST];
     char reply[CONTROL_MAX_REPLY];
+    char actor[64];
+    char request_id[96];
     struct timeval timeout;
     control_handler_fn handler;
     void *handler_arg;
+    admin_role_t role;
+    unsigned long peer_uid = 0;
+    unsigned long peer_pid = 0;
+    int mutation;
     size_t used = 0;
     size_t start;
     size_t end;
@@ -404,6 +414,13 @@ static void control_serve_connection(int fd)
                (socklen_t)sizeof(timeout));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
                (socklen_t)sizeof(timeout));
+
+    if (admin_peer_role(fd, &role, &peer_uid, &peer_pid) != 0) {
+        const char *denied =
+            "ERR permission denied: peer credentials unavailable\n";
+        write_all(fd, denied, strlen(denied));
+        return;
+    }
 
     while (used + 1 < sizeof(request)) {
         nread = read(fd, request + used, sizeof(request) - 1 - used);
@@ -439,6 +456,25 @@ static void control_serve_connection(int fd)
     memmove(request, request + start, end);
     request[end] = '\0';
 
+    (void)admin_user_name(peer_uid, actor, sizeof(actor));
+    snprintf(request_id, sizeof(request_id), "%lu-%lu-%lu",
+             (unsigned long)getpid(), peer_pid,
+             atomic_fetch_add_explicit(&s_request_seq, 1,
+                                       memory_order_relaxed));
+    audit_set_actor(actor, peer_uid, admin_role_name(role), request_id);
+
+    if (!admin_request_allowed(role, request)) {
+        snprintf(reply, sizeof(reply),
+                 "ERR permission denied: role '%s' cannot run '%s'\n",
+                 admin_role_name(role), request);
+        audit_event("admin_denied", "", "", "request=\"%s\"", request);
+        audit_clear_actor();
+        write_all(fd, reply, strlen(reply));
+        return;
+    }
+
+    mutation = admin_request_is_mutation(request);
+
     pthread_mutex_lock(&s_handler_lock);
     handler = s_handler;
     handler_arg = s_handler_arg;
@@ -462,6 +498,13 @@ static void control_serve_connection(int fd)
             reply[len] = '\0';
         }
     }
+
+    if (mutation) {
+        audit_event("admin_action", "", "",
+                    "request=\"%s\" result=\"%s\"", request,
+                    strncmp(reply, "OK", 2) == 0 ? "ok" : "error");
+    }
+    audit_clear_actor();
 
     write_all(fd, reply, len);
 }
@@ -511,6 +554,8 @@ static void *control_loop(void *arg)
 void control_start(const char *config_path)
 {
     struct sockaddr_un addr;
+    unsigned long gid = 0;
+    mode_t mode = 0600;
     int fd;
 
     if (s_thread_started) {
@@ -548,8 +593,27 @@ void control_start(const char *config_path)
         return;
     }
 
-    /* Only the owner may ask; the requests can drop a client. */
-    chmod(s_socket_path, 0600);
+    /*
+     * Without a configured group the socket stays owner-only. With one,
+     * the group gets read/write access and peer credentials decide the
+     * role; a failed chown must not silently widen the mode.
+     */
+    if (admin_control_gid(&gid)) {
+        if (chown(s_socket_path, (uid_t)-1, (gid_t)gid) == 0) {
+            mode = 0660;
+        } else {
+            log_warn("Cannot set the control socket group: %s; keeping it "
+                     "owner-only", strerror(errno));
+        }
+    }
+    if (chmod(s_socket_path, mode) != 0) {
+        log_error("Cannot set control socket permissions: %s",
+                  strerror(errno));
+        close(fd);
+        unlink(s_socket_path);
+        s_socket_path[0] = '\0';
+        return;
+    }
     listen(fd, 8);
 
     s_listen_fd = fd;
@@ -693,6 +757,12 @@ int control_request_stats(const char *config_path)
 }
 
 #endif /* _WIN32 */
+
+int control_configure(const char *access_group, const char *admin_group,
+                      const char *operator_group)
+{
+    return admin_configure(access_group, admin_group, operator_group);
+}
 
 int control_json_escape(const char *in, char *out, size_t out_size)
 {

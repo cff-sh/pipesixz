@@ -254,12 +254,22 @@ stats_interval  = 60
 # remote endpoint list on a client, and the credentials/ACLs/limits: the
 # 'client'/'client_route' table plus staged keys and client state on a
 # server, this client's own 'secret' and 'client_id' in client mode, so a
-# key can be rotated without a restart. Interface, mode, user/group and
-# bind_address changes take effect after a restart.
+# key can be rotated without a restart. Interface, mode, user/group,
+# bind_address and control_* group changes take effect after a restart.
 #
 log_level  = info
 log_format = text
 #
 # audit_log: append-only JSONL security audit. Separate from normal logs;
-# created with mode 0600. Reloadable on SIGHUP.
+# created with mode 0600. Reloadable on SIGHUP. Records include actor,
+# actor_uid, role and request_id.
 #audit_log = /var/log/pipesix/audit.jsonl
+#
+# control_group: POSIX group allowed to use the control socket. Empty keeps
+# the socket owner-only. Members of control_admin_group are administrators;
+# members of control_operator_group may kick/reload; every other member of
+# control_group is read-only. Role-group members must also belong to
+# control_group. Changes require a restart.
+#control_group          = pipesix-control
+#control_admin_group    = pipesix-admin
+#control_operator_group = pipesix-operator

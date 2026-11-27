@@ -58,7 +58,11 @@ Client (::2) → pipesix → UDP → VPS pipesix → tun0 → [wg0|netassist] �
 - Optional automatic failback to the preferred relay after the client has
   moved to a later endpoint
 - Append-only JSONL audit log for handshakes, ACL drops, quota exhaustion,
-  reloads, key changes and administrative client changes
+  reloads, key changes and administrative client changes, with the
+  authenticated actor, role and request id on every record
+- POSIX control-channel RBAC: a read-only viewer role, an operator role for
+  kick/reload, and an administrator role for credentials, limits, lifecycle
+  and accounting changes
 - Per-direction rate limits with `client_rate_limit_in`/`_out`, while
   `client_rate_limit` remains the shared default
 - Liveness and readiness probes: `/healthz` proves the process is running,
@@ -197,16 +201,59 @@ and expired clients, ACLs and limits on a server; the `secret` and
 A client that sees new endpoints drains its workers, reconnects and
 re-handshakes; a server restarts the metrics listener if its address, port
 or token changed.
-Interface, `mode`, `user`/`group` and `bind_address` changes still require a
-restart.
+Interface, `mode`, `user`/`group`, `bind_address` and the `control_*`
+groups still require a restart; the control socket's group and mode are set
+when it is bound.
 
 ### Control channel
 
 While pipesix runs it also listens on a UNIX socket derived from the
-absolute path of its configuration file, with mode `0600`. The socket
-lives in `/run/pipesix/pipesix-<uid>-<hash>.sock`, or in `/tmp` when
-`/run` is not writable, and is removed when the process exits. Windows
-has no equivalent, so these commands are POSIX only.
+absolute path of its configuration file, with mode `0600`, or `0660` when
+`control_group` is configured. The socket lives in
+`/run/pipesix/pipesix-<uid>-<hash>.sock`, or in `/tmp` when `/run` is not
+writable, and is removed when the process exits. Windows has no
+equivalent, so these commands are POSIX only.
+
+### Administrative roles
+
+Administration is role-based on POSIX. Without any `control_*` setting the
+socket stays owner-only and root or the service owner is the
+administrator, preserving existing installations. To delegate access:
+
+```ini
+control_group          = pipesix-control
+control_admin_group    = pipesix-admin
+control_operator_group = pipesix-operator
+```
+
+`control_group` is the socket's group and the base access grant. Root is
+always an administrator. A member of `control_admin_group` is an
+administrator, a member of `control_operator_group` is an operator, and
+every other member of `control_group` is a viewer. Role-group members
+must also be members of `control_group`, because that group controls the
+socket itself. The service account is not implicitly elevated once a
+`control_group` is configured; add it to `control_admin_group` if it must
+administer its own instance.
+
+| Role | Allowed |
+|---|---|
+| viewer | `--status`, `--usage`, `--metrics`, `--stats`, `--check`, `--doctor`, `--usage --history` |
+| operator | viewer plus `--kick` and `--reload` |
+| admin | operator plus `--add-client`, `--remove-client`, `--set-limit`, `--clear-limit`, key rotation/staging, enable/disable/expiry, usage adjustments and client export |
+
+The control channel checks the peer's uid and supplementary groups with
+`SO_PEERCRED` (Linux) or `getpeereid()` (macOS/BSD). Direct CLI mutations
+and signal-based reloads apply the same matrix locally, so an operator
+cannot rewrite the client table just because the file is writable. A
+denied request is answered with `ERR permission denied` and recorded as
+`admin_denied`; a permitted state-changing request is recorded as
+`admin_action` with its result.
+
+Every audit record now carries `actor`, `actor_uid`, `role` and
+`request_id` alongside the existing fields. The control thread attributes
+the request to the connecting account; worker threads use the service
+account as their fallback actor. Changing any `control_*` setting requires
+a restart, because the socket's group and mode are set when it is bound.
 
 ```bash
 sudo pipesix --status -c /etc/pipesix/pipesix.conf
@@ -412,12 +459,15 @@ and lifecycle events:
 audit_log = /var/log/pipesix/audit.jsonl
 ```
 
-Each line is one object with `time`, `event`, `client`, `peer` and `msg`.
-Recorded events include `handshake`, `handshake_failed`, `client_refused`,
-`acl_denied` (once per session), `quota_exhausted`, `reload`, `key_staged`,
-`key_promoted`, `key_changed`, `client_disabled`, `client_enabled`,
-`client_expiry_set`, `client_refused`, `session_blocked`, `startup` and
-`shutdown`. The file is created with mode `0600` and is safe for a running
+Each line is one object with `time`, `event`, `client`, `peer`, `actor`,
+`actor_uid`, `role`, `request_id` and `msg`. Recorded events include
+`handshake`, `handshake_failed`, `client_refused`, `acl_denied` (once per
+session), `quota_exhausted`, `reload`, `key_staged`, `key_promoted`,
+`key_changed`, `key_rotated`, `client_added`, `client_removed`,
+`client_exported`, `limits_set`, `limits_cleared`, `client_disabled`,
+`client_enabled`, `client_expiry_set`, `admin_action`, `admin_denied`,
+`session_blocked`, `startup` and `shutdown`. The file is created with mode
+`0600` and is safe for a running
 server and a provisioning command to append to concurrently. Changing
 `audit_log` takes effect on SIGHUP; the old file is left untouched. Audit
 writing is best-effort: a full disk disables auditing rather than

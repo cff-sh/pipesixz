@@ -1165,6 +1165,7 @@ int client_start(pipesix_config_t *config)
         log_warn("Cannot open the audit log '%s': %s", config->audit_log,
                  strerror(errno));
     }
+    audit_set_process_actor("service");
     audit_event("startup", config->client_id, "", "client starting");
 
     {
